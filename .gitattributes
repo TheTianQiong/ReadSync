@@ -1,0 +1,31 @@
+# 统一换行符策略。
+#
+# 背景：Windows 上 clone 的仓库默认会被 core.autocrlf 转成 CRLF，而
+# **带 CRLF 的 shell 脚本在 Linux 上会直接失败**（bad interpreter: /bin/bash^M）。
+# 本项目的 deploy/install.sh 正是要在 Linux 服务器上执行的，因此必须强制 LF。
+#
+# 策略：仓库内一律存 LF，检出时不转换。这样跨平台行为完全一致。
+
+* text=auto eol=lf
+
+# Shell 脚本：必须 LF，否则 Linux 无法执行
+*.sh          text eol=lf
+*.bash        text eol=lf
+Dockerfile    text eol=lf
+*.yml         text eol=lf
+*.yaml        text eol=lf
+
+# 二进制文件不做任何转换
+*.png         binary
+*.jpg         binary
+*.jpeg        binary
+*.gif         binary
+*.ico         binary
+*.woff        binary
+*.woff2       binary
+*.zip         binary
+*.db          binary
+*.epub        binary
+
+# 锁文件由 npm 生成，避免合并冲突时产生噪音
+package-lock.json  text eol=lf -diff
