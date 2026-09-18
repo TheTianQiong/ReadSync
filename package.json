@@ -1,0 +1,34 @@
+{
+  "name": "readsync",
+  "version": "0.1.0",
+  "private": true,
+  "description": "读记服务器 ReadSync - 支持 WebDAV、对象存储、KOSync 等多协议的自托管阅读同步服务器",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20.11.0"
+  },
+  "workspaces": [
+    "packages/shared",
+    "packages/server",
+    "packages/web"
+  ],
+  "scripts": {
+    "build:shared": "npm run build --workspace @readsync/shared",
+    "build:server": "npm run build --workspace @readsync/server",
+    "build:web": "npm run build --workspace @readsync/web",
+    "build": "npm run build:shared && npm run build:server && npm run build:web",
+    "dev:server": "npm run dev --workspace @readsync/server",
+    "dev:web": "npm run dev --workspace @readsync/web",
+    "dev": "concurrently -n server,web -c cyan,magenta \"npm:dev:server\" \"npm:dev:web\"",
+    "start": "node packages/server/dist/index.js",
+    "cli": "node packages/server/dist/cli.js",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "clean": "node scripts/clean.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.1",
+    "concurrently": "^10.0.5",
+    "typescript": "^7.0.2"
+  }
+}

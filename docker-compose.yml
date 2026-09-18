@@ -1,0 +1,92 @@
+# ============================================================================
+# ReadSync docker-compose 部署
+#
+#   docker compose up -d
+#
+# 国内网络构建加速：
+#   NPM_REGISTRY=https://registry.npmmirror.com docker compose build
+# ============================================================================
+
+services:
+  readsync:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile
+      args:
+        # 国内构建时改成 https://registry.npmmirror.com 可大幅提速
+        NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmjs.org/}
+        NODE_MIRROR: ${NODE_MIRROR:-}
+    image: readsync:latest
+    container_name: readsync
+    restart: unless-stopped
+    ports:
+      - "${READSYNC_PORT:-3000}:3000"
+    environment:
+      NODE_ENV: production
+      READSYNC_PORT: 3000
+      READSYNC_HOST: 0.0.0.0
+      # ⚠ 改成你实际访问的地址（含协议与端口）；用反向代理时填外部域名，
+      #   否则 WebAuthn 通行密钥会因 origin 不匹配而失败
+      READSYNC_BASE_URL: ${READSYNC_BASE_URL:-http://localhost:3000}
+      READSYNC_DATA_DIR: /app/data
+      # 留空则首次启动自动生成到 /app/data/secret.key
+      READSYNC_SECRET: ${READSYNC_SECRET:-}
+      READSYNC_LOG_LEVEL: ${READSYNC_LOG_LEVEL:-info}
+      READSYNC_LOG_PRETTY: "false"
+      # 由反向代理转发时设为 true，否则客户端可伪造 IP 绕过登录限流
+      READSYNC_TRUST_PROXY: ${READSYNC_TRUST_PROXY:-false}
+      READSYNC_AUTO_MIGRATE: "true"
+      READSYNC_SERVE_WEB: "true"
+      TZ: ${TZ:-Asia/Shanghai}
+    volumes:
+      # 数据库、RSA 私钥、主密钥、插件、本地存储都在这里 —— 必须持久化
+      - readsync-data:/app/data
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:3000/api/system/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+    # SQLite 写入时对 I/O 延迟敏感，限制日志驱动避免磁盘被写满
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ---------------------------------------------------------------------------
+  # 可选：Caddy 反向代理，自动申请并续期 HTTPS 证书。
+  # 启用方式：docker compose --profile proxy up -d
+  #
+  # 注意：启用 HTTPS 后必须把 READSYNC_BASE_URL 改成 https://你的域名，
+  #       否则通行密钥（WebAuthn）无法工作。
+  # ---------------------------------------------------------------------------
+  caddy:
+    image: caddy:2-alpine
+    container_name: readsync-caddy
+    restart: unless-stopped
+    profiles: ["proxy"]
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      # 改成你的域名，例如 read.example.com
+      READSYNC_DOMAIN: ${READSYNC_DOMAIN:-localhost}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      - readsync
+
+volumes:
+  readsync-data:
+    driver: local
+  caddy-data:
+    driver: local
+  caddy-config:
+    driver: local

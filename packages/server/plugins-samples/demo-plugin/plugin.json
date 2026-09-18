@@ -1,0 +1,40 @@
+{
+  "id": "com.example.readsync-demo",
+  "name": "示例插件",
+  "version": "1.0.0",
+  "author": "ReadSync",
+  "description": "最小可用示例：读取配置、写入数据目录、注册同步协议路由与生命周期钩子。",
+  "homepage": "https://github.com/",
+  "license": "MIT",
+  "apiVersion": ">=0.1.0 <0.2.0",
+  "capabilities": ["sync", "metadata"],
+  "main": "index.js",
+  "runtime": "node",
+  "permissions": ["log", "fs:data"],
+  "config": [
+    {
+      "key": "greeting",
+      "label": "问候语",
+      "type": "string",
+      "required": false,
+      "default": "Hello ReadSync",
+      "placeholder": "显示在 /status 接口里",
+      "description": "演示普通配置项，明文存储。"
+    },
+    {
+      "key": "apiKey",
+      "label": "示例 API Key",
+      "type": "password",
+      "required": false,
+      "description": "演示敏感配置项：服务端会加密存储，接口返回时脱敏。"
+    }
+  ],
+  "syncProtocols": [
+    {
+      "id": "demo",
+      "name": "示例协议",
+      "mountPath": "/demo",
+      "description": "演示插件如何挂载自己的同步协议路由"
+    }
+  ]
+}

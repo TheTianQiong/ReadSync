@@ -1,0 +1,197 @@
+@import 'tailwindcss';
+
+/*
+ * 墨水屏视觉体系
+ * ---------------
+ * 设计目标不是「深色模式」，而是模拟电子墨水屏：低对比度色阶、1px 细边框代替阴影、
+ * 极小圆角、无渐变。因此这里先定义一套「原始变量」（:root / .dark 两套值），
+ * 再用 @theme inline 暴露成语义 token（bg-paper、text-ink、border-line …）。
+ *
+ * 用 @theme inline 而不是 @theme，是为了让生成的工具类写成 `var(--rs-paper)`
+ * 而不是把十六进制值内联进来 —— 这样切到 .dark 时颜色会跟着变，
+ * 同时 `bg-ink/10` 这类透明度修饰符（内部用 color-mix）也仍然可用。
+ *
+ * 深色模式用 class 变体而不是 media query：手动指定与「跟随系统」两条路径共用一套
+ * 样式，切换逻辑集中在 lib/theme.ts 里。
+ */
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme {
+  /* 正文衬线营造纸书感，控件仍用无衬线保证可读性 */
+  --font-serif: Georgia, 'Songti SC', 'Noto Serif SC', 'Source Han Serif SC', 'STSong', serif;
+  --font-sans:
+    -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB',
+    'Microsoft YaHei', 'Noto Sans SC', sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace;
+
+  /* 墨水屏的圆角几乎可以忽略，只保留 1-3px 的一点柔化 */
+  --radius-sm: 2px;
+  --radius-md: 3px;
+  --radius-lg: 4px;
+  --radius-xl: 6px;
+}
+
+@theme inline {
+  /* 纸面与容器 */
+  --color-paper: var(--rs-paper);
+  --color-surface: var(--rs-surface);
+  --color-raised: var(--rs-raised);
+  --color-sunken: var(--rs-sunken);
+
+  /* 文字层级 */
+  --color-ink: var(--rs-ink);
+  --color-ink-soft: var(--rs-ink-soft);
+  --color-muted: var(--rs-muted);
+  --color-faint: var(--rs-faint);
+
+  /* 分隔线 */
+  --color-line: var(--rs-line);
+  --color-line-strong: var(--rs-line-strong);
+
+  /* 强调色：低饱和靛青，仅用于关键操作与图表主序列 */
+  --color-accent: var(--rs-accent);
+  --color-accent-soft: var(--rs-accent-soft);
+  --color-accent-ink: var(--rs-accent-ink);
+
+  /* 次强调：赭石，用于「已完成 / 进行中」这类正向标记 */
+  --color-ochre: var(--rs-ochre);
+  --color-ochre-soft: var(--rs-ochre-soft);
+
+  /* 危险操作：低饱和砖红，避免在灰阶纸面上过于跳脱 */
+  --color-danger: var(--rs-danger);
+  --color-danger-soft: var(--rs-danger-soft);
+}
+
+/* 白天：纸白 + 墨黑，中间全是中性灰阶 */
+:root {
+  --rs-paper: #f7f7f5;
+  --rs-surface: #fdfdfc;
+  --rs-raised: #efefec;
+  --rs-sunken: #eceae6;
+
+  --rs-ink: #1a1a1a;
+  --rs-ink-soft: #3d3d3a;
+  --rs-muted: #8a8a85;
+  --rs-faint: #b3b3ad;
+
+  --rs-line: #e5e5e2;
+  --rs-line-strong: #cfcfc9;
+
+  --rs-accent: #46586a;
+  --rs-accent-soft: #e7ebee;
+  --rs-accent-ink: #fdfdfc;
+
+  --rs-ochre: #8a7448;
+  --rs-ochre-soft: #f0ebe0;
+
+  --rs-danger: #8f4a44;
+  --rs-danger-soft: #f2e8e6;
+
+  /* 图表序列：灰阶为主，第一个是强调色，保证单序列图表自动拿到主题色 */
+  --rs-chart-1: #46586a;
+  --rs-chart-2: #8a8a85;
+  --rs-chart-3: #b0b0aa;
+  --rs-chart-4: #6f7d88;
+  --rs-chart-5: #8a7448;
+  --rs-chart-6: #cfcfc9;
+  --rs-chart-grid: #e5e5e2;
+  --rs-chart-axis: #b3b3ad;
+}
+
+/* 夜晚：不用纯黑，也不用纯白字 —— 模拟墨水屏夜间反色，降低眩光 */
+.dark {
+  --rs-paper: #121212;
+  --rs-surface: #191918;
+  --rs-raised: #232322;
+  --rs-sunken: #0d0d0d;
+
+  --rs-ink: #d8d8d4;
+  --rs-ink-soft: #bcbcb7;
+  --rs-muted: #87877f;
+  --rs-faint: #5f5f59;
+
+  --rs-line: #2e2e2b;
+  --rs-line-strong: #3f3f3b;
+
+  --rs-accent: #94a8b9;
+  --rs-accent-soft: #222a30;
+  --rs-accent-ink: #121212;
+
+  --rs-ochre: #b09a6e;
+  --rs-ochre-soft: #2a251c;
+
+  --rs-danger: #b5857f;
+  --rs-danger-soft: #2c2220;
+
+  --rs-chart-1: #94a8b9;
+  --rs-chart-2: #87877f;
+  --rs-chart-3: #5f5f59;
+  --rs-chart-4: #7d8f9c;
+  --rs-chart-5: #b09a6e;
+  --rs-chart-6: #3f3f3b;
+  --rs-chart-grid: #2e2e2b;
+  --rs-chart-axis: #5f5f59;
+}
+
+@layer base {
+  html {
+    -webkit-text-size-adjust: 100%;
+  }
+
+  /* 墨水屏观感的基础：整页用纸面色，正文用衬线 */
+  body {
+    background-color: var(--rs-paper);
+    color: var(--rs-ink);
+    font-family: var(--font-serif);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  /* 表单控件与按钮属于「界面」而非「正文」，统一用无衬线 */
+  button,
+  input,
+  select,
+  textarea,
+  label {
+    font-family: var(--font-sans);
+  }
+
+  /* focus 用清晰描边而不是阴影，符合墨水屏的平面语言 */
+  :focus-visible {
+    outline: 2px solid var(--rs-accent);
+    outline-offset: 1px;
+  }
+
+  /* 滚动条也收敛成灰阶细线 */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: var(--rs-line-strong) transparent;
+  }
+
+  ::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    background-color: var(--rs-line-strong);
+    border-radius: 0;
+  }
+
+  ::-webkit-scrollbar-track {
+    background-color: transparent;
+  }
+}
+
+@layer utilities {
+  /* 供 recharts 的 SVG 直接引用：recharts 的 fill/stroke 接受 CSS 变量 */
+  .rs-chart-ink {
+    color: var(--rs-ink);
+  }
+}
+
+/* recharts 默认给容器加了 outline，墨水屏下这个蓝色描边很扎眼 */
+.recharts-wrapper:focus,
+.recharts-surface:focus {
+  outline: none;
+}

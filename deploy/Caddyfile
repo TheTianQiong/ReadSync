@@ -1,0 +1,47 @@
+# ReadSync 反向代理配置（配合 docker-compose 的 proxy profile 使用）
+#
+# 启动：READSYNC_DOMAIN=read.example.com docker compose --profile proxy up -d
+#
+# Caddy 会自动向 Let's Encrypt 申请并续期证书，无需手动配置 HTTPS。
+
+{
+	# 有公网域名时留空即可自动申请证书；
+	# 内网自签场景可取消下面这行注释（浏览器会有证书警告）
+	# local_certs
+}
+
+{$READSYNC_DOMAIN:localhost} {
+	encode zstd gzip
+
+	# 书籍文件可能很大，且 KOReader 同步的 progress 字段也可能较长
+	request_body {
+		max_size 2GB
+	}
+
+	reverse_proxy readsync:3000 {
+		# 传递真实客户端 IP；同时需要把 READSYNC_TRUST_PROXY 设为 true，
+		# 否则服务端不会采信这些头
+		header_up X-Real-IP {remote_host}
+		header_up X-Forwarded-For {remote_host}
+		header_up X-Forwarded-Proto {scheme}
+
+		# 大文件上传/下载不走缓冲，直接透传
+		flush_interval -1
+	}
+
+	# 同步接口不需要缓存
+	@no_cache path /api/* /syncs/* /users/*
+	header @no_cache Cache-Control "no-store"
+
+	# 安全响应头（服务端已用 helmet 设置，这里对静态资源再兜一层）
+	header {
+		X-Content-Type-Options nosniff
+		Referrer-Policy strict-origin-when-cross-origin
+		-Server
+	}
+
+	log {
+		output stdout
+		format console
+	}
+}

@@ -1,0 +1,47 @@
+# 依赖与构建产物（镜像内会重新安装/构建）
+node_modules
+**/node_modules
+packages/*/dist
+dist
+build
+*.tsbuildinfo
+
+# 运行时数据 —— 绝不能打进镜像（含数据库、密钥、用户上传的书）
+data
+data-*
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+secret.key
+keys/
+
+# 环境变量（含密钥）
+.env
+.env.*
+!.env.example
+
+# 版本控制与 CI
+.git
+.gitignore
+.github
+
+# 文档与部署脚本（镜像内不需要）
+docs
+*.md
+!README.md
+deploy/Dockerfile
+deploy/install.sh
+
+# 编辑器与系统文件
+.vscode
+.idea
+.DS_Store
+Thumbs.db
+
+# 日志与临时文件
+logs
+*.log
+tmp
+temp
+coverage

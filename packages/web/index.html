@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="description" content="读记服务器 ReadSync —— 自托管的阅读进度同步服务器" />
+    <title>读记服务器 ReadSync</title>
+    <script>
+      /*
+       * 在样式表加载前就把 .dark 类打到 <html> 上。
+       * 若放到 React 里做，首帧会先按浅色渲染再翻转，深色模式下会闪一次白屏。
+       */
+      (function () {
+        try {
+          var pref = localStorage.getItem('readsync.theme') || 'system';
+          var dark =
+            pref === 'dark' ||
+            (pref !== 'light' &&
+              window.matchMedia &&
+              window.matchMedia('(prefers-color-scheme: dark)').matches);
+          var root = document.documentElement;
+          root.classList.toggle('dark', !!dark);
+          root.style.colorScheme = dark ? 'dark' : 'light';
+        } catch (e) {
+          /* 隐私模式禁用 localStorage 时忽略，交给 React 侧的默认值 */
+        }
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

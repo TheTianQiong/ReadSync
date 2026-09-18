@@ -1,0 +1,32 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    /* 浏览器环境：继承 base 的 ES2023 之外还要补 DOM */
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "jsx": "react-jsx",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "moduleDetection": "force",
+    "types": ["vite/client"],
+
+    /* 前端产物交给 Vite/Rollup，tsc 只做类型检查，不产出声明文件 */
+    "declaration": false,
+    "declarationMap": false,
+    "sourceMap": false,
+    "noEmit": true,
+
+    "allowSyntheticDefaultImports": true,
+    "esModuleInterop": true,
+    "isolatedModules": true,
+    "resolveJsonModule": true,
+    "skipLibCheck": true,
+
+    /* 与 base 保持一致的严格度；noUncheckedIndexedAccess 会在下面的代码里被显式处理 */
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "exactOptionalPropertyTypes": false
+  },
+  "include": ["src", "vite.config.ts"]
+}
