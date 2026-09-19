@@ -2,8 +2,13 @@
 #
 # ReadSync 一键部署脚本（Linux）
 #
-#   curl -fsSL https://raw.githubusercontent.com/<owner>/ReadSync/main/deploy/install.sh | bash
-#   或克隆仓库后：  sudo bash deploy/install.sh
+# 推荐用法（克隆后执行，国内网络下最可靠）：
+#   git clone https://github.com/TheTianQiong/ReadSync.git
+#   cd ReadSync && sudo bash deploy/install.sh
+#
+# 也可以用一行命令直接跑。注意 raw.githubusercontent.com 在国内常被墙，
+# 因此提供加速前缀写法（加速节点本身失效时，改用上面的 clone 方式）：
+#   curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/TheTianQiong/ReadSync/main/deploy/install.sh | bash
 #
 # 脚本会：检测环境 → 安装 Node.js（如缺失）→ 安装依赖 → 构建 → 生成配置 →
 #         初始化数据库 → 注册 systemd 服务并启动。
