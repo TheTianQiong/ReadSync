@@ -10,8 +10,13 @@
 # 因此提供加速前缀写法（加速节点本身失效时，改用上面的 clone 方式）：
 #   curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/TheTianQiong/ReadSync/main/deploy/install.sh | bash
 #
-# 脚本会：检测环境 → 安装 Node.js（如缺失）→ 安装依赖 → 构建 → 生成配置 →
+# 脚本会：检测环境 → 检测/安装 Node.js → 安装依赖 → 构建 → 生成配置 →
 #         初始化数据库 → 注册 systemd 服务并启动。
+#
+# Node.js 检测：会在 root 的 PATH 之外，额外搜索 sudo 调用者的 nvm / fnm / volta
+# 目录，因此**已经装好 Node 和 npm 的机器不会再下载安装包**。
+# 仅当找不到、版本低于 v20、或缺少 npm 时才会下载。
+# 已装但版本过低时会额外装一份到 /usr/local（不删除原有版本）。
 #
 # 国内网络：脚本内置 GitHub 加速链接与 npm 国内镜像，默认自动选择可用节点。
 # 可通过环境变量覆盖：
@@ -19,6 +24,8 @@
 #   NPM_REGISTRY=https://registry.npmmirror.com  指定 npm 源
 #   READSYNC_DIR=/opt/readsync        指定安装目录
 #   READSYNC_PORT=3000                指定端口
+#   FORCE_NODE_INSTALL=1              强制重新下载安装 Node.js（默认复用已有的）
+#   NODE_MAJOR=22                     需要安装的 Node 主版本
 
 set -Eeuo pipefail
 
@@ -45,6 +52,11 @@ READSYNC_DIR="${READSYNC_DIR:-/opt/readsync}"
 READSYNC_PORT="${READSYNC_PORT:-3000}"
 READSYNC_USER="${READSYNC_USER:-readsync}"
 NODE_MAJOR="${NODE_MAJOR:-22}"
+# 本项目要求的最低 Node 主版本。低于此版本才会去下载安装新版本。
+NODE_MAJOR_MIN="${NODE_MAJOR_MIN:-20}"
+
+# 设为 1 可强制重新下载安装 Node.js（默认在已有可用版本时跳过）
+FORCE_NODE_INSTALL="${FORCE_NODE_INSTALL:-0}"
 
 # 是否要求安装为 systemd 服务
 INSTALL_SERVICE="${INSTALL_SERVICE:-auto}"
@@ -155,23 +167,185 @@ install_base_packages() {
   ok "基础工具就绪"
 }
 
-node_version_ok() {
-  command -v node >/dev/null 2>&1 || return 1
-  local major
-  major="$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0)"
-  [[ "${major}" -ge 20 ]]
+# ---------------------- Node.js 检测 ----------------------
+#
+# 为什么不能只用 `command -v node`：
+# 本脚本要求以 root 运行，而 root 的 PATH 通常不包含普通用户通过
+# nvm / fnm / volta 安装的 Node。结果就是「机器上明明装好了 Node 和 npm，
+# 脚本却判定未安装并重新下载」。下面改为在多个候选目录中查找。
+
+# 检测结果（全局）：保存绝对路径，后续不再依赖 PATH
+NODE_BIN=""
+NPM_BIN=""
+NODE_FOUND_VERSION=""
+NODE_TOO_OLD=0
+NODE_FROM_HOME=0
+
+# 取用户家目录。优先 getent，缺失时退回家目录展开（busybox 环境可能没有 getent）
+user_home_dir() {
+  local user="$1" home=""
+  if command -v getent >/dev/null 2>&1; then
+    home="$(getent passwd "${user}" 2>/dev/null | cut -d: -f6)"
+  fi
+  if [[ -z "${home}" ]]; then
+    home="$(eval echo "~${user}" 2>/dev/null || true)"
+    # 展开失败时会原样返回 ~user，这种结果没有意义
+    [[ "${home}" == "~"* ]] && home=""
+  fi
+  printf '%s' "${home}"
 }
 
-install_node() {
-  if node_version_ok; then
-    ok "已安装 Node.js $(node -v)，跳过安装"
-    return
+# 列出目录下按版本号排序的最后一个条目。sort -V 在 busybox 上可能不支持，故做降级
+latest_version_dir() {
+  local dir="$1" out=""
+  out="$(ls -1 "${dir}" 2>/dev/null | sort -V 2>/dev/null | tail -1)"
+  [[ -z "${out}" ]] && out="$(ls -1 "${dir}" 2>/dev/null | sort | tail -1)"
+  printf '%s' "${out}"
+}
+
+# 判断路径是否落在 systemd 的 ProtectHome 会屏蔽的范围内。
+#
+# ProtectHome=true 会隐藏 /home、/root、/run/user —— 通过 nvm/fnm 安装的 Node
+# 正好在这些位置，若不放宽保护，服务会因找不到解释器而启动失败。
+# 抽成独立函数是为了能脱离文件系统直接测试。
+is_under_home() {
+  case "$1" in
+    /home/*|/root/*|/run/user/*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# 输出 Node.js 的候选搜索目录，每行一个
+node_search_dirs() {
+  local dirs=()
+
+  # 1) sudo 调用者的环境 —— nvm / fnm / volta / 用户本地 bin
+  if [[ -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
+    local home latest
+    home="$(user_home_dir "${SUDO_USER}")"
+    if [[ -n "${home}" && -d "${home}" ]]; then
+      # nvm 可能装了多个版本，取版本号最大的那个
+      if [[ -d "${home}/.nvm/versions/node" ]]; then
+        latest="$(latest_version_dir "${home}/.nvm/versions/node")"
+        [[ -n "${latest}" ]] && dirs+=("${home}/.nvm/versions/node/${latest}/bin")
+      fi
+      # fnm
+      if [[ -d "${home}/.local/share/fnm/node-versions" ]]; then
+        latest="$(latest_version_dir "${home}/.local/share/fnm/node-versions")"
+        [[ -n "${latest}" ]] && dirs+=("${home}/.local/share/fnm/node-versions/${latest}/installation/bin")
+      fi
+      dirs+=("${home}/.volta/bin" "${home}/.local/bin" "${home}/bin")
+    fi
   fi
 
+  # 2) 当前 PATH
+  local p
+  while IFS= read -r p; do
+    [[ -n "${p}" ]] && dirs+=("${p}")
+  done < <(printf '%s' "${PATH}" | tr ':' '\n')
+
+  # 3) 系统常见安装位置
+  dirs+=("/usr/local/bin" "/usr/bin" "/bin" "/usr/local/node/bin" "/opt/node/bin")
+
+  printf '%s\n' "${dirs[@]}"
+}
+
+# 在候选目录中查找可执行文件，成功时输出其绝对路径
+find_tool() {
+  local name="$1" dir
+  while IFS= read -r dir; do
+    if [[ -n "${dir}" && -x "${dir}/${name}" && ! -d "${dir}/${name}" ]]; then
+      printf '%s' "${dir}/${name}"
+      return 0
+    fi
+  done < <(node_search_dirs)
+  return 1
+}
+
+# 检测已有的 Node.js 与 npm。
+# 返回 0 表示找到版本达标且自带 npm 的 Node，可直接复用、无需下载。
+detect_node() {
+  NODE_BIN=""; NPM_BIN=""; NODE_FOUND_VERSION=""; NODE_TOO_OLD=0; NODE_FROM_HOME=0
+
+  local found_node
+  found_node="$(find_tool node || true)"
+  [[ -n "${found_node}" ]] || return 1
+
+  local version major
+  version="$("${found_node}" -v 2>/dev/null || true)"
+  major="${version#v}"; major="${major%%.*}"
+
+  # 版本号解析不出来时不要盲信，交给下载流程处理
+  if ! [[ "${major}" =~ ^[0-9]+$ ]]; then
+    warn "检测到 ${found_node}，但无法解析版本号（输出：${version:-空}），将忽略它"
+    return 1
+  fi
+
+  NODE_FOUND_VERSION="${version}"
+
+  if (( major < NODE_MAJOR_MIN )); then
+    NODE_TOO_OLD=1
+    NODE_BIN="${found_node}"
+    return 1
+  fi
+
+  # npm 通常与 node 同目录，也允许在其它候选目录中找到
+  local found_npm
+  found_npm="$(find_tool npm || true)"
+  if [[ -z "${found_npm}" && -x "$(dirname "${found_node}")/npm" ]]; then
+    found_npm="$(dirname "${found_node}")/npm"
+  fi
+
+  NODE_BIN="${found_node}"
+  NPM_BIN="${found_npm}"
+
+  # 家目录下的 Node 会被 systemd 的 ProtectHome 挡住，注册服务时需放宽
+  if is_under_home "${found_node}"; then
+    NODE_FROM_HOME=1
+  fi
+
+  return 0
+}
+
+# 复用了已有 Node 时，提示可能影响后续运维的细节
+report_node_location() {
+  if (( NODE_FROM_HOME == 1 )); then
+    warn "该 Node 位于用户家目录：$(dirname "${NODE_BIN}")"
+    warn "systemd 的 ProtectHome 会阻止服务访问它，注册服务时将自动放宽该限制"
+    warn "若之后通过 nvm 升级或删除该版本，需要重新运行本脚本更新服务配置"
+  fi
+}
+
+# 仅在「Node 达标但缺少 npm」时尝试补装。
+# Debian 系把 nodejs 与 npm 拆成了两个包，因此这种情况确实存在。
+install_npm_only() {
+  info "尝试通过系统包管理器补装 npm…"
+  local pm=""
+  command -v apt-get >/dev/null 2>&1 && pm="apt-get"
+  [[ -z "${pm}" ]] && command -v dnf >/dev/null 2>&1 && pm="dnf"
+  [[ -z "${pm}" ]] && command -v yum >/dev/null 2>&1 && pm="yum"
+  [[ -z "${pm}" ]] && command -v apk >/dev/null 2>&1 && pm="apk"
+  [[ -n "${pm}" ]] || return 1
+
+  case "${pm}" in
+    apt-get) DEBIAN_FRONTEND=noninteractive apt-get install -y -qq npm >/dev/null 2>&1 || return 1 ;;
+    dnf)     dnf install -y -q npm >/dev/null 2>&1 || return 1 ;;
+    yum)     yum install -y -q npm >/dev/null 2>&1 || return 1 ;;
+    apk)     apk add --no-cache npm >/dev/null 2>&1 || return 1 ;;
+  esac
+
+  # 装上了不代表能用，实测一次
+  local candidate
+  candidate="$(find_tool npm || true)"
+  [[ -n "${candidate}" ]] && "${candidate}" -v >/dev/null 2>&1
+}
+
+# 下载官方预编译包并安装到 /usr/local
+download_and_install_node() {
   info "安装 Node.js v${NODE_MAJOR}…"
 
-  local version filename url tmp
-  # 从 npmmirror 取最新版本号，取不到就退回一个已知可用的版本
+  local version filename tmp
+  # 从 npmmirror 取最新版本号，取不到就退回官方源
   version="$(curl -fsSL --max-time 10 "${NODE_MIRROR_BASE}/latest-v${NODE_MAJOR}.x/" 2>/dev/null \
     | grep -oE "node-v${NODE_MAJOR}\.[0-9]+\.[0-9]+-linux-${NODE_ARCH}\.tar\.xz" \
     | head -1 || true)"
@@ -189,7 +363,7 @@ install_node() {
   info "下载 ${filename}"
 
   tmp="$(mktemp -d)"
-  # 优先国内镜像；失败则走官方（官方源在国外，必要时经 GitHub 加速不适用，故单独处理）
+  # 优先国内镜像；失败则走官方源（官方源在国外，GitHub 加速不适用，故单独处理）
   if ! curl -fL --connect-timeout 15 --retry 2 -o "${tmp}/${filename}" "${NODE_MIRROR_BASE}/${filename}"; then
     warn "国内镜像下载失败，尝试官方源 https://nodejs.org/dist/…"
     curl -fL --connect-timeout 20 --retry 3 -o "${tmp}/${filename}" "https://nodejs.org/dist/v${NODE_MAJOR}/${filename}" \
@@ -200,18 +374,60 @@ install_node() {
   local extracted="${tmp}/${filename%.tar.xz}"
   [[ -d "${extracted}" ]] || die "解压失败：${extracted}"
 
-  # 安装到 /usr/local，覆盖已有 node（若有）
-  cp -rf "${extracted}/bin/." /usr/local/bin/
-  cp -rf "${extracted}/include/." /usr/local/include/ 2>/dev/null || true
-  cp -rf "${extracted}/lib/." /usr/local/lib/ 2>/dev/null || true
-  cp -rf "${extracted}/share/." /usr/local/share/ 2>/dev/null || true
+  # 用 -a 而非 -rf：官方包里的 npm/npx 是指向 lib/node_modules/npm 的
+  # 符号链接，-a 会保留链接关系，-r 可能把它们展开成普通文件
+  cp -a "${extracted}/bin/." /usr/local/bin/
+  cp -a "${extracted}/include/." /usr/local/include/ 2>/dev/null || true
+  cp -a "${extracted}/lib/." /usr/local/lib/ 2>/dev/null || true
+  cp -a "${extracted}/share/." /usr/local/share/ 2>/dev/null || true
 
   rm -rf "${tmp}"
   hash -r
 
-  node_version_ok || die "Node.js 安装后仍无法运行，请检查 /usr/local/bin 是否在 PATH 中。"
+  # 刚装到 /usr/local，直接指定它，避免候选目录里更靠前的旧版本被再次选中
+  NODE_BIN="/usr/local/bin/node"
+  NPM_BIN="/usr/local/bin/npm"
+  NODE_FROM_HOME=0
 
-  ok "Node.js $(node -v) 安装完成"
+  [[ -x "${NODE_BIN}" ]] || die "安装后未找到 ${NODE_BIN}。"
+  [[ -x "${NPM_BIN}" ]] || die "安装后未找到 ${NPM_BIN}（npm 随 Node 一同安装）。"
+}
+
+install_node() {
+  if [[ "${FORCE_NODE_INSTALL}" == "1" ]]; then
+    warn "FORCE_NODE_INSTALL=1，跳过检测，强制重新安装 Node.js"
+    download_and_install_node
+    ok "Node.js $("${NODE_BIN}" -v) 安装完成"
+    return
+  fi
+
+  if detect_node; then
+    ok "检测到 Node.js ${NODE_FOUND_VERSION}：${NODE_BIN}"
+
+    if [[ -n "${NPM_BIN}" ]]; then
+      ok "检测到 npm $("${NPM_BIN}" -v 2>/dev/null || echo '?')：${NPM_BIN}"
+      ok "版本满足要求（>= v${NODE_MAJOR_MIN}），跳过下载与安装"
+      report_node_location
+      return
+    fi
+
+    warn "检测到 Node.js 但未找到 npm（部分发行版把 nodejs 与 npm 拆成两个包）"
+    if install_npm_only; then
+      NPM_BIN="$(find_tool npm || true)"
+      ok "npm $("${NPM_BIN}" -v) 已就绪：${NPM_BIN}"
+      report_node_location
+      return
+    fi
+    warn "补装 npm 失败，改为安装一份自带 npm 的 Node.js v${NODE_MAJOR}"
+  fi
+
+  if (( NODE_TOO_OLD == 1 )); then
+    warn "已安装的 Node.js ${NODE_FOUND_VERSION} 低于要求的 v${NODE_MAJOR_MIN}：${NODE_BIN}"
+    warn "将额外安装 v${NODE_MAJOR} 到 /usr/local（不删除原有版本，但 /usr/local/bin 优先级更高）"
+  fi
+
+  download_and_install_node
+  ok "Node.js $("${NODE_BIN}" -v) 与 npm $("${NPM_BIN}" -v) 安装完成"
 }
 
 # ------------------------------ 获取源码 ------------------------------
@@ -253,16 +469,23 @@ prepare_source() {
 build_project() {
   cd "${READSYNC_DIR}"
 
+  # 用检测阶段确定的绝对路径，避免 PATH 里存在多个 node 时用错版本
+  [[ -n "${NODE_BIN}" && -x "${NODE_BIN}" ]] || die "未确定 Node.js 路径，无法继续。"
+  [[ -n "${NPM_BIN}" && -x "${NPM_BIN}" ]] || die "未确定 npm 路径，无法继续。"
+  export PATH="$(dirname "${NODE_BIN}"):${PATH}"
+
+  info "使用 Node.js $("${NODE_BIN}" -v) / npm $("${NPM_BIN}" -v)"
+
   info "配置 npm 镜像：${NPM_REGISTRY}"
-  npm config set registry "${NPM_REGISTRY}" --location=project 2>/dev/null || true
+  "${NPM_BIN}" config set registry "${NPM_REGISTRY}" --location=project 2>/dev/null || true
 
   info "安装依赖（可能需要几分钟）…"
   # 原生模块（better-sqlite3）的预编译包默认从 GitHub 下载，这里指定国内二进制镜像
-  npm ci --no-audit --no-fund \
-    || npm install --no-audit --no-fund
+  "${NPM_BIN}" ci --no-audit --no-fund \
+    || "${NPM_BIN}" install --no-audit --no-fund
 
   info "构建前后端…"
-  npm run build
+  "${NPM_BIN}" run build
 
   [[ -f "${READSYNC_DIR}/packages/server/dist/index.js" ]] \
     || die "后端构建产物缺失，构建可能失败。"
@@ -338,6 +561,17 @@ setup_service() {
   setup_user
   chown -R "${READSYNC_USER}:${READSYNC_USER}" "${READSYNC_DIR}" 2>/dev/null || true
 
+  # ProtectHome=true 会让服务看不到 /home 与 /root 下的任何东西，
+  # 而通过 nvm/fnm 安装的 Node 正在那里 —— 那样服务会因找不到解释器而启动失败。
+  if (( NODE_FROM_HOME == 1 )); then
+    HOME_PROTECTION="# ProtectHome 已放宽为 read-only：Node 位于 ${NODE_BIN}，
+# 该路径在用户家目录下，完全隔离会导致服务找不到解释器"
+    HOME_PROTECTION_VALUE="ProtectHome=read-only"
+  else
+    HOME_PROTECTION="# 安全加固：服务只需要写自己的数据目录"
+    HOME_PROTECTION_VALUE="ProtectHome=true"
+  fi
+
   # 让服务能读取 .env
   cat > /etc/systemd/system/readsync.service <<EOF
 [Unit]
@@ -351,15 +585,15 @@ Type=simple
 User=${READSYNC_USER}
 WorkingDirectory=${READSYNC_DIR}
 EnvironmentFile=${READSYNC_DIR}/.env
-ExecStart=$(command -v node) ${READSYNC_DIR}/packages/server/dist/index.js
+ExecStart=${NODE_BIN} ${READSYNC_DIR}/packages/server/dist/index.js
 Restart=on-failure
 RestartSec=5
 
-# 安全加固：服务只需要写自己的数据目录
+${HOME_PROTECTION}
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
-ProtectHome=true
+${HOME_PROTECTION_VALUE}
 ReadWritePaths=${READSYNC_DIR}/data
 
 # 日志走 journald
@@ -408,6 +642,8 @@ print_summary() {
   printf "  安装目录   : %s\n" "${READSYNC_DIR}"
   printf "  数据目录   : %s/data\n" "${READSYNC_DIR}"
   printf "  配置文件   : %s/.env\n" "${READSYNC_DIR}"
+  printf "  Node.js    : %s\n" "${NODE_FOUND_VERSION:-$("${NODE_BIN}" -v 2>/dev/null || echo '未知')}（${NODE_BIN}）"
+  printf "  npm        : %s\n" "${NPM_BIN}"
   printf "\n"
   printf "  首次访问会引导你创建管理员账号。\n\n"
 

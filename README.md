@@ -72,7 +72,14 @@ cd ReadSync
 sudo bash deploy/install.sh
 ```
 
-脚本会自动完成：检测环境 → 安装 Node.js（走 npmmirror）→ 安装依赖 → 构建 → 生成 `.env` 与随机主密钥 → 注册 systemd 服务并启动。
+脚本会自动完成：检测环境 → 检测/安装 Node.js → 安装依赖 → 构建 → 生成 `.env` 与随机主密钥 → 注册 systemd 服务并启动。
+
+**已装好 Node.js 的机器不会重复下载**：脚本除了查 root 的 `PATH`，还会搜索 sudo 调用者的 `nvm` / `fnm` / `volta` 目录（这些位置 root 通常看不到，是「明明装了却重新下载」的常见原因）。仅当找不到、版本低于 v20、或缺少 npm 时才会下载安装。已装但版本过低时会额外安装一份到 `/usr/local`，不会删除原有版本。
+
+```bash
+# 需要强制重装 Node.js 时
+FORCE_NODE_INSTALL=1 sudo -E bash deploy/install.sh
+```
 
 **国内网络**：脚本会自动探测可用的 GitHub 加速节点，并使用 npmmirror 作为 npm 源与原生模块二进制源。也可手动指定：
 
