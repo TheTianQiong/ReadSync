@@ -67,8 +67,8 @@ Docker 多阶段构建 · 一键 Shell 部署脚本（内置 GitHub 加速）· 
 ### 方式一：一键脚本（Linux 服务器）
 
 ```bash
-git clone https://github.com/readsync/readsync.git
-cd readsync
+git clone https://github.com/TheTianQiong/ReadSync.git
+cd ReadSync
 sudo bash deploy/install.sh
 ```
 

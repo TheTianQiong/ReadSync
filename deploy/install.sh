@@ -225,7 +225,7 @@ prepare_source() {
   fi
 
   # 否则从 GitHub 拉取
-  local repo_url="${READSYNC_REPO:-https://github.com/readsync/readsync.git}"
+  local repo_url="${READSYNC_REPO:-https://github.com/TheTianQiong/ReadSync.git}"
   if [[ -n "${GITHUB_PROXY}" ]]; then
     repo_url="${GITHUB_PROXY}/${repo_url}"
     info "使用加速地址克隆仓库：${repo_url}"
@@ -337,7 +337,7 @@ setup_service() {
   cat > /etc/systemd/system/readsync.service <<EOF
 [Unit]
 Description=ReadSync 读记服务器
-Documentation=https://github.com/readsync/readsync
+Documentation=https://github.com/TheTianQiong/ReadSync
 After=network-online.target
 Wants=network-online.target
 
