@@ -115,6 +115,46 @@ npm start
 
 启动后访问 `http://localhost:3000`，首次访问会引导创建管理员账号。
 
+### 部署后自检
+
+服务起来之后，建议跑一次验收脚本确认核心链路真的通（只依赖 HTTP，三种部署方式通用）：
+
+```bash
+node scripts/verify-deploy.mjs http://localhost:3000
+```
+
+它会检查健康接口、前端页面、RSA 公钥、初始化管理员、登录、明文密码是否被正确拒绝、存储、同步、统计与 KOSync 协议，共 17 项。
+
+### 常见问题
+
+**`npm ci` 报 `gyp ERR!` / 需要 python3、make、g++**
+
+安装原生模块时走了源码编译。本项目所有原生依赖都自带预编译产物（better-sqlite3 的 `prebuilds/`、`@node-rs/argon2` 与 esbuild 的平台包），无需编译：
+
+```bash
+npm ci --ignore-scripts
+```
+
+一键脚本已内置该参数。若确实需要现场编译，再装 `python3 make g++`。
+
+**一键脚本提示「部署完成」但访问不了**
+
+现在脚本在服务未就绪时会**明确报错并打印 systemd 状态、日志与排查方向**，不会再打印成功横幅。按输出提示处理即可。
+
+**`ProtectHome` 导致服务起不来（项目放在 /root 或 /home 下）**
+
+systemd 的 `ProtectHome=true` 会让服务看不到 `/home`、`/root`。若把项目 clone 到这些位置（例如用 root 登录后直接 `git clone`），服务会读不到自己的代码。脚本会自动检测并放宽为 `read-only` 并给出提示。
+
+更稳妥的做法是放到 `/opt`：
+
+```bash
+sudo mv ~/ReadSync /opt/readsync && cd /opt/readsync && sudo bash deploy/install.sh
+```
+
+**改了 `.env` 但不生效**
+
+服务启动时会自动读取工作目录下的 `.env`（已存在的环境变量优先）。注意要在项目根目录启动，且 systemd 方式下修改 `.env` 后需 `systemctl restart readsync`。
+
 ### 版本管理
 
 版本号定义在 `packages/shared/src/version.ts`，是唯一来源。它会：

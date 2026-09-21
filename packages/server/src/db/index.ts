@@ -1,4 +1,4 @@
-import { mkdirSync } from 'node:fs';
+import { existsSync, mkdirSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import Database from 'better-sqlite3';
@@ -26,10 +26,41 @@ export interface DbHandle {
 
 let handle: DbHandle | null = null;
 
-/** 迁移目录：dev 下是 src/db/../../drizzle，构建后是 dist/db/../../drizzle，两者指向同一处 */
-function migrationsDir(): string {
+/**
+ * 定位迁移目录（packages/server/drizzle）。
+ *
+ * 不能写死一个相对路径：dist 在不同部署方式下的位置不一样。
+ *   - npm 直接运行：  packages/server/dist/db/  → ../../drizzle 命中
+ *   - Docker 扁平化： /app/server/db/           → ../drizzle 命中
+ * 之前只算 `../../drizzle`，容器里会解析成 /app/drizzle 而找不到迁移文件，
+ * 服务启动即失败。这里改为按候选顺序探测，取第一个真实存在的。
+ */
+function resolveMigrationsDir(): string {
   const here = path.dirname(fileURLToPath(import.meta.url));
-  return path.resolve(here, '..', '..', 'drizzle');
+
+  const candidates = [
+    // 显式指定优先，便于自定义打包布局
+    process.env.READSYNC_MIGRATIONS_DIR,
+    // npm/源码布局：packages/server/dist/db → packages/server/drizzle
+    path.resolve(here, '..', '..', 'drizzle'),
+    // 扁平布局：/app/server/db → /app/server/drizzle
+    path.resolve(here, '..', 'drizzle'),
+    path.resolve(process.cwd(), 'drizzle'),
+    path.resolve(process.cwd(), 'packages', 'server', 'drizzle'),
+  ].filter((p): p is string => typeof p === 'string' && p.length > 0);
+
+  for (const dir of candidates) {
+    // drizzle 的 migrator 需要 meta/_journal.json，用它判断目录是否有效
+    if (existsSync(path.join(dir, 'meta', '_journal.json'))) {
+      return dir;
+    }
+  }
+
+  throw new Error(
+    `未找到数据库迁移目录（需要其中的 meta/_journal.json）。已尝试：\n` +
+      candidates.map((c) => `  - ${c}`).join('\n') +
+      `\n可通过环境变量 READSYNC_MIGRATIONS_DIR 显式指定。`,
+  );
 }
 
 /**
@@ -58,12 +89,12 @@ export function openDatabase(): DbHandle {
   const db = drizzle(raw, { schema });
 
   if (config.READSYNC_AUTO_MIGRATE) {
-    const dir = migrationsDir();
     try {
+      const dir = resolveMigrationsDir();
       migrate(db, { migrationsFolder: dir });
       log.info({ migrationsDir: dir }, '数据库迁移已应用');
     } catch (err) {
-      log.error({ err, migrationsDir: dir }, '数据库迁移失败');
+      log.error({ err }, '数据库迁移失败');
       throw err;
     }
   }

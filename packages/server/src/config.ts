@@ -138,10 +138,74 @@ function resolveSecret(dataDir: string, fromEnv: string | undefined): { secret: 
 }
 
 let cached: AppConfig | null = null;
+let dotEnvLoaded = false;
+
+/**
+ * 解析 .env 文件并写入 process.env。
+ *
+ * 为什么需要它：README 的手动部署路径是 `cp .env.example .env && npm start`，
+ * 但 Node 不会自动读取 .env —— 之前只有 systemd 单元的 EnvironmentFile 会读，
+ * 导致手动部署时 .env 被完全忽略（用户改了端口、数据目录都不生效，且毫无提示）。
+ *
+ * 语义与 dotenv 一致：**已存在的环境变量优先**，.env 只补空缺，
+ * 这样 systemd / Docker 注入的配置不会被文件覆盖。
+ *
+ * 用 Node 内置的 process.loadEnvFile（20.12+）读取；不可用时退回最小解析器，
+ * 避免为了一个功能引入 dotenv 依赖。
+ */
+function loadDotEnv(): void {
+  if (dotEnvLoaded) return;
+  dotEnvLoaded = true;
+
+  const envPath = path.resolve(process.cwd(), '.env');
+  if (!existsSync(envPath)) return;
+
+  try {
+    const builtin = (process as unknown as { loadEnvFile?: (p: string) => void }).loadEnvFile;
+    if (typeof builtin === 'function') {
+      // 内置实现遵循「已存在的环境变量优先」，与 dotenv 语义一致
+      builtin.call(process, envPath);
+    } else {
+      parseDotEnvFallback(envPath);
+    }
+  } catch (err) {
+    // .env 格式错误不应导致服务起不来，给出提示后继续用环境变量
+    console.warn(
+      `[config] 读取 ${envPath} 失败，将忽略该文件：${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+}
+
+/** process.loadEnvFile 不可用时的最小 .env 解析（支持 KEY=VALUE、# 注释、引号） */
+function parseDotEnvFallback(envPath: string): void {
+  const content = readFileSync(envPath, 'utf8');
+  for (const rawLine of content.split('\n')) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith('#')) continue;
+
+    const eq = line.indexOf('=');
+    if (eq <= 0) continue;
+
+    const key = line.slice(0, eq).trim();
+    let value = line.slice(eq + 1).trim();
+
+    // 去掉成对的引号
+    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+      value = value.slice(1, -1);
+    }
+
+    if (!(key in process.env)) {
+      process.env[key] = value;
+    }
+  }
+}
 
 /** 加载并校验配置；同一进程内只解析一次 */
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
   if (cached) return cached;
+
+  // 在解析前先把 .env 补进 process.env
+  loadDotEnv();
 
   const parsed = envSchema.safeParse(env);
   if (!parsed.success) {

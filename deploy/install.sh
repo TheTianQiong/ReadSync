@@ -466,6 +466,28 @@ prepare_source() {
 
 # ------------------------------ 构建 ------------------------------
 
+# 实测关键原生模块能否加载。
+# 因为安装时用了 --ignore-scripts，这里必须确认预编译产物确实可用 ——
+# 否则问题会推迟到服务启动时才以晦涩的 MODULE_NOT_FOUND 暴露出来。
+verify_native_modules() {
+  local check
+  check="$("${NODE_BIN}" -e "
+    try {
+      const D = require('better-sqlite3');
+      new D(':memory:').prepare('select 1').get();
+      console.log('ok');
+    } catch (e) { console.log('FAIL:' + e.message); }
+  " 2>&1 | tail -1)"
+
+  if [[ "${check}" != "ok" ]]; then
+    warn "better-sqlite3 无法加载：${check#FAIL:}"
+    warn "它本应使用包内自带的预编译产物（prebuilds/）。若确实需要现场编译，"
+    warn "请先安装编译工具链后重试：apt-get install -y python3 make g++"
+    die "原生模块不可用，构建中止。"
+  fi
+  ok "原生模块自检通过（better-sqlite3 可用）"
+}
+
 build_project() {
   cd "${READSYNC_DIR}"
 
@@ -480,9 +502,21 @@ build_project() {
   "${NPM_BIN}" config set registry "${NPM_REGISTRY}" --location=project 2>/dev/null || true
 
   info "安装依赖（可能需要几分钟）…"
-  # 原生模块（better-sqlite3）的预编译包默认从 GitHub 下载，这里指定国内二进制镜像
-  "${NPM_BIN}" ci --no-audit --no-fund \
-    || "${NPM_BIN}" install --no-audit --no-fund
+  #
+  # 必须加 --ignore-scripts：
+  # npm 10（随 Node 22 附带的版本）不会拦截安装脚本，遇到带 binding.gyp 的包会
+  # 自动调用 node-gyp 做源码编译，而服务器上通常没有 python3/make/g++，
+  # 于是 `npm ci` 直接失败 —— 这是「一键部署跑不起来」的主要原因。
+  #
+  # 跳过脚本是安全的：本项目用到的原生模块都自带各平台预编译产物
+  #   better-sqlite3   → prebuilds/linux-x64.node
+  #   @node-rs/argon2  → @node-rs/argon2-linux-x64-gnu 等平台包
+  #   esbuild/rolldown → 平台专用可选依赖
+  # 安装后下面还会实测这几个模块能否加载，真出问题会给出明确提示。
+  "${NPM_BIN}" ci --ignore-scripts --no-audit --no-fund \
+    || "${NPM_BIN}" install --ignore-scripts --no-audit --no-fund
+
+  verify_native_modules
 
   info "构建前后端…"
   "${NPM_BIN}" run build
@@ -561,12 +595,27 @@ setup_service() {
   setup_user
   chown -R "${READSYNC_USER}:${READSYNC_USER}" "${READSYNC_DIR}" 2>/dev/null || true
 
-  # ProtectHome=true 会让服务看不到 /home 与 /root 下的任何东西，
-  # 而通过 nvm/fnm 安装的 Node 正在那里 —— 那样服务会因找不到解释器而启动失败。
+  # ProtectHome=true 会让服务看不到 /home、/root、/run/user 下的任何内容。
+  #
+  # 只要 **Node 解释器** 或 **应用目录** 任一落在这些位置就必须放宽，否则：
+  #   - Node 在 nvm 目录  → 服务找不到解释器
+  #   - 应用在 /root/ReadSync 或 /home/<用户>/ReadSync（git clone 的常见位置，
+  #     尤其是直接用 root 登录的服务器）→ 服务读不到自己的代码
+  #     甚至 systemd 连 EnvironmentFile 都加载不了，直接启动失败。
+  local home_reason=""
   if (( NODE_FROM_HOME == 1 )); then
-    HOME_PROTECTION="# ProtectHome 已放宽为 read-only：Node 位于 ${NODE_BIN}，
-# 该路径在用户家目录下，完全隔离会导致服务找不到解释器"
+    home_reason="Node 位于家目录 ${NODE_BIN}"
+  fi
+  if is_under_home "${READSYNC_DIR}/"; then
+    home_reason="${home_reason:+${home_reason}；}应用目录位于 ${READSYNC_DIR}"
+  fi
+
+  if [[ -n "${home_reason}" ]]; then
+    HOME_PROTECTION="# ProtectHome 已放宽为 read-only：${home_reason}
+# 完全隔离会导致服务无法访问上述路径而启动失败"
     HOME_PROTECTION_VALUE="ProtectHome=read-only"
+    warn "应用或 Node 位于家目录，systemd 服务已放宽 ProtectHome（${home_reason}）"
+    warn "更稳妥的做法是把项目放到 /opt 下，例如：sudo mv ${READSYNC_DIR} /opt/readsync"
   else
     HOME_PROTECTION="# 安全加固：服务只需要写自己的数据目录"
     HOME_PROTECTION_VALUE="ProtectHome=true"
@@ -611,7 +660,7 @@ EOF
 
   info "等待服务启动…"
   local i
-  for i in $(seq 1 20); do
+  for i in $(seq 1 30); do
     if curl -fsS --max-time 2 "http://127.0.0.1:${READSYNC_PORT}/api/system/health" >/dev/null 2>&1; then
       ok "服务已启动"
       return
@@ -619,7 +668,23 @@ EOF
     sleep 1
   done
 
-  warn "服务未在 20 秒内就绪，请查看日志排查：journalctl -u readsync -n 50 --no-pager"
+  # 启动失败时必须明确失败。
+  # 之前这里只 warn 一句就继续往下打印「部署完成」横幅，
+  # 用户看到的是成功提示、实际服务根本没起来，排查方向完全被误导。
+  err "服务未能在 30 秒内就绪，部署失败。"
+  echo ""
+  echo "── systemd 服务状态 ──────────────────────────"
+  systemctl status readsync --no-pager -l 2>&1 | head -20 || true
+  echo ""
+  echo "── 服务日志（最后 30 行）──────────────────────"
+  journalctl -u readsync -n 30 --no-pager 2>&1 || true
+  echo ""
+  echo "── 常见原因 ──────────────────────────────────"
+  echo "  1. 端口 ${READSYNC_PORT} 被占用：ss -lntp | grep ${READSYNC_PORT}"
+  echo "  2. 数据目录不可写：${READSYNC_DIR}/data 的属主应为 ${READSYNC_USER}"
+  echo "  3. 配置文件有误：检查 ${READSYNC_DIR}/.env"
+  echo ""
+  die "请根据以上信息修复后重新运行本脚本。"
 }
 
 # ------------------------------ 收尾 ------------------------------

@@ -19,6 +19,9 @@ services:
     image: readsync:latest
     container_name: readsync
     restart: unless-stopped
+    # 由 Docker 注入 init 进程（等价于 tini），负责转发信号与回收僵尸进程。
+    # 镜像内不再安装 tini，避免构建时访问 Debian 源（国内极慢）。
+    init: true
     ports:
       - "${READSYNC_PORT:-3000}:3000"
     environment:
