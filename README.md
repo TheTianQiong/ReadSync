@@ -107,13 +107,19 @@ READSYNC_DOMAIN=read.example.com docker compose --profile proxy up -d
 
 ```bash
 # 需要 Node.js 20.11+
-npm install
+npm ci --ignore-scripts   # 用 ci 而非 install：严格按 lock 文件安装，更可靠
+node scripts/check-deps.mjs   # 依赖完整性自检（可选但推荐）
 npm run build
 cp .env.example .env      # 按需修改
 npm start
 ```
 
 启动后访问 `http://localhost:3000`，首次访问会引导创建管理员账号。
+
+> **为什么用 `npm ci --ignore-scripts`**
+>
+> - `npm ci` 严格按 `package-lock.json` 安装并校验一致性，`npm install` 则可能改写依赖树。网络中断时 `npm install` 容易留下「半装」的 `node_modules`（目录在但文件缺失），且再跑一次未必修复。
+> - `--ignore-scripts` 跳过安装脚本。本项目所有原生模块都自带各平台预编译产物，无需现场编译；反之若允许执行脚本，npm 会因 `better-sqlite3` 带 `binding.gyp` 而调用 node-gyp，在没有编译工具链的机器上直接失败。
 
 ### 部署后自检
 
@@ -136,6 +142,21 @@ npm ci --ignore-scripts
 ```
 
 一键脚本已内置该参数。若确实需要现场编译，再装 `python3 make g++`。
+
+**构建报 `TS2339: Property 'ok' does not exist on type 'Response'`，或启动报 `Cannot find package '.../byte-length/dist/index.js'`**
+
+这两个错误**都不是代码问题**，而是 `node_modules` 安装不完整：类型包（`undici-types`）或传递依赖（`byte-length`，`webdav` 的依赖）文件缺失，导致类型推断退化、运行时找不到模块。
+
+安装被中断（网络超时、中途 Ctrl+C、前一次安装报错）就会这样，而且再跑 `npm install` 未必修复。做一次干净的重新安装即可：
+
+```bash
+rm -rf node_modules packages/*/node_modules
+npm ci --ignore-scripts
+node scripts/check-deps.mjs   # 确认全部依赖就位
+npm run build
+```
+
+`scripts/check-deps.mjs` 会逐个实际加载关键依赖（含曾出问题的 `byte-length`、`undici-types`），能在构建前就发现这类问题。
 
 **一键脚本提示「部署完成」但访问不了**
 

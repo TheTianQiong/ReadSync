@@ -16,6 +16,7 @@ import { loadConfig } from '../../config.js';
 import { getDb } from '../../db/index.js';
 import { plugins } from '../../db/schema.js';
 import { notFound, pluginError } from '../../errors.js';
+import { http } from '../../lib/http.js';
 import { getModuleLogger } from '../../logger.js';
 import { assertApiVersionCompatible, isPathInside, safeParseManifest } from './internal.js';
 import { resolvePluginConfig } from './plugin-config.js';
@@ -358,7 +359,9 @@ function buildFetch(pluginId: string, allowed: boolean): FetchLike {
       );
     };
   }
-  return (input, init) => globalThis.fetch(input, init);
+  // 走 lib/http.ts 的显式签名，而不是直接返回原生 Response ——
+  // 后者的类型在不同 @types/node 版本下不一致，会导致换个环境就编译失败
+  return (input, init) => http(input, init);
 }
 
 function registerHook(plugin: LoadedPlugin, hook: PluginHook, handler: HookHandler): void {

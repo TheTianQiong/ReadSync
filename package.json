@@ -24,6 +24,8 @@
     "start": "node packages/server/dist/index.js",
     "cli": "node packages/server/dist/cli.js",
     "typecheck": "npm run typecheck --workspaces --if-present",
+    "check:deps": "node scripts/check-deps.mjs",
+    "verify:deploy": "node scripts/verify-deploy.mjs",
     "clean": "node scripts/clean.mjs"
   },
   "devDependencies": {

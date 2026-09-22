@@ -466,26 +466,24 @@ prepare_source() {
 
 # ------------------------------ 构建 ------------------------------
 
-# 实测关键原生模块能否加载。
-# 因为安装时用了 --ignore-scripts，这里必须确认预编译产物确实可用 ——
-# 否则问题会推迟到服务启动时才以晦涩的 MODULE_NOT_FOUND 暴露出来。
+# 依赖完整性自检。
+#
+# npm 安装被中断时会留下「半装」的 node_modules（目录在但入口文件缺失），
+# 之后再跑 npm install 也未必修复，最终表现为各种看似是代码 bug 的错误。
+# 这里在构建前就把问题挡下来，避免排查方向被带偏。
+#
+# 因为安装时用了 --ignore-scripts，同时也要确认原生模块的预编译产物确实可用。
 verify_native_modules() {
-  local check
-  check="$("${NODE_BIN}" -e "
-    try {
-      const D = require('better-sqlite3');
-      new D(':memory:').prepare('select 1').get();
-      console.log('ok');
-    } catch (e) { console.log('FAIL:' + e.message); }
-  " 2>&1 | tail -1)"
+  local script="${READSYNC_DIR}/scripts/check-deps.mjs"
+  [[ -f "${script}" ]] || { warn "未找到 ${script}，跳过依赖自检"; return; }
 
-  if [[ "${check}" != "ok" ]]; then
-    warn "better-sqlite3 无法加载：${check#FAIL:}"
-    warn "它本应使用包内自带的预编译产物（prebuilds/）。若确实需要现场编译，"
-    warn "请先安装编译工具链后重试：apt-get install -y python3 make g++"
-    die "原生模块不可用，构建中止。"
+  if ! "${NODE_BIN}" "${script}"; then
+    echo ""
+    warn "依赖安装不完整。常见原因是安装过程中网络中断。"
+    warn "可先安装编译工具链后重试（若预编译产物不可用）："
+    warn "  apt-get install -y python3 make g++   # Debian/Ubuntu"
+    die "依赖自检未通过，构建中止。"
   fi
-  ok "原生模块自检通过（better-sqlite3 可用）"
 }
 
 build_project() {

@@ -2,6 +2,7 @@ import { createTransport, type Transporter } from 'nodemailer';
 import type { MailProvider } from '@readsync/shared';
 import { decryptString, isEncrypted } from '../crypto/secret-box.js';
 import { AppError, ERROR_CODES } from '../errors.js';
+import { http } from './http.js';
 import { getModuleLogger } from '../logger.js';
 import { getMailSettingsRaw, getSiteSettings, recordMailTestResult } from './settings.js';
 
@@ -105,7 +106,7 @@ async function sendViaResend(config: ResolvedMailConfig, message: MailMessage): 
     return { ok: false, message: '未配置 Resend API Key' };
   }
 
-  const res = await fetch('https://api.resend.com/emails', {
+  const res = await http('https://api.resend.com/emails', {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${config.apiKey}`,
