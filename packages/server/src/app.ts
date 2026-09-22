@@ -229,8 +229,25 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
   });
 
   app.setNotFoundHandler((req, reply) => {
-    // 前端路由（非 /api）交给 SPA 处理
-    if (!req.url.startsWith('/api') && !req.url.startsWith('/users') && !req.url.startsWith('/syncs')) {
+    /*
+     * 只把「页面导航」交给 SPA 兜底，不要兜静态资源。
+     *
+     * 原先只要路径不以 /api、/users、/syncs 开头就返回 index.html，
+     * 结果是 /favicon.ico 或任何拼错的 .js/.css 都会拿到一份 HTML 且状态码 200。
+     * 浏览器随后会以 "Unexpected token '<'" 之类的报错收场 —— 排查方向完全被带偏。
+     *
+     * 判定方式：
+     *   - 带文件扩展名的路径（/assets/x.js、/favicon.ico）→ 不是导航，走 404
+     *   - 其余无扩展名的路径（/library、/settings/profile）→ 是 SPA 客户端路由，交给 index.html
+     * 另外要求 Accept 含 text/html，进一步排除 fetch/XHR 打到未知路径的情况。
+     */
+    const isApiPath =
+      req.url.startsWith('/api') || req.url.startsWith('/users') || req.url.startsWith('/syncs');
+    const pathname = req.url.split('?')[0] ?? '';
+    const hasFileExtension = /\.[a-zA-Z0-9]{1,8}$/.test(pathname);
+    const acceptsHtml = typeof req.headers.accept === 'string' && req.headers.accept.includes('text/html');
+
+    if (!isApiPath && !hasFileExtension && acceptsHtml) {
       if (webIndexExists()) {
         return reply.type('text/html').sendFile('index.html');
       }
