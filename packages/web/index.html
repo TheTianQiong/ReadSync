@@ -6,27 +6,13 @@
     <meta name="color-scheme" content="light dark" />
     <meta name="description" content="读记服务器 ReadSync —— 自托管的阅读进度同步服务器" />
     <title>读记服务器 ReadSync</title>
-    <script>
-      /*
-       * 在样式表加载前就把 .dark 类打到 <html> 上。
-       * 若放到 React 里做，首帧会先按浅色渲染再翻转，深色模式下会闪一次白屏。
-       */
-      (function () {
-        try {
-          var pref = localStorage.getItem('readsync.theme') || 'system';
-          var dark =
-            pref === 'dark' ||
-            (pref !== 'light' &&
-              window.matchMedia &&
-              window.matchMedia('(prefers-color-scheme: dark)').matches);
-          var root = document.documentElement;
-          root.classList.toggle('dark', !!dark);
-          root.style.colorScheme = dark ? 'dark' : 'light';
-        } catch (e) {
-          /* 隐私模式禁用 localStorage 时忽略，交给 React 侧的默认值 */
-        }
-      })();
-    </script>
+    <!--
+      主题初始化必须放在同源外部脚本里（见 public/theme-init.js），
+      不能写成内联 <script>：生产环境 CSP 为 script-src 'self'，
+      内联脚本会被浏览器直接拦截，导致深色模式首帧闪白。
+      放在样式表之前，是为了尽早给 <html> 打上 .dark。
+    -->
+    <script src="/theme-init.js"></script>
   </head>
   <body>
     <div id="root"></div>

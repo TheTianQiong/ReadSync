@@ -172,6 +172,22 @@ systemd 的 `ProtectHome=true` 会让服务看不到 `/home`、`/root`。若把�
 sudo mv ~/ReadSync /opt/readsync && cd /opt/readsync && sudo bash deploy/install.sh
 ```
 
+**用 `http://<服务器IP>:3000` 打开是空白页，F12 里元素很少**
+
+如果 `http://localhost:3000` 正常、换成 IP 就白屏，那是 CSP 的 `upgrade-insecure-requests` 造成的：它会把页面内所有子资源请求强制升级为 HTTPS，而 IP 地址不属于浏览器的「可信来源」（只有 HTTPS 与 localhost 是），于是浏览器去请求 `https://<ip>:3000/assets/*.js` —— 服务端只提供 HTTP，请求失败，JS 不执行，页面就只剩一个空的 `<div id="root">`。
+
+现在该指令只会在 `READSYNC_BASE_URL` 为 `https://` 时下发。请确认：
+
+```bash
+grep READSYNC_BASE_URL .env
+```
+
+若你是用 HTTP 访问，保持 `http://<实际地址>:3000` 即可。改完 `.env` 需重启服务。
+
+**页面提示「前端尚未构建」**
+
+后端起来了但 `packages/web/dist` 不存在。注意 `npm run build` 是 `build:shared && build:server && build:web` 串行执行，**只要前一步失败，后面的前端构建就不会执行**。请确认 `npm run build` 整体成功，再重启服务。
+
 **改了 `.env` 但不生效**
 
 服务启动时会自动读取工作目录下的 `.env`（已存在的环境变量优先）。注意要在项目根目录启动，且 systemd 方式下修改 `.env` 后需 `systemctl restart readsync`。

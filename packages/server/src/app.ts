@@ -56,6 +56,21 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
 
   /* ----------------------------- 基础插件 ----------------------------- */
 
+  /**
+   * 对外访问地址是否为 HTTPS。
+   *
+   * 决定要不要下发 upgrade-insecure-requests 与 HSTS —— 这两条指令都假设
+   * 站点跑在 HTTPS 上，对自托管的 HTTP 部署是有害的（见下方注释）。
+   * READSYNC_BASE_URL 可能被填成非法值，因此解析失败时按 HTTP 处理。
+   */
+  const publicUrlIsHttps = ((): boolean => {
+    try {
+      return new URL(config.READSYNC_BASE_URL).protocol === 'https:';
+    } catch {
+      return false;
+    }
+  })();
+
   await app.register(helmet, {
     // 前端是 SPA，需要允许内联样式（Tailwind 运行时注入）与 data: 图片
     contentSecurityPolicy: config.NODE_ENV === 'production'
@@ -68,9 +83,32 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
             connectSrc: ["'self'"],
             objectSrc: ["'none'"],
             frameAncestors: ["'none'"],
+
+            /*
+             * upgrade-insecure-requests 是 helmet 的默认指令，会把页面内
+             * **所有子资源请求**升级为 https。
+             *
+             * 自托管场景普遍是 http://<内网IP>:3000，而 IP 地址不属于浏览器
+             * 定义的「可信来源」（只有 https 与 localhost/127.0.0.1 是），
+             * 于是浏览器会真的去请求 https://<ip>:3000/assets/index-xxx.js。
+             * 服务端只有 HTTP、不做 TLS，请求必然失败 —— JS 一行都不会执行，
+             * 页面只剩空的 <div id="root">，表现为「全空白、F12 里没几个元素」。
+             *
+             * 而在 localhost 上测试是正常的（可信来源不升级），所以这个坑
+             * 只在通过 IP/域名访问时暴露。
+             */
+            upgradeInsecureRequests: publicUrlIsHttps ? [] : null,
           },
         }
       : false,
+
+    // 同理：HTTP 部署下发 HSTS 没有意义（浏览器只认 HTTPS 响应里的 HSTS），
+    // 反而会给将来切到 HTTPS 埋下「把自己锁死」的隐患。
+    // 注意这是 helmet 的顶层选项，不是 CSP 指令。
+    strictTransportSecurity: publicUrlIsHttps
+      ? { maxAge: 31536000, includeSubDomains: true }
+      : false,
+
     // 允许跨域携带图片资源
     crossOriginResourcePolicy: { policy: 'cross-origin' },
   });
@@ -196,6 +234,26 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
       if (webIndexExists()) {
         return reply.type('text/html').sendFile('index.html');
       }
+
+      // 前端产物不存在时，若直接返回 404 JSON，用户只会看到一个空页面或一段
+      // 报错文本，完全不知道是「没构建前端」。这里给出可操作的说明。
+      return reply
+        .status(503)
+        .type('text/html; charset=utf-8')
+        .send(
+          `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
+<title>前端尚未构建 · ReadSync</title>
+<style>body{font-family:system-ui,sans-serif;max-width:44rem;margin:12vh auto;padding:0 1.5rem;line-height:1.8;color:#1a1a1a}
+code{background:#f0f0ee;padding:.15em .4em;border-radius:3px}pre{background:#f0f0ee;padding:1rem;border-radius:4px;overflow-x:auto}</style>
+</head><body>
+<h1>前端尚未构建</h1>
+<p>后端已经启动，但没有找到前端构建产物，因此页面无法显示。</p>
+<p>请在项目根目录执行：</p>
+<pre>npm run build</pre>
+<p>然后重启服务。若只想使用 API，可忽略本提示。</p>
+<p style="color:#666;font-size:.9em">期望的产物路径：<code>${config.webDistDir}/index.html</code></p>
+</body></html>`,
+        );
     }
     const body: ApiFailure = {
       ok: false,
@@ -238,6 +296,13 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
       },
     });
     app.log.info({ webDistDir: config.webDistDir }, '已启用前端静态托管');
+  } else if (serveWeb) {
+    // 这是很容易踩的坑：构建在 build:server 阶段失败时 build:web 根本没执行，
+    // 前端产物不存在，访问首页只会看到一个空页面。启动时就明确说出来。
+    app.log.warn(
+      { webDistDir: config.webDistDir },
+      '未找到前端构建产物，Web 界面不可用。请在项目根目录执行 npm run build 后重启服务。',
+    );
   }
 
   return app;
