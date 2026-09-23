@@ -1,6 +1,8 @@
 import { and, asc, count, eq } from 'drizzle-orm';
 import {
   SENSITIVE_CONFIG_KEYS,
+  type StorageBrowseEntry,
+  type StorageBrowseResult,
   type StorageInput,
   type StorageSummary,
   type StorageTestResult,
@@ -302,15 +304,82 @@ export async function testStorage(id: number, userId: number): Promise<StorageTe
   return result;
 }
 
-/** 浏览远端目录（「存储管理」页面用） */
+/**
+ * 浏览目录时向上游扫描的对象数上限。
+ *
+ * 适配器给的是**扁平**对象列表（S3 风格：只有文件，没有目录概念），要还原出
+ * 「这一层有哪些子目录」，必须把它下面所有对象都看一遍才知道。自托管书库通常
+ * 是几千个文件量级，一次扫完没有压力；这个上限只是防止有人把存储根指向一个
+ * 巨型桶时把内存和上游配额打爆。
+ */
+const BROWSE_SCAN_LIMIT = 5000;
+
+/**
+ * 浏览目录（「存储管理」页面用）。
+ *
+ * 适配器的 list() 返回扁平对象列表，而界面要的是**一层目录**：
+ * 这里把 `books/1/ab/cd.md5.epub` 这样的 key 收敛成根目录下的 `books/` 目录项，
+ * 进到 `books/1/` 后再收敛成 `ab/`。没有这一步，界面既显示不出目录，
+ * 也没法逐层进入。
+ */
 export async function browseStorage(
   id: number,
   userId: number,
   options: ListOptions,
-): Promise<ListResult> {
+): Promise<StorageBrowseResult> {
   // 适配器抛出的已是可读的 AppError（STORAGE_ERROR / NOT_FOUND），原样向上传递
   const adapter = await getAdapterForStorage(id, userId);
-  return adapter.list(options);
+
+  // 统一成「以 / 结尾的前缀」或空串，避免 books 与 books/ 两种写法列出不同结果
+  const rawPrefix = (options.prefix ?? '').trim().replace(/^\/+/, '');
+  const prefix = rawPrefix === '' ? '' : `${rawPrefix.replace(/\/+$/, '')}/`;
+
+  const listed = await adapter.list({ prefix, limit: BROWSE_SCAN_LIMIT });
+
+  const limit = options.limit && options.limit > 0 ? options.limit : 100;
+  const dirNames = new Set<string>();
+  const files: StorageBrowseEntry[] = [];
+
+  for (const object of listed.objects) {
+    // 适配器可能返回前缀之外的 key（个别驱动忽略 prefix），这里自己再筛一次
+    if (!object.key.startsWith(prefix)) continue;
+    const rest = object.key.slice(prefix.length);
+    if (!rest) continue;
+
+    const slash = rest.indexOf('/');
+    if (slash === -1) {
+      files.push({
+        name: rest,
+        path: object.key,
+        isDir: false,
+        size: object.size,
+        lastModified: object.lastModified,
+      });
+    } else {
+      // 只取第一段作为目录名：更深的层级等用户点进去再列
+      dirNames.add(rest.slice(0, slash));
+    }
+  }
+
+  const dirs: StorageBrowseEntry[] = [...dirNames].map((name) => ({
+    name,
+    path: `${prefix}${name}/`,
+    isDir: true,
+    size: null,
+    lastModified: null,
+  }));
+
+  // 目录在前、文件在后，各自按名称排序 —— 与常见文件管理器一致
+  dirs.sort((a, b) => a.name.localeCompare(b.name));
+  files.sort((a, b) => a.name.localeCompare(b.name));
+
+  const all = [...dirs, ...files];
+  return {
+    prefix,
+    entries: all.slice(0, limit),
+    // 上游自己截断过的话，这一层也一定不完整，必须如实告知
+    truncated: all.length > limit || listed.truncated,
+  };
 }
 
 /** 创建目录；驱动不支持目录概念（对象存储 / 部分插件）时按空操作成功处理 */

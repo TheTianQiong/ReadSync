@@ -111,6 +111,51 @@ export interface StorageTestResult {
   latencyMs?: number;
 }
 
+/* ---------------------------- 目录浏览 ---------------------------- */
+
+/**
+ * 浏览参数。
+ *
+ * 放在 shared 而不是路由内部：前端要用同一个契约发请求。此前两边各自定义了
+ * 一套（前端发 `path`、服务端读 `prefix`），参数名对不上，服务端永远按空前缀
+ * 列根目录，页面因此恒显示「目录为空」。
+ */
+export const storageBrowseQuerySchema = z.object({
+  /** 要列出的目录前缀；空或 '/' 表示根目录 */
+  prefix: z.string().max(1024).optional(),
+  limit: z.coerce.number().int().min(1).max(1000).optional(),
+  cursor: z.string().max(4096).optional(),
+});
+
+export type StorageBrowseQuery = z.infer<typeof storageBrowseQuerySchema>;
+
+/** 浏览结果里的一条：可能是文件，也可能是由 key 前缀合成出来的目录 */
+export interface StorageBrowseEntry {
+  /** 展示名，不含父路径 */
+  name: string;
+  /** 完整 key；目录以 '/' 结尾，可直接作为下次请求的 prefix */
+  path: string;
+  isDir: boolean;
+  /** 文件字节数；目录为 null */
+  size: number | null;
+  lastModified: string | null;
+}
+
+/**
+ * 浏览结果。
+ *
+ * 字段名固定为 entries：底层适配器的 list() 返回的是「扁平对象列表」（S3 风格，
+ * 只有文件、没有目录概念），而界面要的是「一层目录列表」。转换在服务端完成，
+ * 前端不必也不该自己从 key 里反推目录结构。
+ */
+export interface StorageBrowseResult {
+  /** 本次列出的前缀，便于前端回显当前路径 */
+  prefix: string;
+  entries: StorageBrowseEntry[];
+  /** 条目是否被截断（目录较大时只返回前 limit 条） */
+  truncated: boolean;
+}
+
 /** 需要脱敏的字段名（值统一替换为 ******，仅保留首尾字符以便用户确认没填错） */
 export const SENSITIVE_CONFIG_KEYS = [
   'password',

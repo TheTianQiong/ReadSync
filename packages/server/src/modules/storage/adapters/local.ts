@@ -292,6 +292,16 @@ export class LocalStorageAdapter implements DirectoryAdapter {
       // 统一输出 POSIX 风格的 key，避免 Windows 下产生反斜杠导致跨平台不一致
       const childRel = relDir ? `${relDir}/${entry.name}` : entry.name;
       if (entry.isDirectory()) {
+        /*
+         * 目录本身也作为一条记录输出（key 以 '/' 结尾）。
+         *
+         * 不能只递归收文件：**空目录**在只收文件的实现里会彻底消失，
+         * 用户在「存储管理」里新建一个目录后什么都看不到，像是没生效。
+         * 有子文件的目录会被上层据 key 前缀合成出来，这里重复输出一次也无妨，
+         * 上层用 Set 去重。
+         */
+        const st = await fs.stat(path.join(this.rootDir, childRel));
+        out.push({ key: `${childRel}/`, size: 0, lastModified: st.mtime.toISOString(), etag: null });
         await this.walk(childRel, out);
       } else if (entry.isFile()) {
         const st = await fs.stat(path.join(this.rootDir, childRel));

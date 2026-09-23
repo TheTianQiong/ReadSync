@@ -2,13 +2,14 @@ import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
 import {
   idParamSchema,
+  storageBrowseQuerySchema,
   storageInputSchema,
   storageUpdateSchema,
   type ApiSuccess,
+  type StorageBrowseResult,
   type StorageSummary,
   type StorageTestResult,
 } from '@readsync/shared';
-import type { ListResult } from './types.js';
 import { auditContextFrom, recordAudit } from '../../lib/audit.js';
 import { currentUser, requireAuth } from '../../middleware/auth.js';
 import {
@@ -31,16 +32,12 @@ import {
  */
 
 /**
- * 浏览参数与建目录用的 schema 就地定义。
- * 按 CONVENTIONS 本应放进 @readsync/shared，但本次任务约定不修改 shared 包，
- * 且这两个结构目前只有本模块使用，故暂放这里；后续前端需要复用时再上移。
+ * 建目录用的 schema 就地定义（目前只有本模块的界面在用）。
+ *
+ * 浏览参数则已上移到 @readsync/shared：前端需要用同一份契约发请求。
+ * 两边各自定义过一次的下场是参数名对不上（前端发 path、服务端读 prefix），
+ * 服务端永远按空前缀列根目录，界面恒显示「目录为空或接口尚未就绪」。
  */
-const browseQuerySchema = z.object({
-  prefix: z.string().max(1024).optional(),
-  limit: z.coerce.number().int().min(1).max(1000).optional(),
-  cursor: z.string().max(4096).optional(),
-});
-
 const mkdirBodySchema = z.object({
   /** 目录路径（POSIX 风格相对路径），如 books/2026 */
   path: z.string().trim().min(1).max(1024),
@@ -123,7 +120,7 @@ export async function registerStorageRoutes(app: FastifyInstance): Promise<void>
   app.get('/api/storages/:id/browse', { preHandler: requireAuth }, async (req) => {
     const user = currentUser(req);
     const { id } = idParamSchema.parse(req.params);
-    const query = browseQuerySchema.parse(req.query);
+    const query = storageBrowseQuerySchema.parse(req.query);
 
     const result = await browseStorage(id, user.id, {
       prefix: query.prefix ?? '',
@@ -131,7 +128,7 @@ export async function registerStorageRoutes(app: FastifyInstance): Promise<void>
       ...(query.cursor ? { cursor: query.cursor } : {}),
     });
 
-    return { ok: true, data: result } satisfies ApiSuccess<ListResult>;
+    return { ok: true, data: result } satisfies ApiSuccess<StorageBrowseResult>;
   });
 
   /** 创建目录（WebDAV / 本地生效；对象存储与不支持的驱动按空操作成功返回） */

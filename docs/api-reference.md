@@ -148,8 +148,34 @@ Authorization: Bearer rs_xxxxxxxxxxxx    # 第三方接入令牌（前缀 rs_）
 | POST | `/api/storages` | 新增（local / webdav / s3 / plugin） |
 | GET / PATCH / DELETE | `/api/storages/:id` | 详情 / 更新 / 删除 |
 | POST | `/api/storages/:id/test` | 连通性测试 |
-| GET | `/api/storages/:id/browse` | 浏览远端目录 |
+| GET | `/api/storages/:id/browse` | 浏览目录（一次一层，见下） |
 | POST | `/api/storages/:id/mkdir` | 新建目录 |
+
+#### 浏览目录
+
+```
+GET /api/storages/:id/browse?prefix=books/1/
+```
+
+`prefix` 省略或为空表示根目录。返回**一层**条目，目录在前、文件在后，各自按名称排序：
+
+```json
+{
+  "ok": true,
+  "data": {
+    "prefix": "books/1/",
+    "entries": [
+      { "name": "ab", "path": "books/1/ab/", "isDir": true,  "size": null,   "lastModified": null },
+      { "name": "d41d8cd9.epub", "path": "books/1/d41d8cd9.epub", "isDir": false, "size": 1048576, "lastModified": "2026-09-23T11:20:31.206Z" }
+    ],
+    "truncated": false
+  }
+}
+```
+
+- `path` 是完整 key；**目录以 `/` 结尾，可直接作为下次请求的 `prefix`**。
+- 底层适配器的 `list()` 返回的是扁平对象列表（S3 风格，只有文件、没有目录概念）。把 key 前缀收敛成目录条目这件事在服务端完成，调用方不必自己从 key 反推目录结构。
+- `truncated` 为 true 表示条目被截断（目录很大时只返回前 `limit` 条，默认 100）。
 
 ### 3.4 个人书库 `/api/books`
 

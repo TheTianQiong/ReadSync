@@ -1,6 +1,8 @@
 import {
   S3_ADDRESSING_STYLES,
   STORAGE_DRIVERS,
+  type StorageBrowseEntry,
+  type StorageBrowseResult,
   type StorageInput,
   type StorageSummary,
   type StorageTestResult,
@@ -36,13 +38,6 @@ const DRIVER_ICONS: Record<string, ReactNode> = {
   plugin: <Plug size={14} />,
 };
 
-interface BrowseEntry {
-  name: string;
-  path?: string;
-  isDir?: boolean;
-  directory?: boolean;
-  size?: number;
-}
 
 /**
  * 存储管理（README 要求 7、8）。
@@ -605,7 +600,7 @@ function BrowseDialog({
   onClose: () => void;
 }): ReactNode {
   const [path, setPath] = useState('/');
-  const [entries, setEntries] = useState<BrowseEntry[]>([]);
+  const [entries, setEntries] = useState<StorageBrowseEntry[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [newDir, setNewDir] = useState('');
@@ -616,12 +611,13 @@ function BrowseDialog({
       setLoading(true);
       setError(null);
       try {
-        const result = await api.get<{ items?: BrowseEntry[]; entries?: BrowseEntry[] } | BrowseEntry[]>(
-          `/storages/${storage.id}/browse`,
-          { path: target },
-        );
-        const items = Array.isArray(result) ? result : (result.items ?? result.entries ?? []);
-        setEntries(items);
+        // 参数名与响应字段都必须与 @readsync/shared 的 browse 契约一致：
+        // 之前这里发的是 path、读的是 items/entries，而服务端收的是 prefix、
+        // 返回的是 objects —— 三处都对不上，页面因此恒显示「目录为空」。
+        const result = await api.get<StorageBrowseResult>(`/storages/${storage.id}/browse`, {
+          prefix: target === '/' ? '' : target,
+        });
+        setEntries(result.entries ?? []);
       } catch (err) {
         setError(err instanceof Error ? err.message : '浏览失败');
         setEntries([]);
@@ -701,35 +697,37 @@ function BrowseDialog({
         {loading ? (
           <PageSpinner label="正在读取目录…" />
         ) : entries.length === 0 ? (
-          <EmptyState title="目录为空或接口尚未就绪" />
+          <EmptyState title="这个目录是空的" />
         ) : (
           <ul className="flex flex-col divide-y divide-line rounded-sm border border-line">
-            {entries.map((entry) => {
-              const isDir = entry.isDir ?? entry.directory ?? false;
-              const entryPath = entry.path ?? `${path.replace(/\/$/, '')}/${entry.name}`;
-              return (
-                <li key={entryPath} className="flex items-center justify-between gap-2 px-3 py-1.5">
-                  <span className="flex min-w-0 items-center gap-2">
-                    {isDir ? <FolderOpen size={13} className="shrink-0 text-muted" /> : <Cloud size={13} className="shrink-0 text-faint" />}
-                    <span className="truncate font-sans text-xs text-ink-soft">{entry.name}</span>
-                  </span>
-                  {isDir ? (
-                    <Button
-                      size="sm"
-                      variant="quiet"
-                      onClick={() => {
-                        setPath(entryPath);
-                        void load(entryPath);
-                      }}
-                    >
-                      打开
-                    </Button>
+            {entries.map((entry) => (
+              <li key={entry.path} className="flex items-center justify-between gap-2 px-3 py-1.5">
+                <span className="flex min-w-0 items-center gap-2">
+                  {entry.isDir ? (
+                    <FolderOpen size={13} className="shrink-0 text-muted" />
                   ) : (
-                    <span className="shrink-0 font-sans text-xs text-muted">{formatBytes(entry.size)}</span>
+                    <Cloud size={13} className="shrink-0 text-faint" />
                   )}
-                </li>
-              );
-            })}
+                  <span className="truncate font-sans text-xs text-ink-soft">{entry.name}</span>
+                </span>
+                {entry.isDir ? (
+                  <Button
+                    size="sm"
+                    variant="quiet"
+                    onClick={() => {
+                      setPath(entry.path);
+                      void load(entry.path);
+                    }}
+                  >
+                    打开
+                  </Button>
+                ) : (
+                  <span className="shrink-0 font-sans text-xs text-muted">
+                    {entry.size === null ? '—' : formatBytes(entry.size)}
+                  </span>
+                )}
+              </li>
+            ))}
           </ul>
         )}
       </div>

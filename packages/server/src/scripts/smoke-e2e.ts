@@ -226,6 +226,12 @@ async function main(): Promise<void> {
     const tested = await api({ method: 'POST', url: `/api/storages/${storageId}/test`, headers: auth });
     check('存储连通性测试通过', tested.json().data?.ok === true, tested.body);
 
+    // 目录浏览的契约必须前后端一致。此前前端发 path、读 items/entries，而服务端
+    // 收 prefix、返回 objects —— 三处都对不上，界面恒显示「目录为空」。
+    const browseEmpty = await api({ method: 'GET', url: `/api/storages/${storageId}/browse`, headers: auth });
+    check('浏览空存储返回 entries 数组', Array.isArray(browseEmpty.json().data?.entries), browseEmpty.body);
+    check('浏览结果回显 prefix', browseEmpty.json().data?.prefix === '', browseEmpty.json().data);
+
     /* ---------------------------- 5. 上传书籍 ---------------------------- */
     section('5. 书库与上传');
     const bookContent = Buffer.from(`%PDF-1.4 fake epub content ${randomUUID()}`.repeat(50), 'utf8');
@@ -270,6 +276,77 @@ async function main(): Promise<void> {
     const download = await api({ method: 'GET', url: `/api/books/${book!.id}/download`, headers: auth });
     check('下载书籍成功', download.statusCode === 200, download.statusCode);
     check('下载内容与上传一致', Buffer.from(download.rawPayload).equals(bookContent));
+
+    // 上传后存储里应当真的能看到文件 —— 这正是用户反馈「实际存了文件却显示目录为空」的场景。
+    // 书的 key 形如 books/<userId>/<md5前2位>/<md5>.<ext>，要逐层点进去才能看到文件。
+    const root = await api({ method: 'GET', url: `/api/storages/${storageId}/browse`, headers: auth });
+    const rootEntries = root.json().data?.entries as { name: string; path: string; isDir: boolean }[];
+    check('上传后根目录出现 books 目录', rootEntries?.some((e) => e.name === 'books' && e.isDir), rootEntries);
+
+    const booksDir = rootEntries?.find((e) => e.name === 'books');
+    const level1 = await api({
+      method: 'GET',
+      url: `/api/storages/${storageId}/browse?prefix=${encodeURIComponent(booksDir?.path ?? '')}`,
+      headers: auth,
+    });
+    const level1Entries = level1.json().data?.entries as { name: string; path: string; isDir: boolean }[];
+    check('books/ 下出现用户目录', level1Entries?.some((e) => e.isDir), level1Entries);
+
+    // 一路点到文件所在层，确认文件条目带 size 且 isDir=false
+    const userDir = level1Entries?.[0];
+    const level2 = await api({
+      method: 'GET',
+      url: `/api/storages/${storageId}/browse?prefix=${encodeURIComponent(userDir?.path ?? '')}`,
+      headers: auth,
+    });
+    const level2Entries = level2.json().data?.entries as { name: string; path: string; isDir: boolean }[];
+    const level3 = await api({
+      method: 'GET',
+      url: `/api/storages/${storageId}/browse?prefix=${encodeURIComponent(level2Entries?.[0]?.path ?? '')}`,
+      headers: auth,
+    });
+    const fileEntries = level3.json().data?.entries as { name: string; isDir: boolean; size: number | null }[];
+    check(
+      '逐层进入后能看到实际文件',
+      Array.isArray(fileEntries) && fileEntries.length > 0 && fileEntries.every((e) => !e.isDir),
+      fileEntries,
+    );
+    check('文件条目带大小', typeof fileEntries?.[0]?.size === 'number' && fileEntries[0].size > 0, fileEntries?.[0]);
+    check(
+      '文件名不含父目录路径（展示名与 key 分离）',
+      fileEntries?.[0]?.name !== undefined && !fileEntries[0].name.includes('/'),
+      fileEntries?.[0]?.name,
+    );
+
+    // 不存在的目录应当是空列表而不是报错 —— 界面据此显示「这个目录是空的」
+    const missingDir = await api({
+      method: 'GET',
+      url: `/api/storages/${storageId}/browse?prefix=no-such-dir/`,
+      headers: auth,
+    });
+    check('浏览不存在的目录返回空列表', missingDir.json().data?.entries?.length === 0, missingDir.body);
+
+    // 新建的空目录必须出现在列表里，否则界面上「新建目录」看起来像没生效
+    const madeDir = await api({
+      method: 'POST',
+      url: `/api/storages/${storageId}/mkdir`,
+      headers: auth,
+      payload: { path: '我的空目录' },
+    });
+    check('新建目录成功', madeDir.statusCode === 200, madeDir.body);
+
+    const afterMkdir = await api({ method: 'GET', url: `/api/storages/${storageId}/browse`, headers: auth });
+    const mkdirEntries = afterMkdir.json().data?.entries as { name: string; path: string; isDir: boolean }[];
+    const newDir = mkdirEntries?.find((e) => e.name === '我的空目录');
+    check('新建的空目录出现在根目录列表里', newDir?.isDir === true, mkdirEntries);
+    check('目录条目的 path 以 / 结尾（可直接作为下次 prefix）', newDir?.path === '我的空目录/', newDir?.path);
+
+    const intoNewDir = await api({
+      method: 'GET',
+      url: `/api/storages/${storageId}/browse?prefix=${encodeURIComponent('我的空目录/')}`,
+      headers: auth,
+    });
+    check('进入新建目录为空列表', intoNewDir.json().data?.entries?.length === 0, intoNewDir.body);
 
     /* ------------------------- 5b. 分片上传 ------------------------- */
     section('5b. 分片上传（绕过代理的体积/超时限制）');
