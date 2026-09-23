@@ -19,7 +19,7 @@ import { PageSpinner } from '../../components/ui/Spinner';
 import { Table, TBody, TD, TH, THead, TR } from '../../components/ui/Table';
 import { useToast } from '../../components/ui/Toast';
 import { api } from '../../lib/api';
-import { encryptPassword } from '../../lib/crypto';
+import { buildPasswordPayload } from '../../lib/crypto';
 import { useAsync, useDebounced } from '../../lib/hooks';
 import { formatBytes, formatDateTime, formatRelative } from '../../lib/utils';
 
@@ -326,7 +326,7 @@ function CreateUserDialog({
 
     setSaving(true);
     try {
-      const payload = await encryptPassword(password);
+      const payload = await buildPasswordPayload(password);
       await api.post('/admin/users', {
         username: username.trim(),
         email: email.trim(),
@@ -530,7 +530,7 @@ function ResetPasswordDialog({
     setSaving(true);
     setError(null);
     try {
-      const payload = await encryptPassword(newPassword);
+      const payload = await buildPasswordPayload(newPassword);
       await api.post(`/admin/users/${user.id}/reset-password`, { newPassword: payload, resetKosyncKey });
       onSaved();
       onClose();

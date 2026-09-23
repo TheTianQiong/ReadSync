@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import { MAIL_PROVIDERS, USER_ROLES, USER_STATUSES } from '../constants.js';
-import { encryptedPayloadSchema } from './auth.js';
+import { passwordPayloadSchema } from './auth.js';
 import { DEFAULT_ALLOWED_EXTENSIONS, DEFAULT_MAX_FILE_SIZE } from './book.js';
 import { paginationQuerySchema } from './common.js';
 
@@ -53,6 +53,17 @@ export interface PublicSettings {
   defaultTheme: 'light' | 'dark' | 'system';
   footerText: string;
   version: string;
+  /**
+   * 服务端是否接受明文密码。
+   *
+   * 背景：密码加密依赖浏览器的 WebCrypto，而它只在安全上下文（HTTPS 或
+   * localhost）可用。只通过 http://<内网IP> 访问时，前端无法加密 ——
+   * 此时若服务端显式开启了 READSYNC_ALLOW_PLAINTEXT_PASSWORD，
+   * 前端才降级为明文提交，并展示醒目警告。
+   *
+   * 默认 false：服务端只接受密文，前端在非安全上下文下明确报错而不是悄悄降级。
+   */
+  allowPlaintextPassword: boolean;
 }
 
 /* ---------------------------- 邮件设置 ---------------------------- */
@@ -114,8 +125,8 @@ export type ListUsersQuery = z.infer<typeof listUsersQuerySchema>;
 export const adminCreateUserSchema = z.object({
   username: z.string().min(3).max(32),
   email: z.email(),
-  /** 密文提交；管理员输入的是别人的密码，更不应明文过网 */
-  password: encryptedPayloadSchema,
+  /** 密码载荷；管理员输入的是别人的密码，更不应明文过网 */
+  password: passwordPayloadSchema,
   displayName: z.string().trim().max(64).optional(),
   role: z.enum(USER_ROLES).default('user'),
 });
@@ -130,7 +141,7 @@ export const adminUpdateUserSchema = z.object({
 
 /** 管理员重置用户密码（直接指定新密码，无需旧密码） */
 export const adminResetPasswordSchema = z.object({
-  newPassword: encryptedPayloadSchema,
+  newPassword: passwordPayloadSchema,
   /** 是否同时重置该用户的 KOSync 同步密钥 */
   resetKosyncKey: z.boolean().default(true),
 });
@@ -238,8 +249,8 @@ export interface SystemInfo {
 export const bootstrapSchema = z.object({
   username: z.string().min(3).max(32),
   email: z.email(),
-  /** 密文提交，与登录/注册保持一致 */
-  password: encryptedPayloadSchema,
+  /** 密码载荷，与登录/注册保持一致 */
+  password: passwordPayloadSchema,
   siteName: z.string().trim().min(1).max(64).default('读记服务器'),
 });
 

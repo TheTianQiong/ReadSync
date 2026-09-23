@@ -1,7 +1,7 @@
 import { and, eq, isNull, sql } from 'drizzle-orm';
 import type { FastifyRequest } from 'fastify';
 import { OTP } from 'otplib';
-import type { AuthResult, EncryptedPayload } from '@readsync/shared';
+import type { AuthResult, PasswordPayload } from '@readsync/shared';
 import { loadConfig } from '../../config.js';
 import { resolvePassword } from '../../crypto/keys.js';
 import { generateToken, hashPassword, sha256Hex, verifyPassword } from '../../crypto/password.js';
@@ -276,7 +276,7 @@ function dummyPasswordHash(): Promise<string> {
  * 就成了用户名/邮箱枚举器。用户不存在时依然执行一次 RSA 解密与 Argon2 校验，
  * 让两条分支的耗时接近（否则响应时间本身也会泄漏账号是否存在）。
  */
-export async function verifyCredentials(login: string, password: EncryptedPayload): Promise<UserRow | null> {
+export async function verifyCredentials(login: string, password: PasswordPayload): Promise<UserRow | null> {
   const plain = resolvePassword(password);
   const user = findUserByLogin(login);
 

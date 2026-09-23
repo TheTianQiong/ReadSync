@@ -6,6 +6,7 @@ import {
   type SiteSettings,
 } from '@readsync/shared';
 import { VERSION } from '@readsync/shared';
+import { allowPlaintextPassword } from '../crypto/keys.js';
 import { getDb } from '../db/index.js';
 import { serverSettings } from '../db/schema.js';
 import { getPublicKeyFingerprintSafe } from './fingerprint.js';
@@ -66,6 +67,8 @@ export function getPublicSettings(): PublicSettings {
     defaultTheme: s.defaultTheme,
     footerText: s.footerText,
     version: VERSION,
+    // 前端据此决定：无法使用 WebCrypto 时是报错还是降级为明文提交
+    allowPlaintextPassword: allowPlaintextPassword(),
   };
 }
 

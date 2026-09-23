@@ -38,12 +38,29 @@ export const encryptedPayloadSchema = z.object({
 
 export type EncryptedPayload = z.infer<typeof encryptedPayloadSchema>;
 
+/**
+ * 密码载荷：正常是 RSA 密文对象，也可能是明文串。
+ *
+ * 为什么 schema 要放行明文：
+ * 密码加密依赖浏览器的 WebCrypto，而它只在安全上下文（HTTPS / localhost）可用。
+ * 只通过 http://<内网IP> 访问时前端无法加密，若 schema 在此处硬性拒绝，
+ * 用户会被彻底卡死（连初始化都做不了），且错误信息与真实原因无关。
+ *
+ * 安全性不受影响：**是否接受明文由服务端的 resolvePassword 决定**，
+ * 只有显式设置 READSYNC_ALLOW_PLAINTEXT_PASSWORD=true 时才会通过；
+ * 默认情况下明文会在解密环节被拒绝（BAD_REQUEST）。schema 只描述传输形状，
+ * 策略检查集中在 crypto/keys.ts 一处。
+ */
+export const passwordPayloadSchema = z.union([encryptedPayloadSchema, z.string().min(1).max(256)]);
+
+export type PasswordPayload = z.infer<typeof passwordPayloadSchema>;
+
 /** 注册请求 */
 export const registerSchema = z.object({
   username: usernameSchema,
   email: z.email('邮箱格式不正确'),
-  /** 密码密文（RSA-OAEP） */
-  password: encryptedPayloadSchema,
+  /** 密码载荷：RSA 密文（正常）或明文串（仅在服务端开启降级时接受） */
+  password: passwordPayloadSchema,
   /** 邀请码；当后台开启「邀请码注册」时必填 */
   inviteCode: z.string().trim().min(1).max(64).optional(),
   /** 显示名称，可选 */
@@ -75,7 +92,7 @@ export function isTotpCode(code: string): boolean {
 /** 登录请求 */
 export const loginSchema = z.object({
   username: usernameSchema.or(z.email()),
-  password: encryptedPayloadSchema,
+  password: passwordPayloadSchema,
   /** 两步验证凭据：TOTP 验证码或恢复码，当账号开启 TOTP 时需要 */
   totpCode: twoFactorCodeSchema.optional(),
   /** 是否记住登录状态（延长会话有效期） */
@@ -98,13 +115,13 @@ export const resetPasswordSchema = z.object({
   email: z.email('邮箱格式不正确'),
   code: z.string().regex(/^[0-9]{6}$/, '验证码为 6 位数字'),
   /** 新密码同样以密文提交：明文密码不应出现在任何请求体里 */
-  newPassword: encryptedPayloadSchema,
+  newPassword: passwordPayloadSchema,
 });
 
 /** 修改密码（已登录） */
 export const changePasswordSchema = z.object({
-  oldPassword: encryptedPayloadSchema,
-  newPassword: encryptedPayloadSchema,
+  oldPassword: passwordPayloadSchema,
+  newPassword: passwordPayloadSchema,
 });
 
 /** 当前登录用户信息 */
@@ -153,7 +170,7 @@ export const totpVerifySchema = z.object({
 
 export const totpDisableSchema = z.object({
   code: z.string().regex(/^[0-9]{6}$/, '验证码为 6 位数字'),
-  password: encryptedPayloadSchema,
+  password: passwordPayloadSchema,
 });
 
 /** 开启 2FA 时返回的绑定信息 */

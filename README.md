@@ -121,6 +121,40 @@ npm start
 > - `npm ci` 严格按 `package-lock.json` 安装并校验一致性，`npm install` 则可能改写依赖树。网络中断时 `npm install` 容易留下「半装」的 `node_modules`（目录在但文件缺失），且再跑一次未必修复。
 > - `--ignore-scripts` 跳过安装脚本。本项目所有原生模块都自带各平台预编译产物，无需现场编译；反之若允许执行脚本，npm 会因 `better-sqlite3` 带 `binding.gyp` 而调用 node-gyp，在没有编译工具链的机器上直接失败。
 
+### 方式四：Cloudflare Tunnel（免费 HTTPS，无需公网 IP 与证书）
+
+服务端很多功能依赖**安全上下文**（HTTPS 或 localhost）—— 浏览器的 WebCrypto 只在安全上下文可用，密码加密、通行密钥都基于它。如果你的服务器只能用 `http://<IP>:3000` 访问，推荐用 Cloudflare Tunnel 补上 HTTPS。
+
+```bash
+# 1. 安装 cloudflared（Debian/Ubuntu）
+curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb -o cloudflared.deb
+sudo dpkg -i cloudflared.deb
+
+# 2. 登录并创建隧道
+cloudflared tunnel login
+cloudflared tunnel create readsync
+
+# 3. 指向本地服务（注意用 127.0.0.1，见下方说明）
+cloudflared tunnel --url http://127.0.0.1:3000
+```
+
+然后在 `.env` 中按隧道域名调整，并**重启服务**：
+
+```bash
+READSYNC_BASE_URL=https://read.example.com   # 换成你的隧道域名
+READSYNC_TRUST_PROXY=true                    # 让服务采信 X-Forwarded-* 拿到真实客户端 IP
+```
+
+> **为什么源站地址建议用 `127.0.0.1` 而不是 `localhost`**
+>
+> `localhost` 在不少系统上会优先解析到 IPv6 的 `::1`。服务端默认按双栈监听（`::`）已能兼容两种解析；但如果你此前把 `READSYNC_HOST` 设成了 `0.0.0.0`（纯 IPv4）或用了别的反向代理，写 `127.0.0.1` 最省事。
+>
+> 若隧道报 **502 Bad Gateway**，按顺序排查：
+> 1. 源站地址写成 `http://`（不是 `https://`）且端口正确；
+> 2. 应用是否在跑：`curl -I http://127.0.0.1:3000/api/system/health`；
+> 3. 上面那条 IPv6 问题 —— 改用 `127.0.0.1` 试试；
+> 4. `cloudflared` 若跑在 Docker 里，`localhost` 指向的是容器自身，应改用宿主机地址。
+
 ### 部署后自检
 
 服务起来之后，建议跑一次验收脚本确认核心链路真的通（只依赖 HTTP，三种部署方式通用）：
@@ -187,6 +221,24 @@ grep READSYNC_BASE_URL .env
 **页面提示「前端尚未构建」**
 
 后端起来了但 `packages/web/dist` 不存在。注意 `npm run build` 是 `build:shared && build:server && build:web` 串行执行，**只要前一步失败，后面的前端构建就不会执行**。请确认 `npm run build` 整体成功，再重启服务。
+
+**能用页面，但一到「创建管理员 / 登录」就失败，提示不支持 WebCrypto**
+
+说明你在用 `http://<IP>:3000` 访问 —— 这不是安全上下文，浏览器不提供 WebCrypto，前端无法加密密码。有三种解决办法，按推荐顺序：
+
+1. **配 HTTPS**（推荐）：用上面的 [Cloudflare Tunnel](#方式四cloudflare-tunnel免费-https无需公网-ip-与证书)；
+2. **改用 `http://localhost:3000`** 在本机浏览器访问（localhost 属于安全上下文）；
+3. **确实只能走 HTTP 时**，在 `.env` 中显式开启明文降级后重启：
+
+```bash
+READSYNC_ALLOW_PLAINTEXT_PASSWORD=true
+```
+
+   开启后页面上会显示醒目警告，密码将以明文提交。**仅限内网 / VPN 等可信链路**，公网部署请勿使用。
+
+**Cloudflare Tunnel 报 502 Bad Gateway**
+
+见 [方式四](#方式四cloudflare-tunnel免费-https无需公网-ip-与证书) 的排查清单。最常见的是源站地址写成 `https://`、端口不对，或 `localhost` 被解析到 IPv6 而源站只监听了 IPv4 —— 后者改用 `http://127.0.0.1:3000` 即可。
 
 **改了 `.env` 但不生效**
 

@@ -97,6 +97,51 @@ export function resetKeyCache(): void {
   cached = null;
 }
 
+/* -------------------------------------------------------------------------- */
+/* 明文降级                                                                    */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * 服务端是否允许明文密码（来自 /api/system/settings 的 allowPlaintextPassword）。
+ *
+ * 为什么需要这个开关：WebCrypto 只在安全上下文可用，而「用 http://<内网IP>
+ * 访问」是很常见的自托管场景 —— 此时前端根本无法加密。若不给降级路径，
+ * 用户会卡在「无法初始化」且没有任何可行办法。
+ *
+ * 默认 false：非安全上下文下直接报错，而不是悄悄把明文发出去。
+ */
+let plaintextAllowed = false;
+
+/** 由 AuthContext 在拉到公开设置后写入 */
+export function setPlaintextFallbackAllowed(allowed: boolean): void {
+  plaintextAllowed = allowed;
+}
+
+/** 当前是否处于「无法加密、只能明文」的降级状态（用于展示警告） */
+export function isPlaintextFallbackActive(): boolean {
+  return !isEncryptionAvailable() && plaintextAllowed;
+}
+
+/**
+ * 构造密码载荷 —— 所有需要提交密码的地方都应当走它。
+ *
+ * 行为：
+ *  1. 安全上下文（HTTPS / localhost）→ 正常 RSA-OAEP 加密；
+ *  2. 非安全上下文 + 服务端允许明文 → 返回明文字符串，接口照常接受；
+ *  3. 非安全上下文 + 服务端未允许 → 抛出可读错误，明确告诉用户怎么办。
+ */
+export async function buildPasswordPayload(password: string): Promise<EncryptedPayload | string> {
+  if (isEncryptionAvailable()) {
+    return encryptPassword(password);
+  }
+
+  if (plaintextAllowed) {
+    return password;
+  }
+
+  throw new Error(UNSUPPORTED_MESSAGE);
+}
+
 /**
  * 加密密码，返回可直接放进请求体的载荷。
  * 失败时抛出带中文原因的错误，调用方应把 message 直接展示给用户。

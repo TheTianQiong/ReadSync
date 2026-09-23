@@ -13,7 +13,7 @@ import { Table, TBody, TD, TH, THead, TR } from '../../components/ui/Table';
 import { useToast } from '../../components/ui/Toast';
 import { useAuth } from '../../contexts/AuthContext';
 import { api } from '../../lib/api';
-import { encryptPassword } from '../../lib/crypto';
+import { buildPasswordPayload } from '../../lib/crypto';
 import { useAsync } from '../../lib/hooks';
 import { copyText, formatRelative } from '../../lib/utils';
 import { isPasskeySupported, registerPasskey } from '../../lib/webauthn';
@@ -92,8 +92,8 @@ export function Security(): ReactNode {
     setChangingPassword(true);
     try {
       // 旧密码与新密码都以 RSA 密文提交
-      const oldPayload = await encryptPassword(oldPassword);
-      const newPayload = await encryptPassword(newPassword);
+      const oldPayload = await buildPasswordPayload(oldPassword);
+      const newPayload = await buildPasswordPayload(newPassword);
       await api.post('/auth/change-password', { oldPassword: oldPayload, newPassword: newPayload });
       toast.success('密码已修改，其它设备已退出登录');
       setOldPassword('');
@@ -153,7 +153,7 @@ export function Security(): ReactNode {
 
     setTotpBusy(true);
     try {
-      const payload = await encryptPassword(disablePassword);
+      const payload = await buildPasswordPayload(disablePassword);
       await api.post('/auth/2fa/disable', { code: disableCode, password: payload });
       toast.success('两步验证已关闭');
       setDisableOpen(false);

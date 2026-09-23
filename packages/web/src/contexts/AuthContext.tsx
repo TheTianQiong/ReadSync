@@ -9,7 +9,7 @@ import {
   type ReactNode,
 } from 'react';
 import { UNAUTHORIZED_EVENT, api, clearTokens, getAccessToken, setTokens } from '../lib/api';
-import { encryptPassword } from '../lib/crypto';
+import { buildPasswordPayload, setPlaintextFallbackAllowed } from '../lib/crypto';
 
 /**
  * 全局登录态。
@@ -69,7 +69,14 @@ export function AuthProvider({ children }: { children: ReactNode }): ReactNode {
       api.get<BootstrapStatus>('/system/bootstrap', undefined, { auth: false }),
     ]);
 
-    setSettings(settingsResult.status === 'fulfilled' ? settingsResult.value : null);
+    const publicSettings = settingsResult.status === 'fulfilled' ? settingsResult.value : null;
+    setSettings(publicSettings);
+
+    // 把「服务端是否接受明文密码」告知 crypto 模块。
+    // 非安全上下文（http://内网IP）下浏览器不提供 WebCrypto，前端无法加密；
+    // 只有服务端显式开启该开关时才降级为明文提交，否则明确报错而不是默默发出明文。
+    setPlaintextFallbackAllowed(publicSettings?.allowPlaintextPassword === true);
+
     setInitialized(bootstrapResult.status === 'fulfilled' ? bootstrapResult.value.initialized : true);
   }, []);
 
@@ -111,7 +118,7 @@ export function AuthProvider({ children }: { children: ReactNode }): ReactNode {
   }, []);
 
   const login = useCallback(async (credentials: LoginCredentials): Promise<AuthResult> => {
-    const password = await encryptPassword(credentials.password);
+    const password = await buildPasswordPayload(credentials.password);
     const result = await api.post<AuthResult>(
       '/auth/login',
       {
@@ -132,7 +139,7 @@ export function AuthProvider({ children }: { children: ReactNode }): ReactNode {
   }, []);
 
   const register = useCallback(async (payload: RegisterPayload): Promise<SessionUser> => {
-    const password = await encryptPassword(payload.password);
+    const password = await buildPasswordPayload(payload.password);
 
     const result = await api.post<{ user?: SessionUser } & Partial<AuthResult>>(
       '/auth/register',

@@ -9,7 +9,7 @@ import { Field, Input } from '../components/ui/Input';
 import { PageSpinner } from '../components/ui/Spinner';
 import { useAuth } from '../contexts/AuthContext';
 import { ApiError, api } from '../lib/api';
-import { encryptPassword, isEncryptionAvailable } from '../lib/crypto';
+import { buildPasswordPayload, isEncryptionAvailable, isPlaintextFallbackActive } from '../lib/crypto';
 import { emailField, passwordSchema, usernameField, validateAll } from '../lib/validation';
 
 /**
@@ -74,7 +74,7 @@ export function Bootstrap(): ReactNode {
     setSubmitting(true);
     try {
       // 与登录/注册一致：密码以 RSA 密文提交，明文不出浏览器
-      const passwordPayload = await encryptPassword(password);
+      const passwordPayload = await buildPasswordPayload(password);
       await api.post('/system/bootstrap', { username, email, password: passwordPayload, siteName }, { auth: false });
 
       // 初始化后站点进入正常模式，刷新引导状态再放行路由
@@ -111,10 +111,20 @@ export function Bootstrap(): ReactNode {
               该账号拥有全部管理权限，请使用强密码并妥善保管。站点初始化完成后，此页面将永久关闭。
             </Alert>
 
-            {!isEncryptionAvailable() ? (
+            {isPlaintextFallbackActive() ? (
               <Alert tone="warning">
-                当前页面不是安全上下文，浏览器不会提供 WebCrypto。请通过 HTTPS 或 localhost 访问，
-                否则登录接口无法加密密码。
+                当前通过 HTTP 访问，浏览器不提供 WebCrypto，密码将以<strong>明文</strong>提交。
+                仅在内网或可信网络中这样使用；公网部署请改用 HTTPS
+                （可参考 README 的 Cloudflare Tunnel 配置）。
+              </Alert>
+            ) : !isEncryptionAvailable() ? (
+              <Alert tone="danger">
+                当前页面不是安全上下文，浏览器不提供 WebCrypto，无法加密密码，因此无法完成初始化。
+                请任选一种方式：
+                <br />· 通过 <code>http://localhost:3000</code> 在本机访问；
+                <br />· 配置 HTTPS（如 Cloudflare Tunnel，见 README）；
+                <br />· 若确实只能走 HTTP，在服务端 <code>.env</code> 中设置{' '}
+                <code>READSYNC_ALLOW_PLAINTEXT_PASSWORD=true</code> 后重启（密码将明文传输，仅限可信网络）。
               </Alert>
             ) : null}
 
