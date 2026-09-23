@@ -142,6 +142,39 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
     },
   });
 
+  /**
+   * 分片上传的原始二进制 body。
+   *
+   * 分片走 application/octet-stream 而不是 multipart：每片再包一层 multipart
+   * 只是白白增加开销，而分片请求没有任何附带字段。没有这个解析器 Fastify 会对
+   * 未知 content-type 直接返回 415。
+   *
+   * bodyLimit 取 64 MB：分片大小默认 4 MiB（可用 READSYNC_UPLOAD_CHUNK_SIZE 调大），
+   * 这里留足余量，真正的分片大小校验在 writeChunk 里按会话参数做。
+   * 注意 Fastify 的默认 bodyLimit（下面 8 MB）不适用于自定义解析器之外的场景，
+   * 所以必须在这里显式给一个够大的值。
+   */
+  app.addContentTypeParser(
+    'application/octet-stream',
+    { bodyLimit: 64 * 1024 * 1024 },
+    (_req, body, done) => {
+      const chunks: Buffer[] = [];
+      let size = 0;
+      body.on('data', (chunk: Buffer) => {
+        size += chunk.length;
+        chunks.push(chunk);
+      });
+      body.on('end', () => {
+        if (size === 0) {
+          done(new Error('请求体为空'), undefined);
+          return;
+        }
+        done(null, Buffer.concat(chunks));
+      });
+      body.on('error', (err: Error) => done(err, undefined));
+    },
+  );
+
   /* --------------------------- 认证信息解析 --------------------------- */
 
   // 所有请求先尝试解析登录态；是否强制登录由各路由的 preHandler 决定

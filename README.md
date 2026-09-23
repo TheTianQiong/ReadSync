@@ -291,9 +291,13 @@ curl -s http://<你的服务器地址>:3000/healthcheck
 
 **上传书籍失败，提示「上传失败，网络连接中断」**
 
-先看提示里的百分比：**「无法连接服务器」是链路没通；「上传在 xx% 处中断」是连接被中途掐断**——后者几乎都是反向代理的体积/超时限制（Nginx 的 `client_max_body_size` 默认只有 1 MB，Cloudflare 免费版请求体上限 100 MB 且超时 100 秒）。完整排查表见 [HTTPS 配置指南](docs/https-setup.md#七常见问题)。
+网页端已改为**分片上传**，每个请求都很小，正常情况下不会再触发反向代理的体积与超时限制。若仍失败：
 
-选文件时若已超过本站单文件上限（默认 200 MB），页面会立即提示，不会白传一场。
+- 提示「无法连接服务器」→ 链路根本没通，查地址/端口/防火墙。
+- 提示「第 N/M 片上传失败」→ 连接是通的，中间被切断了。查代理：Nginx 的 `client_max_body_size`（默认仅 1 MB）、Cloudflare 橙云与 Tunnel 的体积/超时上限。
+- 上行特别慢（< 1 Mbps）时可减小分片：`READSYNC_UPLOAD_CHUNK_SIZE=2097152`。
+
+完整排查表见 [HTTPS 配置指南](docs/https-setup.md#七常见问题)。选文件时若已超过本站单文件上限（默认 200 MB），页面会立即提示，不会白传一场。
 
 **改了 `.env` 但不生效**
 
@@ -560,14 +564,17 @@ cd packages/server
 READSYNC_DATA_DIR=./data-smoke npx tsx src/scripts/smoke-crypto.ts
 READSYNC_DATA_DIR=./data-smoke npx tsx src/scripts/smoke-db.ts
 
-# 端到端集成测试（83 项断言：认证 / 2FA / 恢复码 / 上传秒传 / 同步 / 统计 / KOSync / 权限隔离）
+# 端到端集成测试（102 项断言：认证 / 2FA / 恢复码 / 上传 / 分片上传 / 同步 / 统计 / KOSync / 权限隔离）
 READSYNC_DATA_DIR=./data-e2e npx tsx src/scripts/smoke-e2e.ts
 
-# 真实 socket 的大文件上传（冒烟测试走进程内 inject，照不出传输层问题）
+# 真实 socket 的大文件整体上传（冒烟测试走进程内 inject，照不出传输层问题）
 READSYNC_DATA_DIR=./data-repro npx tsx src/scripts/repro-upload.ts 64
 
 # 验证服务端会等完整请求体（file 字段在前、文本字段在后的真实顺序）
 READSYNC_DATA_DIR=./data-repro npx tsx src/scripts/repro-socket.ts 8 2
+
+# 在「限制请求体大小的代理」后面，对比整体上传与分片上传（分片能穿过，整体被挡）
+READSYNC_DATA_DIR=./data-repro npx tsx src/scripts/repro-proxy-limit.ts 16 8
 ```
 
 端到端测试使用独立的 `data-e2e` 目录，并带有路径护栏，不会误伤生产数据。

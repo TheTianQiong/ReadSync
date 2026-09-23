@@ -516,7 +516,7 @@ function usedBytesOf(userId: number): number {
 }
 
 /** 配额校验：必须在写入远端存储前执行，避免超配额数据先落地再回滚 */
-function assertWithinQuota(userId: number, incomingBytes: number): void {
+export function assertWithinQuota(userId: number, incomingBytes: number): void {
   const quota = getSiteSettings().userQuotaBytes;
   if (quota <= 0) return; // 0 表示不限制
 
@@ -539,6 +539,25 @@ function readField(fields: UploadedFile['fields'], name: string): string | undef
   if (typeof value === 'string') return value;
   if (Buffer.isBuffer(value)) return value.toString('utf8');
   return undefined;
+}
+
+/**
+ * 表单字段的「普通对象」视图。
+ *
+ * 入库逻辑（秒传、配额、存储选择、事务写库）不该关心这些字段是从 multipart
+ * 来的还是分片上传时用 JSON 带来的。把它摊平成普通对象，两条上传路径就能复用
+ * 同一套实现 —— 否则分片上传得把入库逻辑整个抄一遍，两边必然逐渐走样。
+ */
+export type UploadFields = Record<string, string | undefined>;
+
+/** 把 multipart 解析出的 fields 摊平；同名字段取第一个（与 readField 行为一致） */
+export function toUploadFields(fields: UploadedFile['fields']): UploadFields {
+  const out: UploadFields = {};
+  for (const name of Object.keys(fields)) {
+    const value = readField(fields, name);
+    if (value !== undefined) out[name] = value;
+  }
+  return out;
 }
 
 function parsePositiveIntField(raw: string, field: string): number {
@@ -605,12 +624,17 @@ async function streamFileToTemp(
   return { size, md5: hash.digest('hex') };
 }
 
-/** 扩展名白名单校验；失败时先 drain 掉文件流，否则 multipart 解析器会卡住连接 */
-function assertAllowedExtension(file: UploadedFile): { ext: string; allowed: string[] } {
+/**
+ * 扩展名白名单校验（按文件名）。
+ *
+ * 抽成按名字校验，是为了让分片上传也能走同一套规则：分片路径没有 multipart
+ * 的 UploadedFile，若各自实现一遍，两条路径的白名单迟早会不一致 ——
+ * 而绕过类型白名单正是上传功能最需要防住的事。
+ */
+export function assertAllowedExtensionName(filename: string): { ext: string; allowed: string[] } {
   const allowed = getSiteSettings().upload.allowedExtensions.map((e) => e.toLowerCase());
-  const ext = extensionOf(file.filename ?? '');
+  const ext = extensionOf(filename);
   if (!ext || !allowed.includes(ext)) {
-    file.file.resume();
     throw unsupportedMediaType(
       `不支持的文件类型${ext ? ` .${ext}` : ''}；允许的扩展名：${allowed.join('、')}`,
     );
@@ -618,11 +642,36 @@ function assertAllowedExtension(file: UploadedFile): { ext: string; allowed: str
   return { ext, allowed };
 }
 
+/** 扩展名白名单校验；失败时先 drain 掉文件流，否则 multipart 解析器会卡住连接 */
+function assertAllowedExtension(file: UploadedFile): { ext: string; allowed: string[] } {
+  try {
+    return assertAllowedExtensionName(file.filename ?? '');
+  } catch (err) {
+    // 校验失败时请求体还没读完，必须排空，否则连接会挂住
+    file.file.resume();
+    throw err;
+  }
+}
+
+/**
+ * 一份已经完整落到本地临时文件的上传内容。
+ *
+ * 这是两条上传路径（multipart 整体上传、分片上传合并）共同的中间产物：
+ * 无论怎么传上来的，到了这一步都变成「一个临时文件 + 它的大小与 MD5」，
+ * 后续入库逻辑因此只需一份实现。
+ */
+export interface ReceivedUpload {
+  ext: string;
+  size: number;
+  md5: string;
+  tmpPath: string;
+}
+
 /** 上传前的公共流程：校验类型 → 落临时文件（边算 MD5）→ 大小/配额校验 */
 async function receiveUpload(
   file: UploadedFile,
   userId: number,
-): Promise<{ ext: string; size: number; md5: string; tmpPath: string }> {
+): Promise<ReceivedUpload> {
   const { ext } = assertAllowedExtension(file);
 
   const maxFileSize = getSiteSettings().upload.maxFileSize;
@@ -682,6 +731,28 @@ export async function uploadBook(userId: number, file: UploadedFile): Promise<Up
   const received = await receiveUpload(file, userId);
 
   try {
+    // text 字段必须等文件流消费完才全部可用（客户端通常把字段放在文件之前），
+    // 因此摊平要放在 receiveUpload 之后
+    return await commitNewBook(userId, received, toUploadFields(file.fields));
+  } finally {
+    // try/finally 保证任何路径（含异常、秒传）都会清理临时文件
+    await cleanupTemp(received.tmpPath);
+  }
+}
+
+/**
+ * 用「已落盘的临时文件 + 普通字段」登记新书。
+ *
+ * 从 uploadBook 里拆出来，是为了让分片上传在合并完分片后能直接复用这一段 ——
+ * 秒传、配额、存储选择、事务写库这些都只实现一次。
+ * 调用方负责清理 received.tmpPath。
+ */
+export async function commitNewBook(
+  userId: number,
+  received: ReceivedUpload,
+  fields: UploadFields,
+): Promise<UploadBookResult> {
+  {
     // 秒传：命中则不上传、不落库，直接返回已有书籍（省流量的关键路径）
     const existing = findBookByMd5(userId, received.md5);
     if (existing) {
@@ -689,13 +760,11 @@ export async function uploadBook(userId: number, file: UploadedFile): Promise<Up
       return { book: getBookDetail(userId, existing.book.id), deduped: true };
     }
 
-    // text 字段在文件流消费完后才全部可用（客户端通常把字段放在文件之前）
-    const fields = file.fields;
-    const title = (readField(fields, 'title') ?? '').trim();
+    const title = (fields.title ?? '').trim();
     if (!title) throw badRequest('请填写书名（表单字段 title）');
     if (title.length > 256) throw badRequest('书名不能超过 256 个字符');
 
-    const storageIdRaw = readField(fields, 'storageId');
+    const storageIdRaw = fields.storageId;
     let storageId: number;
     let adapter: StorageAdapter;
     if (storageIdRaw !== undefined && storageIdRaw.trim() !== '') {
@@ -721,7 +790,7 @@ export async function uploadBook(userId: number, file: UploadedFile): Promise<Up
     }
 
     const now = new Date();
-    const format = resolveFormat(readField(fields, 'format'), received.ext);
+    const format = resolveFormat(fields.format, received.ext);
 
     // 主记录 + 版本行 + 容量统计在同一事务内完成：唯一索引冲突时整体回滚，
     // 不会留下「有书没版本」或「容量已加但书没建」的中间状态。
@@ -735,20 +804,20 @@ export async function uploadBook(userId: number, file: UploadedFile): Promise<Up
             .values({
               ownerId: userId,
               title,
-              author: nonEmpty(readField(fields, 'author')),
-              publisher: nonEmpty(readField(fields, 'publisher')),
-              isbn: nonEmpty(readField(fields, 'isbn')),
+              author: nonEmpty(fields.author),
+              publisher: nonEmpty(fields.publisher),
+              isbn: nonEmpty(fields.isbn),
               format,
               size: received.size,
               md5: received.md5,
               objectKey: key,
               storageId,
               currentVersion: 1,
-              description: nonEmpty(readField(fields, 'description')),
-              tags: parseTagsField(readField(fields, 'tags')),
-              language: nonEmpty(readField(fields, 'language')),
-              totalPages: parseOptionalCountField(readField(fields, 'totalPages'), 'totalPages') ?? null,
-              totalWords: parseOptionalCountField(readField(fields, 'totalWords'), 'totalWords') ?? null,
+              description: nonEmpty(fields.description),
+              tags: parseTagsField(fields.tags),
+              language: nonEmpty(fields.language),
+              totalPages: parseOptionalCountField(fields.totalPages, 'totalPages') ?? null,
+              totalWords: parseOptionalCountField(fields.totalWords, 'totalWords') ?? null,
               createdAt: now,
               updatedAt: now,
             })
@@ -796,9 +865,6 @@ export async function uploadBook(userId: number, file: UploadedFile): Promise<Up
       inserted.deduped ? '并发秒传竞态，返回已存在书籍' : '上传书籍完成',
     );
     return { book: getBookDetail(userId, inserted.id), deduped: inserted.deduped };
-  } finally {
-    // try/finally 保证任何路径（含异常、秒传）都会清理临时文件
-    await cleanupTemp(received.tmpPath);
   }
 }
 
@@ -816,6 +882,20 @@ export async function uploadBookVersion(userId: number, bookId: number, file: Up
   const received = await receiveUpload(file, userId);
 
   try {
+    return await commitNewVersion(userId, bookId, received, toUploadFields(file.fields));
+  } finally {
+    await cleanupTemp(received.tmpPath);
+  }
+}
+
+/** 用「已落盘的临时文件 + 普通字段」为已有书籍上传新版本；供 multipart 与分片上传共用 */
+export async function commitNewVersion(
+  userId: number,
+  bookId: number,
+  received: ReceivedUpload,
+  fields: UploadFields,
+): Promise<BookDetail> {
+  {
     const { book } = getOwnedBook(userId, bookId);
 
     // books(owner_id, md5) 唯一索引要求：新版本的 md5 不能与同用户其它书籍相同
@@ -838,7 +918,7 @@ export async function uploadBookVersion(userId: number, bookId: number, file: Up
 
     const now = new Date();
     const nextVersion = book.currentVersion + 1;
-    const note = nonEmpty(readField(file.fields, 'note'));
+    const note = nonEmpty(fields.note);
 
     // 先更新主记录（md5 唯一冲突会在此抛出并回滚），再插版本行，最后累加容量；
     // 三步同一事务，避免出现「版本行已写但 currentVersion 未变」导致后续版本号撞车。
@@ -876,8 +956,6 @@ export async function uploadBookVersion(userId: number, bookId: number, file: Up
 
     log.info({ userId, bookId, version: nextVersion, size: received.size }, '上传书籍新版本');
     return getBookDetail(userId, bookId);
-  } finally {
-    await cleanupTemp(received.tmpPath);
   }
 }
 

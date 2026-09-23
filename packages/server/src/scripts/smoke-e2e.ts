@@ -271,6 +271,160 @@ async function main(): Promise<void> {
     check('下载书籍成功', download.statusCode === 200, download.statusCode);
     check('下载内容与上传一致', Buffer.from(download.rawPayload).equals(bookContent));
 
+    /* ------------------------- 5b. 分片上传 ------------------------- */
+    section('5b. 分片上传（绕过代理的体积/超时限制）');
+    {
+      // 造一个跨多片的文件，并让分片大小可控（默认 4 MiB 太大，测试里调小）
+      const chunkSize = 256 * 1024;
+      process.env.READSYNC_UPLOAD_CHUNK_SIZE = String(chunkSize);
+
+      const payload = Buffer.alloc(chunkSize * 3 + 12345);
+      for (let i = 0; i < payload.length; i += 1) payload[i] = (i * 7 + 11) % 251;
+      const payloadMd5 = createHash('md5').update(payload).digest('hex');
+      const totalChunks = Math.ceil(payload.length / chunkSize);
+
+      const init = await api({
+        method: 'POST',
+        url: '/api/uploads',
+        headers: auth,
+        payload: {
+          filename: 'chunked.epub',
+          size: payload.length,
+          md5: payloadMd5,
+          mode: 'create',
+          fields: { title: '分片上传的书', format: 'epub', author: '张三' },
+        },
+      });
+      check('分片上传：初始化会话成功', init.statusCode === 200, init.body);
+      const uploadId = init.json().data?.uploadId as string;
+      check('分片上传：返回 chunkSize', init.json().data?.chunkSize === chunkSize, init.json().data);
+      check('分片上传：分片数正确', init.json().data?.totalChunks === totalChunks, init.json().data);
+
+      const putPart = (index: number, data: Buffer) =>
+        api({
+          method: 'PUT',
+          url: `/api/uploads/${uploadId}/parts/${index}`,
+          headers: { ...auth, 'content-type': 'application/octet-stream' },
+          payload: data,
+        });
+
+      // 先传最后一片，再倒着传 —— 验证服务端是按偏移写入而非顺序追加。
+      // 若误用 O_APPEND，文件会错位且 MD5 必然对不上。
+      const partRes = await putPart(totalChunks - 1, payload.subarray((totalChunks - 1) * chunkSize));
+      check('分片上传：末片（不足一片）被接受', partRes.statusCode === 200, partRes.body);
+
+      for (let i = totalChunks - 2; i >= 0; i -= 1) {
+        const res = await putPart(i, payload.subarray(i * chunkSize, (i + 1) * chunkSize));
+        check(`分片上传：第 ${i} 片上传成功`, res.statusCode === 200, res.body);
+      }
+
+      // 缺片时必须拒绝：中间缺片会被后续分片撑到完整长度，只看大小发现不了
+      const holeInit = await api({
+        method: 'POST',
+        url: '/api/uploads',
+        headers: auth,
+        payload: {
+          filename: 'hole.epub',
+          size: payload.length,
+          mode: 'create',
+          fields: { title: '缺片的书' },
+        },
+      });
+      const holeId = holeInit.json().data?.uploadId as string;
+      await api({
+        method: 'PUT',
+        url: `/api/uploads/${holeId}/parts/0`,
+        headers: { ...auth, 'content-type': 'application/octet-stream' },
+        payload: payload.subarray(0, chunkSize),
+      });
+      // 中间片必须是满片（末片才允许不足），这里按整片切
+      await api({
+        method: 'PUT',
+        url: `/api/uploads/${holeId}/parts/2`,
+        headers: { ...auth, 'content-type': 'application/octet-stream' },
+        payload: payload.subarray(2 * chunkSize, 3 * chunkSize),
+      });
+      const holeComplete = await api({ method: 'POST', url: `/api/uploads/${holeId}/complete`, headers: auth });
+      // 缺的是第 1、3 片（共 4 片，只传了 0 和 2）；两者都要被点出来
+      const holeMsg: string = holeComplete.json().error?.message ?? '';
+      check(
+        '分片上传：缺片时拒绝合并且指明缺哪片',
+        holeComplete.statusCode === 400 && holeMsg.includes('第 1、3 片'),
+        holeComplete.body,
+      );
+      await api({ method: 'DELETE', url: `/api/uploads/${holeId}`, headers: auth });
+
+      // 大小不符的分片要当场拒绝
+      const wrongSize = await putPart(0, Buffer.alloc(chunkSize - 1));
+      check('分片上传：分片大小不符被拒', wrongSize.statusCode === 400, wrongSize.body);
+
+      const outOfRange = await putPart(totalChunks + 5, Buffer.alloc(16));
+      check('分片上传：序号越界被拒', outOfRange.statusCode === 400, outOfRange.body);
+
+      const done = await api({ method: 'POST', url: `/api/uploads/${uploadId}/complete`, headers: auth });
+      check('分片上传：合并入库成功', done.statusCode === 200, done.body);
+      check('分片上传：服务端重算 MD5 与原始一致', done.json().data?.md5 === payloadMd5, done.json().data?.md5);
+      check('分片上传：书名等字段正确带入', done.json().data?.title === '分片上传的书', done.json().data?.title);
+      check('分片上传：大小正确', done.json().data?.size === payload.length, done.json().data?.size);
+
+      // 合并后会话应被清理，再合并同一 id 必然失败
+      const reComplete = await api({ method: 'POST', url: `/api/uploads/${uploadId}/complete`, headers: auth });
+      check('分片上传：合并后会话已清理', reComplete.statusCode === 404, reComplete.statusCode);
+
+      // 内容相同的分片上传应命中秒传
+      const dupInit = await api({
+        method: 'POST',
+        url: '/api/uploads',
+        headers: auth,
+        payload: {
+          filename: 'chunked-copy.epub',
+          size: payload.length,
+          md5: payloadMd5,
+          mode: 'create',
+          fields: { title: '重复的分片书' },
+        },
+      });
+      const dupId = dupInit.json().data?.uploadId as string;
+      for (let i = 0; i < totalChunks; i += 1) {
+        await api({
+          method: 'PUT',
+          url: `/api/uploads/${dupId}/parts/${i}`,
+          headers: { ...auth, 'content-type': 'application/octet-stream' },
+          payload: payload.subarray(i * chunkSize, Math.min((i + 1) * chunkSize, payload.length)),
+        });
+      }
+      const dupDone = await api({ method: 'POST', url: `/api/uploads/${dupId}/complete`, headers: auth });
+      check('分片上传：相同内容命中秒传', dupDone.statusCode === 200 && dupDone.json().data?.id === done.json().data?.id, dupDone.body);
+
+      // 扩展名白名单：不支持的格式必须在建会话时就被挡住，别让人白传
+      const badExt = await api({
+        method: 'POST',
+        url: '/api/uploads',
+        headers: auth,
+        payload: { filename: 'evil.exe', size: 1024, mode: 'create', fields: {} },
+      });
+      check('分片上传：非法扩展名在建会话时被拒', badExt.statusCode === 415, badExt.body);
+
+      // 路径穿越：uploadId 会进文件路径，必须从源头挡住
+      const traversal = await api({
+        method: 'PUT',
+        url: '/api/uploads/..%2f..%2fetc/parts/0',
+        headers: { ...auth, 'content-type': 'application/octet-stream' },
+        payload: Buffer.alloc(16),
+      });
+      check('分片上传：路径穿越的 uploadId 被拒', traversal.statusCode >= 400 && traversal.statusCode < 500, traversal.statusCode);
+
+      const bogusId = await api({
+        method: 'POST',
+        url: '/api/uploads/notavalidid/complete',
+        headers: auth,
+      });
+      check('分片上传：非法 uploadId 被拒', bogusId.statusCode === 400, bogusId.body);
+
+      // 还原，避免影响后续用例（该变量是全局读取的）
+      delete process.env.READSYNC_UPLOAD_CHUNK_SIZE;
+    }
+
     /* ---------------------------- 6. 统一同步接口 ---------------------------- */
     section('6. 统一同步接口');
     const push = await api({

@@ -158,29 +158,36 @@ export function BookUploadDialog({
     setError(null);
     setProgress(0);
 
-    const form = new FormData();
-    form.append('file', file);
-
+    /*
+     * 一律走分片上传，不再用整体 POST。
+     *
+     * 整体上传只在「客户端与服务端之间没有任何中间层」时才可靠：Nginx 的
+     * client_max_body_size 默认 1 MB，Cloudflare 橙云与 Tunnel 对请求体大小和
+     * 请求时长都有上限且免费版调不了。这些限制服务端绕不过去，只有把请求切小
+     * 才能解决 —— 而小文件走分片也完全没问题，没必要为此维护两条代码路径。
+     */
+    const fields: Record<string, string> = {};
     if (mode === 'create') {
-      form.append('title', title.trim());
-      if (author.trim()) form.append('author', author.trim());
-      form.append('format', format);
-      form.append('size', String(file.size));
-      if (description.trim()) form.append('description', description.trim());
+      fields.title = title.trim();
+      if (author.trim()) fields.author = author.trim();
+      fields.format = format;
+      // 服务端会边传边算 MD5；用户点过秒传检测的话直接复用，省一次计算
+      if (knownMd5) fields.md5 = knownMd5;
+      if (description.trim()) fields.description = description.trim();
       const tagList = parseTags(tags);
-      if (tagList.length > 0) form.append('tags', JSON.stringify(tagList));
-      if (storageId) form.append('storageId', storageId);
-      // 服务端会边传边算 MD5；如果用户已经点过秒传检测，直接复用结果省一次计算。
-      // 不传 objectKey —— 对象键由服务端按 MD5 生成，客户端指定会与去重逻辑冲突。
-      if (knownMd5) form.append('md5', knownMd5);
+      if (tagList.length > 0) fields.tags = tagList.join(',');
+      if (storageId) fields.storageId = storageId;
     } else if (note.trim()) {
-      form.append('note', note.trim());
+      fields.note = note.trim();
     }
 
     try {
-      await api.upload(mode === 'create' ? '/books/upload' : `/books/${bookId}/versions`, form, {
-        onProgress: setProgress,
-      });
+      await api.uploadChunked(
+        file,
+        fields,
+        mode === 'create' ? { mode: 'create' } : { mode: 'version', bookId: Number(bookId) },
+        { onProgress: setProgress },
+      );
       toast.success(mode === 'create' ? '上传完成' : '新版本已上传');
       onUploaded();
       onClose();

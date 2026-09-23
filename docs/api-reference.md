@@ -383,7 +383,80 @@ text = body and body.message or _("Unknown server error")
 
 ---
 
-## 六、速率限制
+## 六、分片上传
+
+> **网页端默认就走这条路径，你不需要手动调用。** 本节面向自行接入的开发者。
+
+整份文件一次 `POST /api/books/upload` 在直连时更省事，但只要客户端与服务端之间隔着反向代理就不可靠：Nginx 的 `client_max_body_size` 默认只有 1 MB，Cloudflare 橙云（含 Tunnel）对请求体大小和请求时长都有上限且免费版调不了。这些限制服务端绕不过去，只能把请求切小。
+
+### 6.1 流程
+
+| 步骤 | 方法 | 路径 | 说明 |
+|---|---|---|---|
+| 1 | POST | `/api/uploads` | 建会话，返回 `uploadId`、`chunkSize`、`totalChunks` |
+| 2 | PUT | `/api/uploads/{uploadId}/parts/{index}` | 上传第 index 片（从 0 开始），**原始二进制** |
+| 3 | POST | `/api/uploads/{uploadId}/complete` | 合并、校验 MD5、入库 |
+| — | DELETE | `/api/uploads/{uploadId}` | 放弃上传并清理已落盘的分片 |
+
+### 6.2 建会话
+
+```json
+POST /api/uploads
+{
+  "filename": "book.epub",
+  "size": 52428800,
+  "md5": "d41d8cd98f00b204e9800998ecf8427e",
+  "mode": "create",
+  "fields": { "title": "书名", "author": "作者", "format": "epub", "storageId": "1" }
+}
+```
+
+- `size` 必填且必须准确：服务端据此算分片数，并在合并时校验。
+- `md5` 可选；给了就会在合并后比对，不一致直接拒绝。
+- `mode` 为 `version` 时必须带 `bookId`，用于给已有书籍上传新版本。
+- `fields` 就是整体上传时那些表单字段（title/author/format/storageId/tags/note…）。
+
+响应：
+
+```json
+{ "ok": true, "data": { "uploadId": "a1b2…", "chunkSize": 4194304, "totalChunks": 13 } }
+```
+
+**分片大小以服务端返回的 `chunkSize` 为准**，不要自己定 —— 服务端才知道自己的 `bodyLimit` 与部署环境能承受多大的请求。
+
+### 6.3 上传分片
+
+```http
+PUT /api/uploads/{uploadId}/parts/0
+Content-Type: application/octet-stream
+Authorization: Bearer <令牌>
+
+<该片的原始字节>
+```
+
+- 除最后一片外，每片**必须正好** `chunkSize` 字节；最后一片是剩余部分。大小不符会被拒绝（这样客户端切分逻辑写错能立刻发现，而不是合并出一个损坏的文件）。
+- 分片**可以乱序上传，也可以重传覆盖**：服务端按 `index × chunkSize` 定位写入。
+- 服务端不信任客户端上报的内容，合并时会流式重算 MD5 与大小。
+
+### 6.4 合并入库
+
+```http
+POST /api/uploads/{uploadId}/complete
+```
+
+返回与整体上传相同的 `BookDetail`（命中秒传时返回已有书籍）。合并成功后会话立即失效。
+
+**缺片会被明确拒绝**，并在错误信息里点出缺哪几片：
+
+```json
+{ "ok": false, "error": { "code": "BAD_REQUEST", "message": "还有分片未上传（如第 1、3 片），请补传后再合并" } }
+```
+
+此时可以补传缺失的分片再重试 `complete`（会话仍在）。会话保留 24 小时，超时由服务端自动清理。
+
+---
+
+## 七、速率限制
 
 | 接口 | 限制 |
 |---|---|

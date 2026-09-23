@@ -130,6 +130,67 @@ export const checkBookExistsSchema = z.object({
 });
 export type CheckBookExistsInput = z.infer<typeof checkBookExistsSchema>;
 
+/* ------------------------------ 分片上传 ------------------------------ */
+
+/**
+ * 分片上传（用于绕过反向代理的请求体大小与超时限制）。
+ *
+ * 流程：init 建会话 → 逐片 PUT parts/:index → complete 合并入库。
+ * 分片走的是原始二进制（application/octet-stream），不是 multipart ——
+ * 每片再包一层 multipart 只会白白增加开销。
+ */
+export const chunkedUploadInitSchema = z.object({
+  /** 原始文件名，用于取扩展名做白名单校验与命名 */
+  filename: z.string().trim().min(1).max(256),
+  /** 文件总字节数；服务端据此算分片数并校验合并结果 */
+  size: z.coerce.number().int().nonnegative(),
+  /** 客户端算好的 MD5；给了就校验，不给则服务端自己算 */
+  md5: z
+    .string()
+    .trim()
+    .regex(/^[a-fA-F0-9]{32}$/, 'MD5 必须是 32 位十六进制串')
+    .optional(),
+  /** 登记新书时为 create，给已有书籍传新版本时为 version */
+  mode: z.enum(['create', 'version']).default('create'),
+  /** mode 为 version 时必填 */
+  bookId: z.coerce.number().int().positive().optional(),
+  /**
+   * 表单字段（title/author/format/storageId/note 等）。
+   * 单独传是因为这些字段原先搭 multipart 的便车，分片上传没有 multipart 可搭。
+   */
+  fields: z.record(z.string(), z.string()).default({}),
+});
+
+export type ChunkedUploadInitInput = z.infer<typeof chunkedUploadInitSchema>;
+
+/** 服务端保存的会话状态；前端不消费，仅用于服务端内部与调试 */
+export interface ChunkedUploadSession {
+  uploadId: string;
+  mode: 'create' | 'version';
+  bookId?: number;
+  filename: string;
+  size: number;
+  md5?: string;
+  fields: Record<string, string | undefined>;
+  userId: number;
+  chunkSize: number;
+  totalChunks: number;
+  createdAt: string;
+}
+
+/** init 的响应：告知客户端按多大切片、切几片 */
+export interface ChunkedUploadInitResult {
+  uploadId: string;
+  chunkSize: number;
+  totalChunks: number;
+}
+
+/** 单片上传结果，便于客户端确认进度 */
+export interface ChunkedUploadPartResult {
+  received: number;
+  total: number;
+}
+
 export interface CheckBookExistsResult {
   /** 该 MD5 是否已存在于当前用户书库 */
   exists: boolean;

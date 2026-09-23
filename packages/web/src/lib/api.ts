@@ -1,4 +1,4 @@
-import type { ApiResponse } from '@readsync/shared';
+import type { ApiResponse, BookDetail } from '@readsync/shared';
 
 /**
  * 后端接口客户端。
@@ -313,6 +313,113 @@ export function upload<T>(
 }
 
 /**
+ * 分片上传。
+ *
+ * 为什么不用上面那个整体上传：整份文件一次 POST 时，请求体大小与请求耗时都
+ * 受客户端与服务端之间的中间层约束 —— Nginx 的 client_max_body_size 默认只有
+ * 1 MB，Cloudflare 橙云（含 Tunnel）对体积和时长都有上限且免费版调不了。
+ * 这些限制服务端绕不过去，只能改用小请求。
+ *
+ * 分片大小由服务端在 init 时下发（默认 4 MiB），前端不自己定：
+ * 服务端才知道自己的 bodyLimit 与部署环境能承受多大的请求。
+ *
+ * 失败时的 uploadId 会随错误抛出，调用方可以据此中止会话，避免分片一直占着磁盘。
+ */
+export async function uploadChunked(
+  file: File,
+  fields: Record<string, string>,
+  target: { mode: 'create' } | { mode: 'version'; bookId: number },
+  options: { onProgress?: (percent: number) => void; signal?: AbortSignal } = {},
+): Promise<BookDetail> {
+  const token = getAccessToken();
+  const authHeaders: Record<string, string> = token ? { Authorization: `Bearer ${token}` } : {};
+
+  const post = async (url: string): Promise<unknown> => {
+    const res = await fetch(resolveUrl(url), {
+      method: 'POST',
+      headers: { ...authHeaders, 'Content-Type': 'application/json' },
+      body: '{}',
+      ...(options.signal ? { signal: options.signal } : {}),
+    });
+    return unwrap<unknown>(await readBody(res), res.status, {});
+  };
+
+  /** 放弃会话，清掉已落盘的分片。失败路径必须调用，否则重试几次就堆出几份残片 */
+  const abortSession = (id: string): void => {
+    void fetch(resolveUrl(`/uploads/${id}`), { method: 'DELETE', headers: authHeaders }).catch(
+      () => undefined,
+    );
+  };
+
+  const initRes = await fetch(resolveUrl('/uploads'), {
+    method: 'POST',
+    headers: { ...authHeaders, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      filename: file.name,
+      size: file.size,
+      mode: target.mode,
+      ...(target.mode === 'version' ? { bookId: target.bookId } : {}),
+      fields,
+    }),
+    ...(options.signal ? { signal: options.signal } : {}),
+  });
+  const init = (await unwrap<unknown>(await readBody(initRes), initRes.status, {})) as {
+    uploadId: string;
+    chunkSize: number;
+    totalChunks: number;
+  };
+
+  const { uploadId, chunkSize, totalChunks } = init;
+  let done = 0;
+
+  try {
+    for (let index = 0; index < totalChunks; index += 1) {
+      const start = index * chunkSize;
+      const blob = file.slice(start, Math.min(start + chunkSize, file.size));
+
+      const res = await fetch(resolveUrl(`/uploads/${uploadId}/parts/${index}`), {
+        method: 'PUT',
+        headers: { ...authHeaders, 'Content-Type': 'application/octet-stream' },
+        body: blob,
+        ...(options.signal ? { signal: options.signal } : {}),
+      });
+
+      if (!res.ok) {
+        // 把服务端给的具体原因带出去（分片大小不对、会话过期等），
+        // 否则用户只看到一句「上传失败」，完全不知道下一步该干嘛
+        const text = await res.text().catch(() => '');
+        throw new ApiError(
+          res.status === 401 ? 'UNAUTHORIZED' : 'INTERNAL_ERROR',
+          `第 ${index + 1}/${totalChunks} 片上传失败（HTTP ${res.status}）${extractMessage(text)}`,
+          res.status,
+        );
+      }
+
+      done += 1;
+      // 只到 99%：最后 1% 留给服务端合并与入库，避免进度条早早停在 100% 却还没结束
+      options.onProgress?.(Math.min(99, Math.round((done / totalChunks) * 99)));
+    }
+
+    const result = (await post(`/uploads/${uploadId}/complete`)) as BookDetail;
+    options.onProgress?.(100);
+    return result;
+  } catch (err) {
+    abortSession(uploadId);
+    throw err;
+  }
+}
+
+/** 从响应的错误信封里取出 message；拿不到就返回空串（不要污染上层提示） */
+function extractMessage(text: string): string {
+  try {
+    const parsed = JSON.parse(text) as { error?: { message?: string } };
+    return parsed.error?.message ?? '';
+  } catch {
+    return '';
+  }
+}
+
+/**
  * 以二进制方式拉取文件。
  *
  * 下载接口有两种形态：S3 后端返回预签名 URL（拿 JSON 里跳转即可），
@@ -343,4 +450,4 @@ export async function getBlob(path: string, query?: Record<string, QueryValue>):
   return res.blob();
 }
 
-export const api = { get, post, put, patch, del, upload, getBlob };
+export const api = { get, post, put, patch, del, upload, uploadChunked, getBlob };

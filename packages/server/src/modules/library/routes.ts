@@ -1,6 +1,7 @@
 import type { FastifyInstance, FastifyRequest } from 'fastify';
 import {
   checkBookExistsSchema,
+  chunkedUploadInitSchema,
   createBookSchema,
   listBooksQuerySchema,
   updateBookSchema,
@@ -9,11 +10,14 @@ import {
   type BookSummary,
   type BookVersion,
   type CheckBookExistsResult,
+  type ChunkedUploadInitResult,
+  type ChunkedUploadPartResult,
   type Paginated,
 } from '@readsync/shared';
 import { badRequest, validationFailed } from '../../errors.js';
 import { auditContextFrom, recordAudit } from '../../lib/audit.js';
 import { currentUser, requireAuth } from '../../middleware/auth.js';
+import { completeSession, createSession, discardSession, writeChunk } from './chunked.js';
 import {
   checkBookExists,
   createBook,
@@ -167,6 +171,116 @@ export async function registerLibraryRoutes(app: FastifyInstance): Promise<void>
 
     return { ok: true, data: detail } satisfies ApiSuccess<BookDetail>;
   });
+
+  /* ---------------------------- 分片上传 ---------------------------- */
+
+  /**
+   * 建分片上传会话。
+   *
+   * 存在的理由：整份文件一次 POST 时，请求体大小与请求耗时都受中间层约束
+   * （Nginx client_max_body_size 默认 1 MB、Cloudflare 橙云与 Tunnel 的体积
+   * 与超时上限），这些都调不了。切成小块后每个请求都很小很快，限制自然不触发。
+   */
+  app.post('/api/uploads', auth, async (req) => {
+    const user = currentUser(req);
+    const input = parseOrThrow(() => chunkedUploadInitSchema.parse(req.body));
+
+    if (input.mode === 'version' && input.bookId === undefined) {
+      throw badRequest('为已有书籍上传新版本时必须提供 bookId');
+    }
+    // 版本模式下先确认书籍归属，避免为一个不存在的书白传几百 MB
+    if (input.mode === 'version' && input.bookId !== undefined) {
+      getBookDetail(user.id, input.bookId);
+    }
+
+    const session = await createSession({
+      userId: user.id,
+      mode: input.mode,
+      bookId: input.bookId,
+      filename: input.filename,
+      size: input.size,
+      md5: input.md5,
+      fields: input.fields as Record<string, string | undefined>,
+    });
+
+    recordAudit('book.upload', auditContextFrom(req, user), {
+      target: input.filename,
+      meta: { mode: 'chunked-init', size: input.size, totalChunks: session.totalChunks },
+    });
+
+    return {
+      ok: true,
+      data: {
+        uploadId: session.uploadId,
+        chunkSize: session.chunkSize,
+        totalChunks: session.totalChunks,
+      },
+    } satisfies ApiSuccess<ChunkedUploadInitResult>;
+  });
+
+  /**
+   * 上传单个分片。
+   *
+   * body 是原始二进制（application/octet-stream），不再包一层 multipart ——
+   * 每片都包 multipart 只是白白增加开销，而这里没有任何附带字段。
+   */
+  app.put<{ Params: { uploadId: string; index: string } }>(
+    '/api/uploads/:uploadId/parts/:index',
+    auth,
+    async (req) => {
+      const user = currentUser(req);
+      const index = Number(req.params.index);
+      if (!Number.isInteger(index) || index < 0) throw badRequest('分片序号不合法');
+
+      const body = req.body;
+      if (!Buffer.isBuffer(body) || body.length === 0) {
+        throw badRequest('分片内容为空（请以 application/octet-stream 发送原始字节）');
+      }
+
+      const result = await writeChunk(req.params.uploadId, index, user.id, body);
+      return { ok: true, data: result } satisfies ApiSuccess<ChunkedUploadPartResult>;
+    },
+  );
+
+  /** 合并分片并入库；成功后会话目录被清理，uploadId 随即失效 */
+  app.post<{ Params: { uploadId: string } }>(
+    '/api/uploads/:uploadId/complete',
+    auth,
+    async (req) => {
+      const user = currentUser(req);
+      const outcome = await completeSession(req.params.uploadId, user.id);
+
+      if (outcome.kind === 'version') {
+        recordAudit('book.upload', auditContextFrom(req, user), {
+          target: outcome.result.title,
+          meta: { mode: 'chunked-version', bookId: outcome.result.id, size: outcome.result.size },
+        });
+        return { ok: true, data: outcome.result } satisfies ApiSuccess<BookDetail>;
+      }
+
+      recordAudit('book.upload', auditContextFrom(req, user), {
+        target: outcome.result.book.title,
+        meta: {
+          mode: 'chunked-create',
+          bookId: outcome.result.book.id,
+          size: outcome.result.book.size,
+          deduped: outcome.result.deduped,
+        },
+      });
+      return { ok: true, data: outcome.result.book } satisfies ApiSuccess<BookDetail>;
+    },
+  );
+
+  /** 放弃上传并清理已落盘的分片 */
+  app.delete<{ Params: { uploadId: string } }>(
+    '/api/uploads/:uploadId',
+    auth,
+    async (req) => {
+      const user = currentUser(req);
+      await discardSession(req.params.uploadId, user.id);
+      return { ok: true, data: { discarded: true } } satisfies ApiSuccess<{ discarded: boolean }>;
+    },
+  );
 
   /**
    * 回滚到指定历史版本。
