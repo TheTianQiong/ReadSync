@@ -1,4 +1,4 @@
-import { eq } from 'drizzle-orm';
+import { eq, or, sql } from 'drizzle-orm';
 import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import {
   kosyncCreateUserSchema,
@@ -10,6 +10,7 @@ import { getDb } from '../../db/index.js';
 import { users, type UserRow } from '../../db/schema.js';
 import { auditContextFrom, recordAudit } from '../../lib/audit.js';
 import { getSiteSettings } from '../../lib/settings.js';
+import { findUserByLoginLoose } from '../../lib/users.js';
 import { getModuleLogger } from '../../logger.js';
 import { getProgress, upsertProgress } from './service.js';
 
@@ -57,9 +58,9 @@ export async function registerKosyncRoutes(app: FastifyInstance): Promise<void> 
    * 普通字符串比较会在首个不同字符处提前返回，攻击者可以据此逐字节爆破。
    */
   app.get('/users/auth', async (req, reply) => {
-    const user = authenticateKosync(req);
-    if (!user) {
-      return kosyncError(reply, 401, '用户名或同步密码不正确（KOSync 使用独立同步密码，可在「设置 → 账号安全」中查看或重置）');
+    const auth = authenticateKosync(req);
+    if (!auth.ok) {
+      return kosyncAuthFailed(req, reply, auth);
     }
     return reply.status(200).type('text/plain').send('OK');
   });
@@ -125,10 +126,11 @@ export async function registerKosyncRoutes(app: FastifyInstance): Promise<void> 
 
   /** 上报进度。响应是裸 JSON，timestamp 为 Unix 秒 */
   app.put('/syncs/progress', async (req, reply) => {
-    const user = authenticateKosync(req);
-    if (!user) {
-      return kosyncError(reply, 401, '用户名或同步密码不正确（KOSync 使用独立同步密码，可在「设置 → 账号安全」中查看或重置）');
+    const auth = authenticateKosync(req);
+    if (!auth.ok) {
+      return kosyncAuthFailed(req, reply, auth);
     }
+    const user = auth.user;
 
     const parsed = kosyncProgressUpdateSchema.safeParse(req.body);
     if (!parsed.success) {
@@ -173,10 +175,11 @@ export async function registerKosyncRoutes(app: FastifyInstance): Promise<void> 
    * 会不断重试并提示同步失败，只有空对象才被它理解为「这本书服务端还没有记录」。
    */
   app.get<{ Params: { document: string } }>('/syncs/progress/:document', async (req, reply) => {
-    const user = authenticateKosync(req);
-    if (!user) {
-      return kosyncError(reply, 401, '用户名或同步密码不正确（KOSync 使用独立同步密码，可在「设置 → 账号安全」中查看或重置）');
+    const auth = authenticateKosync(req);
+    if (!auth.ok) {
+      return kosyncAuthFailed(req, reply, auth);
     }
+    const user = auth.user;
 
     const entry = getProgress(user.id, req.params.document);
     if (!entry) {
@@ -203,26 +206,70 @@ export async function registerKosyncRoutes(app: FastifyInstance): Promise<void> 
 }
 
 /**
- * 从 x-auth-user / x-auth-key 头校验用户，失败返回 null。
+ * 从 x-auth-user / x-auth-key 头校验用户。
  *
  * 只支持这一种认证方式：KOSync 协议里没有 Authorization 头的位置，
  * 也没有令牌刷新机制，JWT 在此无从谈起。
+ *
+ * 返回失败原因而不是 null，是为了让调用方能把「用户名不存在」「没设过
+ * 同步密码」「密码不匹配」区分开 —— 这些对使用者是完全不可见的，
+ * 只有把原因回传并在日志里记下来才可能排查。
  */
-export function authenticateKosync(req: FastifyRequest): UserRow | null {
-  const username = headerValue(req.headers['x-auth-user']);
-  const key = headerValue(req.headers['x-auth-key']);
-  if (!username || !key) return null;
+export type KosyncAuthFailure =
+  | 'missing_headers'
+  | 'user_not_found'
+  | 'user_disabled'
+  | 'no_sync_key'
+  | 'key_mismatch';
 
-  const db = getDb();
-  const user = db.select().from(users).where(eq(users.username, username)).get();
-  if (!user || user.status !== 'active') return null;
-  if (!user.kosyncKey) return null;
+export type KosyncAuthResult =
+  | { ok: true; user: UserRow }
+  | { ok: false; reason: KosyncAuthFailure; username: string };
+
+/**
+ * 每种失败原因对应的提示文案。
+ *
+ * 之所以区分得这么细：认证失败的原因对使用者来说完全不可见 ——
+ * KOReader 只会把服务端给的 message 原样显示。统一回一句「密码不正确」
+ * 会让「用户名填成了邮箱」「根本没设过同步密码」这些情况无从判断，
+ * 用户只能反复猜。这里直接说清是哪一环。
+ *
+ * 是否算用户枚举：/users/create 本身就会以 402 暴露用户名是否被占用，
+ * 因此这里给出具体原因并不额外泄露信息，换来的是可诊断性。
+ */
+function kosyncAuthMessage(reason: KosyncAuthFailure): string {
+  switch (reason) {
+    case 'missing_headers':
+      return '请求缺少认证信息（客户端未发送 x-auth-user / x-auth-key）';
+    case 'user_not_found':
+      return '用户名不存在：请填写 ReadSync 的用户名或邮箱（注意大小写）';
+    case 'user_disabled':
+      return '该账号已被禁用，请联系管理员';
+    case 'no_sync_key':
+      return '该账号尚未设置同步密码，请在网页端「设置 → 账号安全 → KOSync 同步密码」中生成一个';
+    case 'key_mismatch':
+      return '同步密码不正确，可在网页端「设置 → 账号安全」中重新设置或随机生成';
+  }
+}
+
+export function authenticateKosync(req: FastifyRequest): KosyncAuthResult {
+  const identifier = headerValue(req.headers['x-auth-user']);
+  const key = headerValue(req.headers['x-auth-key']);
+  if (!identifier || !key) return { ok: false, reason: 'missing_headers', username: identifier };
+
+  // 宽容查找：支持邮箱、忽略大小写差异（设备上输入很容易打错大小写）
+  const user = findUserByLoginLoose(identifier);
+  if (!user) return { ok: false, reason: 'user_not_found', username: identifier };
+  if (user.status !== 'active') return { ok: false, reason: 'user_disabled', username: identifier };
+  if (!user.kosyncKey) return { ok: false, reason: 'no_sync_key', username: identifier };
 
   // 大小写统一后再比较：safeEqualHex 按 hex 解析，大写 MD5 也能正确比较，
   // 但长度判断要求一致，先归一化成小写更稳妥
-  if (!safeEqualHex(user.kosyncKey.toLowerCase(), key.toLowerCase())) return null;
+  if (!safeEqualHex(user.kosyncKey.toLowerCase(), key.toLowerCase())) {
+    return { ok: false, reason: 'key_mismatch', username: identifier };
+  }
 
-  return user;
+  return { ok: true, user };
 }
 
 /** Fastify 的头可能是 string | string[]，统一取第一个值 */
@@ -234,4 +281,28 @@ function headerValue(value: string | string[] | undefined): string {
 /** 协议对外的 timestamp 一律是 Unix 秒 */
 function unixSeconds(iso: string): number {
   return Math.floor(new Date(iso).getTime() / 1000);
+}
+
+/**
+ * 统一的 KOSync 认证失败处理。
+ *
+ * 除了返回可读提示，还会把失败原因写进日志 —— 用户在 KOReader 上看到的
+ * 只有一句话，服务端日志才是排查的落脚点（用户名、具体是哪一环）。
+ * 日志里**不记录密钥本身**，避免把密码摘要带进日志。
+ */
+function kosyncAuthFailed(
+  req: FastifyRequest,
+  reply: FastifyReply,
+  auth: Extract<KosyncAuthResult, { ok: false }>,
+): FastifyReply {
+  log.warn(
+    {
+      username: auth.username || '(未提供)',
+      reason: auth.reason,
+      hasKey: Boolean(headerValue(req.headers['x-auth-key'])),
+      ip: req.ip,
+    },
+    'KOSync 认证失败',
+  );
+  return kosyncError(reply, 401, kosyncAuthMessage(auth.reason));
 }

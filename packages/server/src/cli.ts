@@ -20,6 +20,7 @@ import {
   generateToken,
   hashPassword,
   md5Hex,
+  safeEqualHex,
   sha256Hex,
 } from './crypto/password.js';
 import { closeDatabase, getDb, openDatabase } from './db/index.js';
@@ -35,7 +36,7 @@ import {
 } from './db/schema.js';
 import { getSiteSettings, patchSiteSettings } from './lib/settings.js';
 import { displayWidth, hLine, padDisplayEnd } from './lib/text.js';
-import { createUser, findUserByLogin, toSessionUser } from './lib/users.js';
+import { createUser, findUserByLogin, findUserByLoginLoose, toSessionUser } from './lib/users.js';
 
 /* ------------------------------ 输出helpers ------------------------------ */
 
@@ -398,6 +399,61 @@ user
       console.log(c(color.dim, '    密码：上面这串'));
       console.log('');
       console.log(c(color.dim, '  注意：设置后 KOReader 将不再接受主密码，网页端登录不受影响。'));
+    }),
+  );
+
+user
+  .command('kosync-check <identifier>')
+  .description('用指定密码模拟 KOReader 登录，确认能否通过 KOSync 认证')
+  .requiredOption('-p, --password <密码>', '要验证的密码（同步密码，或未设置同步密码时的主密码）')
+  .action(
+    withDb(async (identifier: string, opts: { password: string }) => {
+      const db = getDb();
+      // 与 KOSync 服务端一致：用户名或邮箱都接受
+      // 与服务端 KOSync 一致：允许邮箱、忽略大小写
+      const target = findUserByLoginLoose(identifier);
+
+      if (!target) {
+        fail(`找不到用户：${identifier}（KOSync 允许填用户名或邮箱，且不区分大小写）`);
+        console.log(c(color.dim, '  用 readsync user list 查看现有账号。'));
+        process.exit(1);
+      }
+
+      console.log('');
+      console.log(`  账号      ${c(color.bold, target.username)} <${target.email}>`);
+      console.log(`  状态      ${target.status === 'active' ? c(color.green, '正常') : c(color.red, '已禁用')}`);
+
+      if (!target.kosyncKey) {
+        warn('该账号尚未设置同步密码 —— KOReader 一定登录失败。');
+        console.log(
+          c(color.dim, `  修复：readsync user sync-password ${target.username}`),
+        );
+        process.exit(1);
+      }
+
+      // KOReader 发的是 md5(密码)，这里做同样的计算再比对
+      const incoming = md5Hex(opts.password);
+      const matches = safeEqualHex(target.kosyncKey.toLowerCase(), incoming);
+
+      console.log(`  收到的 key md5(${opts.password.slice(0, 2)}${'*'.repeat(Math.max(0, opts.password.length - 2))}) = ${incoming.slice(0, 12)}…`);
+      console.log(`  库中的 key  ${target.kosyncKey.slice(0, 12)}…`);
+      console.log('');
+
+      if (matches) {
+        ok('该密码可以通过 KOSync 认证，KOReader 可以正常登录。');
+        console.log(c(color.dim, '  若 KOReader 仍失败，请检查服务器地址与用户名填写是否正确。'));
+        return;
+      }
+
+      fail('该密码与库中的同步密码不一致，KOReader 会报认证失败。');
+      console.log('');
+      console.log(c(color.dim, '  可能原因：'));
+      console.log(c(color.dim, '    · 输入时多了空格或大小写不同'));
+      console.log(c(color.dim, '    · 该账号设置过独立同步密码，而不是主密码'));
+      console.log('');
+      console.log(c(color.dim, `  修复：readsync user sync-password ${target.username}     # 随机生成一个新的`));
+      console.log(c(color.dim, `        readsync user sync-password ${target.username} -p 你记得住的密码`));
+      process.exit(1);
     }),
   );
 

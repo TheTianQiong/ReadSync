@@ -255,15 +255,26 @@ READSYNC_ALLOW_PLAINTEXT_PASSWORD=true
 
 **KOReader 报「未知服务器错误」，或 Reeden 等 App 报「连接失败」**
 
-按顺序排查：
+**先跑一条命令定位**——它模拟 KOReader 的登录过程，直接告诉你密码能不能通过：
 
-1. **先确认服务端可达**：`curl -I http://127.0.0.1:3000/api/system/health`。
-2. **KOReader 的「未知服务器错误」= 服务端返回了非 200**，绝大多数是认证失败（密码不匹配）。客户端地址填 `http://<IP>:3000` 或你的 HTTPS 域名，用户名填本站账号，密码填「设置 → 账号安全 → KOSync 同步密码」。现在服务端会返回具体原因，KOReader 会直接显示出来。
-3. **忘记同步密码**：网页端「设置 → 账号安全 → KOSync 同步密码 → 随机生成」，或命令行
+```bash
+readsync user kosync-check <用户名或邮箱> -p <你填进 KOReader 的密码>
+```
+
+输出会明确区分「密码能过」/「密码不一致」/「账号没设过同步密码」。若能过但 KOReader 仍失败，就是地址或用户名的问题。
+
+服务端日志里也会记录每次 KOSync 认证失败的原因（`journalctl -u readsync -f | grep KOSync`）。
+
+其余排查点：
+
+1. **服务端是否可达**：`curl -I http://127.0.0.1:3000/api/system/health`。
+2. **用户名可以填用户名或邮箱，且忽略大小写**（电子墨水屏键盘容易打错大小写，现已兼容）。
+3. **密码填的是「KOSync 同步密码」**：网页端「设置 → 账号安全 → KOSync 同步密码」，或
    ```bash
    readsync user sync-password <用户名>            # 随机生成并显示
    readsync user sync-password <用户名> --status   # 只看是否已设置
    ```
+   设置过同步密码后，**主密码不再能用于 KOSync**（这是有意为之，避免主密码摘要外泄）。
 4. **Reeden 等 Android 应用报「连接失败」**：Android 默认禁止明文 HTTP 流量，这类应用通常只能用 **HTTPS** 地址。请先按 [HTTPS 配置指南](docs/https-setup.md) 配上证书。
 
 **改了 `.env` 但不生效**
@@ -324,6 +335,11 @@ readsync user reset-password alice -p 'NewPassw0rd!'
 readsync user set-role alice admin
 readsync user disable alice
 readsync user delete alice --yes
+
+# KOSync 排查：模拟 KOReader 登录，确认密码能否通过
+readsync user kosync-check alice -p '你的同步密码'
+readsync user sync-password alice --status
+readsync user sync-password alice              # 随机生成并显示
 
 # 站点设置
 readsync settings show

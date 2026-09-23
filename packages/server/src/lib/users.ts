@@ -1,4 +1,4 @@
-import { eq, or } from 'drizzle-orm';
+import { eq, or, sql } from 'drizzle-orm';
 import type { SessionUser, UserRole } from '@readsync/shared';
 import { hashPassword, md5Hex } from '../crypto/password.js';
 import { getDb } from '../db/index.js';
@@ -103,7 +103,7 @@ export function userUsedBytes(userId: number): number {
   return rows.reduce((sum, r) => sum + (r.used ?? 0), 0);
 }
 
-/** 按用户名或邮箱查找用户（登录时两者都允许） */
+/** 按用户名或邮箱查找用户（登录时两者都允许）。精确匹配，大小写敏感 */
 export function findUserByLogin(login: string): UserRow | undefined {
   const db = getDb();
   return db
@@ -111,4 +111,30 @@ export function findUserByLogin(login: string): UserRow | undefined {
     .from(users)
     .where(or(eq(users.username, login), eq(users.email, login)))
     .get();
+}
+
+/**
+ * 宽容查找：精确匹配失败后，再按大小写不敏感匹配一次。
+ *
+ * 用于 KOSync 这类在设备上输入账号的场景 —— 电子墨水屏的键盘很容易把
+ * 大小写打错，而用户名是按原样注册的（SQLite 默认大小写敏感），
+ * 于是一个字母的大小写差异就会表现为「用户名不存在」。
+ *
+ * 安全性：仅在小写匹配唯一时返回。若历史上注册过仅大小写不同的多个账号，
+ * 宁可判为找不到，也不能把用户登进另一个账号。
+ * 邮箱同样不区分大小写（域名部分本就大小写无关）。
+ */
+export function findUserByLoginLoose(login: string): UserRow | undefined {
+  const exact = findUserByLogin(login);
+  if (exact) return exact;
+
+  const db = getDb();
+  const lowered = login.toLowerCase();
+  const matches = db
+    .select()
+    .from(users)
+    .where(or(eq(sql`lower(${users.username})`, lowered), eq(sql`lower(${users.email})`, lowered)))
+    .all();
+
+  return matches.length === 1 ? matches[0] : undefined;
 }
