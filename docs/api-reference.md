@@ -433,6 +433,7 @@ POST /api/uploads
   "size": 52428800,
   "md5": "d41d8cd98f00b204e9800998ecf8427e",
   "mode": "create",
+  "chunkSize": 2097152,
   "fields": { "title": "书名", "author": "作者", "format": "epub", "storageId": "1" }
 }
 ```
@@ -441,6 +442,9 @@ POST /api/uploads
 - `md5` 可选；给了就会在合并后比对，不一致直接拒绝。
 - `mode` 为 `version` 时必须带 `bookId`，用于给已有书籍上传新版本。
 - `fields` 就是整体上传时那些表单字段（title/author/format/storageId/tags/note…）。
+- `chunkSize` 可选，省略则用服务端默认值（4 MiB）。会被夹到 `256 KiB ~ 64 MiB`。
+
+> **分片大小拿不准就先不传，失败了再减半重来。** 一片能不能在这个链路上传完取决于用户上行到源站的实际速度，事前猜不准 —— 同一个 4 MiB 在光纤上几百毫秒，绕经 Cloudflare 的慢链路上就会超过它的 100 秒超时（表现为 `524`）。网页端就是这么做的：遇到 524/504/408/413 或连接被重置时，把分片减半、**重新建会话**再传（分片布局是建会话时定死的，不能中途改）。
 
 响应：
 

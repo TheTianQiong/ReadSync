@@ -54,6 +54,7 @@ export function BookUploadDialog({
   const [progress, setProgress] = useState(0);
   const [error, setError] = useState<string | null>(null);
 
+  const [notice, setNotice] = useState<string | null>(null);
   const [hashing, setHashing] = useState(false);
   const [hashProgress, setHashProgress] = useState(0);
   const [knownMd5, setKnownMd5] = useState<string | null>(null);
@@ -77,6 +78,7 @@ export function BookUploadDialog({
     setNote('');
     setProgress(0);
     setError(null);
+    setNotice(null);
     setKnownMd5(null);
     setDuplicate(null);
     if (fileInputRef.current) fileInputRef.current.value = '';
@@ -156,6 +158,7 @@ export function BookUploadDialog({
 
     setUploading(true);
     setError(null);
+    setNotice(null);
     setProgress(0);
 
     /*
@@ -186,7 +189,11 @@ export function BookUploadDialog({
         file,
         fields,
         mode === 'create' ? { mode: 'create' } : { mode: 'version', bookId: Number(bookId) },
-        { onProgress: setProgress },
+        {
+          onProgress: setProgress,
+          // 链路慢而降级重试时得让用户看见，否则进度条归零会像是卡死了
+          onNotice: setNotice,
+        },
       );
       toast.success(mode === 'create' ? '上传完成' : '新版本已上传');
       onUploaded();
@@ -347,6 +354,7 @@ export function BookUploadDialog({
         ) : null}
 
         {error ? <Alert tone="danger">{error}</Alert> : null}
+        {!error && notice ? <Alert tone="info">{notice}</Alert> : null}
       </div>
     </Modal>
   );

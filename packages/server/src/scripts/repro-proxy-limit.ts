@@ -14,6 +14,7 @@
  */
 
 import { constants, createHash, publicEncrypt, randomUUID } from 'node:crypto';
+import { request as httpRequest } from 'node:http';
 import { createServer, connect as netConnect, type Socket } from 'node:net';
 import { buildApp } from '../app.js';
 import { loadConfig } from '../config.js';
@@ -38,7 +39,10 @@ function log(step: string, detail = ''): void {
  * 普通请求。超限时按 Nginx 的行为回 413 并断开：**响应是在客户端还在发请求体
  * 的时候发出的**，浏览器正是因此报「网络连接中断」而不是显示 413。
  */
-function startLimitedProxy(limitBytes: number): Promise<{ close: () => Promise<void> }> {
+function startLimitedProxy(
+  limitBytes: number,
+  status = Number(process.env.PROXY_STATUS ?? 413),
+): Promise<{ close: () => Promise<void> }> {
   const server = createServer((client: Socket) => {
     const upstream = netConnect({ host: '127.0.0.1', port: BACKEND_PORT });
 
@@ -66,11 +70,21 @@ function startLimitedProxy(limitBytes: number): Promise<{ close: () => Promise<v
       const head = headerBuf.subarray(0, headerEnd).toString('latin1');
       const match = /content-length:\s*(\d+)/i.exec(head);
       contentLength = match ? Number(match[1]) : 0;
+      if (process.env.PROXY_DEBUG === '1') {
+        const firstLine = head.split('\r\n')[0];
+        console.log(
+          `    [proxy] ${firstLine} content-length=${contentLength} limit=${limitBytes} → ` +
+            (contentLength > limitBytes ? `拒绝 ${status}` : '放行'),
+        );
+      }
 
       if (contentLength > limitBytes) {
-        // 模拟 Nginx：回 413 然后断开，不等请求体发完
+        // 模拟代理：回错误状态然后断开，不等请求体发完。
+        // 413 = Nginx client_max_body_size；524 = Cloudflare 源站超时
+        const reason =
+          status === 524 ? 'A timeout occurred' : status === 413 ? 'Request Entity Too Large' : 'Error';
         client.write(
-          'HTTP/1.1 413 Request Entity Too Large\r\n' +
+          `HTTP/1.1 ${status} ${reason}\r\n` +
             'Content-Type: text/html\r\n' +
             'Content-Length: 0\r\n' +
             'Connection: close\r\n\r\n',
@@ -97,6 +111,51 @@ function startLimitedProxy(limitBytes: number): Promise<{ close: () => Promise<v
         close: () => new Promise<void>((r) => server.close(() => r())),
       }),
     );
+  });
+}
+
+/**
+ * 用 node:http 发一次请求，且**每次新建连接**（agent: false）。
+ *
+ * 必须这样：本脚本的代理是按「每条连接的第一个请求」做体积判断的简化实现，
+ * 而 fetch/undici 默认 keep-alive 复用连接 —— 复用后后续请求绕过检查，
+ * 于是「超限」根本不会发生，测试就成了假的通过。判定逻辑本身不重要，
+ * 重要的是让每个请求都真的被检查到。
+ */
+function rawRequest(opts: {
+  port: number;
+  method: string;
+  path: string;
+  headers: Record<string, string>;
+  body?: Uint8Array;
+}): Promise<{ status: number; body: string }> {
+  return new Promise((resolve, reject) => {
+    const req = httpRequest(
+      {
+        host: '127.0.0.1',
+        port: opts.port,
+        method: opts.method,
+        path: opts.path,
+        // 必须显式给 Content-Length：只用 req.write() 的话 Node 会走 chunked 编码，
+        // 请求头里没有长度，代理那关的体积判断就永远看到 0，等于没检查
+        headers: {
+          ...opts.headers,
+          ...(opts.body ? { 'content-length': String(opts.body.length) } : {}),
+        },
+        agent: false,
+      },
+      (res) => {
+        let text = '';
+        res.setEncoding('utf8');
+        res.on('data', (c) => {
+          text += c;
+        });
+        res.on('end', () => resolve({ status: res.statusCode ?? 0, body: text }));
+      },
+    );
+    req.on('error', reject);
+    if (opts.body) req.write(Buffer.from(opts.body));
+    req.end();
   });
 }
 
@@ -235,6 +294,93 @@ async function main(): Promise<void> {
         : '✗ 分片上传失败或校验不符',
     );
     if (!ok) process.exitCode = 1;
+
+    /* ------- 3) 分片本身仍超限时，逐级减半重试（前端自适应的服务端侧验证） ------- */
+    console.log(`\n=== 3) 分片仍超过代理上限时逐级减半重试 ===`);
+    // 首次请求的分片必须**超过**代理上限，才会触发降级；减半后落到上限之内
+    const tooBig = LIMIT * 2;
+    let size = tooBig;
+    let attempts = 0;
+
+    const jsonH = { 'content-type': 'application/json', ...authH };
+
+    while (size >= 256 * 1024) {
+      attempts += 1;
+      const initR = await rawRequest({
+        port: PROXY_PORT,
+        method: 'POST',
+        path: '/api/uploads',
+        headers: jsonH,
+        body: Buffer.from(
+          JSON.stringify({
+            filename: 'retry.epub',
+            size: bytes,
+            mode: 'create',
+            chunkSize: size,
+            fields: { title: '降级重试' },
+          }),
+        ),
+      });
+      if (initR.status !== 200) {
+        console.error(`  建会话失败：HTTP ${initR.status} ${initR.body.slice(0, 200)}`);
+        process.exitCode = 1;
+        return;
+      }
+      const s = JSON.parse(initR.body) as {
+        data: { uploadId: string; chunkSize: number; totalChunks: number };
+      };
+      const real = s.data.chunkSize;
+      console.log(
+        `  第 ${attempts} 次尝试：分片 ${(real / 1024 / 1024).toFixed(2)} MB × ${s.data.totalChunks} 片`,
+      );
+
+      let slowed = false;
+      for (let i = 0; i < s.data.totalChunks; i += 1) {
+        const slice = data.subarray(i * real, Math.min((i + 1) * real, bytes));
+        const partRes = await rawRequest({
+          port: PROXY_PORT,
+          method: 'PUT',
+          path: `/api/uploads/${s.data.uploadId}/parts/${i}`,
+          headers: { ...authH, 'content-type': 'application/octet-stream' },
+          body: new Uint8Array(slice),
+        }).catch(() => ({ status: 0, body: '连接被重置' }));
+
+        if (partRes.status !== 200) {
+          console.log(`    ↳ 第 ${i + 1} 片被代理回 ${partRes.status}，减小分片重来`);
+          slowed = true;
+          break;
+        }
+      }
+
+      if (!slowed) {
+        const fin = await rawRequest({
+          port: PROXY_PORT,
+          method: 'POST',
+          path: `/api/uploads/${s.data.uploadId}/complete`,
+          headers: jsonH,
+          body: Buffer.from('{}'),
+        });
+        const finBody = JSON.parse(fin.body || '{}') as { data?: { md5?: string } };
+        const good = fin.status === 200 && finBody.data?.md5 === md5;
+        console.log(
+          good
+            ? `✓ 降到 ${(real / 1024).toFixed(0)} KB 后成功（共尝试 ${attempts} 次）`
+            : `✗ 合并失败：HTTP ${fin.status}`,
+        );
+        if (!good) process.exitCode = 1;
+        return;
+      }
+
+      await rawRequest({
+        port: PROXY_PORT,
+        method: 'DELETE',
+        path: `/api/uploads/${s.data.uploadId}`,
+        headers: authH,
+      }).catch(() => undefined);
+      size = Math.floor(real / 2);
+    }
+    console.error('✗ 降到下限仍无法通过');
+    process.exitCode = 1;
   } finally {
     await proxy.close();
     await app.close();

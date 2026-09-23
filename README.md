@@ -291,11 +291,13 @@ curl -s http://<你的服务器地址>:3000/healthcheck
 
 **上传书籍失败，提示「上传失败，网络连接中断」**
 
-网页端已改为**分片上传**，每个请求都很小，正常情况下不会再触发反向代理的体积与超时限制。若仍失败：
+网页端走**分片上传**，且分片大小会**自动适应链路**：某一片被中间层拒绝（Cloudflare `524` 源站超时、`504`、Nginx `413`）时，前端会把分片减半、重建会话重来，直到传得动（4 MiB → 2 → 1 → 512 → 256 KiB）。界面上会显示「网络较慢，正在把分片减小到 X 重试…」。
+
+若仍失败：
 
 - 提示「无法连接服务器」→ 链路根本没通，查地址/端口/防火墙。
-- 提示「第 N/M 片上传失败」→ 连接是通的，中间被切断了。查代理：Nginx 的 `client_max_body_size`（默认仅 1 MB）、Cloudflare 橙云与 Tunnel 的体积/超时上限。
-- 上行特别慢（< 1 Mbps）时可减小分片：`READSYNC_UPLOAD_CHUNK_SIZE=2097152`。
+- 提示「上传持续超时：分片已降到最小的 256 KB 仍传不完」→ 这条链路到服务器的有效上行速度过低，只能换网络。想省掉几次重试可把起点调小：`READSYNC_UPLOAD_CHUNK_SIZE=1048576`。
+- 提示「第 N/M 片上传失败」且错误码不是 524/504/413 → 把状态码发出来，多半是代理的其它限制。
 
 完整排查表见 [HTTPS 配置指南](docs/https-setup.md#七常见问题)。选文件时若已超过本站单文件上限（默认 200 MB），页面会立即提示，不会白传一场。
 
@@ -575,6 +577,9 @@ READSYNC_DATA_DIR=./data-repro npx tsx src/scripts/repro-socket.ts 8 2
 
 # 在「限制请求体大小的代理」后面，对比整体上传与分片上传（分片能穿过，整体被挡）
 READSYNC_DATA_DIR=./data-repro npx tsx src/scripts/repro-proxy-limit.ts 16 8
+
+# 同上，但代理返回 524（Cloudflare 源站超时），验证分片减半重试确实能穿过
+READSYNC_DATA_DIR=./data-repro PROXY_STATUS=524 npx tsx src/scripts/repro-proxy-limit.ts 16 8
 ```
 
 端到端测试使用独立的 `data-e2e` 目录，并带有路径护栏，不会误伤生产数据。

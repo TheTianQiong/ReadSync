@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { createReadStream } from 'node:fs';
 import { mkdir, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import type { ChunkedUploadSession } from '@readsync/shared';
+import { clampChunkSize, type ChunkedUploadSession } from '@readsync/shared';
 import { loadConfig } from '../../config.js';
 import { badRequest, notFound, payloadTooLarge } from '../../errors.js';
 import { getModuleLogger } from '../../logger.js';
@@ -32,16 +32,17 @@ import {
 
 const log = getModuleLogger('library');
 
-/** 单个分片的大小。4 MiB 是保守值：慢速上行（512 Kbps）下约 64 秒传完，仍在常见代理超时之内 */
-const DEFAULT_CHUNK_SIZE = 4 * 1024 * 1024;
-
-/** 分片大小可通过环境变量调整，但夹在合理区间内，避免配出离谱的值 */
-export function resolveChunkSize(): number {
-  const raw = Number(process.env.READSYNC_UPLOAD_CHUNK_SIZE ?? '');
-  if (!Number.isFinite(raw) || raw <= 0) return DEFAULT_CHUNK_SIZE;
-  const min = 256 * 1024;
-  const max = 64 * 1024 * 1024;
-  return Math.min(Math.max(Math.floor(raw), min), max);
+/**
+ * 本次会话实际使用的分片大小。
+ *
+ * 优先级：客户端在 init 时的请求 > 环境变量 > 默认值，最后统一夹到合法区间。
+ * 允许客户端指定是必需的 —— 链路能承受多大的片差异极大（实测有链路在
+ * Cloudflare 后面传 4 MiB 就触发 524 超时），客户端要靠逐级减半来自适应，
+ * 而每次减半都要重新建会话。
+ */
+export function resolveChunkSize(requested?: number | undefined): number {
+  if (requested !== undefined) return clampChunkSize(requested);
+  return clampChunkSize(process.env.READSYNC_UPLOAD_CHUNK_SIZE);
 }
 
 /**
@@ -99,14 +100,18 @@ export async function createSession(input: {
   size: number;
   md5?: string | undefined;
   fields: UploadFields;
+  /** 客户端期望的分片大小；省略则按环境变量/默认值 */
+  chunkSize?: number | undefined;
 }): Promise<ChunkedUploadSession & { chunkSize: number }> {
   // 一开始就校验类型，不能让用户把几百 MB 传完才被告知格式不支持
   assertAllowedExtensionName(input.filename);
 
-  const chunkSize = resolveChunkSize();
+  const chunkSize = resolveChunkSize(input.chunkSize);
   const totalChunks = Math.max(1, Math.ceil(input.size / chunkSize));
   if (totalChunks > MAX_CHUNKS) {
-    throw payloadTooLarge(`分片数超过上限（${MAX_CHUNKS}），请减少文件大小或调大 READSYNC_UPLOAD_CHUNK_SIZE`);
+    throw payloadTooLarge(
+      `分片数超过上限（${MAX_CHUNKS}）。请减少文件大小，或调大 READSYNC_UPLOAD_CHUNK_SIZE 后重试`,
+    );
   }
 
   const id = randomUUID().replace(/-/g, '');

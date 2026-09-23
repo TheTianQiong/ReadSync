@@ -498,6 +498,26 @@ async function main(): Promise<void> {
       });
       check('分片上传：非法 uploadId 被拒', bogusId.statusCode === 400, bogusId.body);
 
+      /*
+       * 客户端可以指定分片大小 —— 这是「链路太慢导致代理超时（如 Cloudflare 524）」
+       * 时逐级减半重试的落点。服务端必须照办，同时把离谱的值夹到合法区间。
+       */
+      const askSize = async (requested: number | string) => {
+        const res = await api({
+          method: 'POST',
+          url: '/api/uploads',
+          headers: auth,
+          payload: { filename: 'probe.epub', size: 1024, mode: 'create', fields: {}, chunkSize: requested },
+        });
+        const id = res.json().data?.uploadId as string | undefined;
+        if (id) await api({ method: 'DELETE', url: `/api/uploads/${id}`, headers: auth });
+        return res.json().data?.chunkSize as number | undefined;
+      };
+
+      check('分片上传：客户端可指定分片大小', (await askSize(1024 * 1024)) === 1024 * 1024);
+      check('分片上传：过小的分片被夹到下限', (await askSize(1)) === 256 * 1024);
+      check('分片上传：过大的分片被夹到上限', (await askSize(999_999_999)) === 64 * 1024 * 1024);
+
       // 还原，避免影响后续用例（该变量是全局读取的）
       delete process.env.READSYNC_UPLOAD_CHUNK_SIZE;
     }

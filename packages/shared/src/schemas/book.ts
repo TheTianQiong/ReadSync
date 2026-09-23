@@ -133,6 +133,28 @@ export type CheckBookExistsInput = z.infer<typeof checkBookExistsSchema>;
 /* ------------------------------ 分片上传 ------------------------------ */
 
 /**
+ * 分片大小的取值区间与默认值。
+ *
+ * 放在 shared 是因为**前后端都得知道**：服务端用它夹取配置与客户端请求，
+ * 客户端用它在「片太大导致超时」时逐级减半重试，且必须和服务端停在同一个
+ * 下界 —— 否则客户端会一直尝试一个服务端根本不接受的更小值。
+ *
+ * 默认 4 MiB：正常宽带上单片几百毫秒完成，请求数也不至于太多。
+ * 下界 256 KiB：即使上行只有 20 KB/s，一片也能在 13 秒内传完，
+ * 仍在 Cloudflare 那类 100 秒超时之内（实测过 524 的链路需要降到这一档）。
+ */
+export const UPLOAD_CHUNK_SIZE_DEFAULT = 4 * 1024 * 1024;
+export const UPLOAD_CHUNK_SIZE_MIN = 256 * 1024;
+export const UPLOAD_CHUNK_SIZE_MAX = 64 * 1024 * 1024;
+
+/** 把任意输入夹到合法区间；非法值回落到默认值 */
+export function clampChunkSize(value: unknown): number {
+  const n = typeof value === 'string' ? Number(value) : value;
+  if (typeof n !== 'number' || !Number.isFinite(n) || n <= 0) return UPLOAD_CHUNK_SIZE_DEFAULT;
+  return Math.min(Math.max(Math.floor(n), UPLOAD_CHUNK_SIZE_MIN), UPLOAD_CHUNK_SIZE_MAX);
+}
+
+/**
  * 分片上传（用于绕过反向代理的请求体大小与超时限制）。
  *
  * 流程：init 建会话 → 逐片 PUT parts/:index → complete 合并入库。
@@ -154,6 +176,13 @@ export const chunkedUploadInitSchema = z.object({
   mode: z.enum(['create', 'version']).default('create'),
   /** mode 为 version 时必填 */
   bookId: z.coerce.number().int().positive().optional(),
+  /**
+   * 期望的分片大小；省略则用服务端默认值。
+   *
+   * 客户端在「片太大、请求超时」时会逐级减半并重新建会话，
+   * 因此这个字段是自适应重试的落点。服务端仍会按区间夹取。
+   */
+  chunkSize: z.coerce.number().int().positive().optional(),
   /**
    * 表单字段（title/author/format/storageId/note 等）。
    * 单独传是因为这些字段原先搭 multipart 的便车，分片上传没有 multipart 可搭。

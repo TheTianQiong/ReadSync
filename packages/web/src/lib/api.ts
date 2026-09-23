@@ -1,4 +1,17 @@
-import type { ApiResponse, BookDetail } from '@readsync/shared';
+import {
+  UPLOAD_CHUNK_SIZE_DEFAULT,
+  UPLOAD_CHUNK_SIZE_MIN,
+  type ApiResponse,
+  type BookDetail,
+} from '@readsync/shared';
+
+/**
+ * 分片上传因「链路太慢」而降级重试的最大轮数。
+ *
+ * 从默认 4 MiB 逐级减半到下限 256 KiB 需要 4 轮，多留两轮余量。
+ * 到下限仍失败就直接报错 —— 那条链路基本不可用，继续重试只是耗用户时间。
+ */
+const UPLOAD_CHUNK_RETRIES = 6;
 
 /**
  * 后端接口客户端。
@@ -329,84 +342,148 @@ export async function uploadChunked(
   file: File,
   fields: Record<string, string>,
   target: { mode: 'create' } | { mode: 'version'; bookId: number },
-  options: { onProgress?: (percent: number) => void; signal?: AbortSignal } = {},
+  options: {
+    onProgress?: (percent: number) => void;
+    onNotice?: (message: string) => void;
+    signal?: AbortSignal;
+  } = {},
 ): Promise<BookDetail> {
   const token = getAccessToken();
   const authHeaders: Record<string, string> = token ? { Authorization: `Bearer ${token}` } : {};
 
-  const post = async (url: string): Promise<unknown> => {
-    const res = await fetch(resolveUrl(url), {
-      method: 'POST',
-      headers: { ...authHeaders, 'Content-Type': 'application/json' },
-      body: '{}',
-      ...(options.signal ? { signal: options.signal } : {}),
-    });
-    return unwrap<unknown>(await readBody(res), res.status, {});
-  };
-
-  /** 放弃会话，清掉已落盘的分片。失败路径必须调用，否则重试几次就堆出几份残片 */
   const abortSession = (id: string): void => {
     void fetch(resolveUrl(`/uploads/${id}`), { method: 'DELETE', headers: authHeaders }).catch(
       () => undefined,
     );
   };
 
-  const initRes = await fetch(resolveUrl('/uploads'), {
-    method: 'POST',
-    headers: { ...authHeaders, 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      filename: file.name,
-      size: file.size,
-      mode: target.mode,
-      ...(target.mode === 'version' ? { bookId: target.bookId } : {}),
-      fields,
-    }),
-    ...(options.signal ? { signal: options.signal } : {}),
-  });
-  const init = (await unwrap<unknown>(await readBody(initRes), initRes.status, {})) as {
-    uploadId: string;
-    chunkSize: number;
-    totalChunks: number;
-  };
+  /** 跑完一轮：建会话 → 逐片上传 → 合并。任何一步失败都由调用方决定是否降级重试 */
+  const runOnce = async (chunkSize?: number): Promise<BookDetail> => {
+    const initRes = await fetch(resolveUrl('/uploads'), {
+      method: 'POST',
+      headers: { ...authHeaders, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        filename: file.name,
+        size: file.size,
+        mode: target.mode,
+        ...(target.mode === 'version' ? { bookId: target.bookId } : {}),
+        ...(chunkSize !== undefined ? { chunkSize } : {}),
+        fields,
+      }),
+      ...(options.signal ? { signal: options.signal } : {}),
+    });
+    const init = (await unwrap<unknown>(await readBody(initRes), initRes.status, {})) as {
+      uploadId: string;
+      chunkSize: number;
+      totalChunks: number;
+    };
 
-  const { uploadId, chunkSize, totalChunks } = init;
-  let done = 0;
+    const { uploadId, totalChunks } = init;
+    let done = 0;
 
-  try {
-    for (let index = 0; index < totalChunks; index += 1) {
-      const start = index * chunkSize;
-      const blob = file.slice(start, Math.min(start + chunkSize, file.size));
+    try {
+      for (let index = 0; index < totalChunks; index += 1) {
+        const start = index * init.chunkSize;
+        const blob = file.slice(start, Math.min(start + init.chunkSize, file.size));
 
-      const res = await fetch(resolveUrl(`/uploads/${uploadId}/parts/${index}`), {
-        method: 'PUT',
-        headers: { ...authHeaders, 'Content-Type': 'application/octet-stream' },
-        body: blob,
+        const res = await fetch(resolveUrl(`/uploads/${uploadId}/parts/${index}`), {
+          method: 'PUT',
+          headers: { ...authHeaders, 'Content-Type': 'application/octet-stream' },
+          body: blob,
+          ...(options.signal ? { signal: options.signal } : {}),
+        });
+
+        if (!res.ok) {
+          const text = await res.text().catch(() => '');
+          throw new ApiError(
+            res.status === 401 ? 'UNAUTHORIZED' : 'INTERNAL_ERROR',
+            `第 ${index + 1}/${totalChunks} 片上传失败（HTTP ${res.status}）${extractMessage(text)}`,
+            res.status,
+          );
+        }
+
+        done += 1;
+        // 只到 99%：最后 1% 留给服务端合并与入库
+        options.onProgress?.(Math.min(99, Math.round((done / totalChunks) * 99)));
+      }
+
+      const doneRes = await fetch(resolveUrl(`/uploads/${uploadId}/complete`), {
+        method: 'POST',
+        headers: { ...authHeaders, 'Content-Type': 'application/json' },
+        body: '{}',
         ...(options.signal ? { signal: options.signal } : {}),
       });
+      return (await unwrap<unknown>(await readBody(doneRes), doneRes.status, {})) as BookDetail;
+    } catch (err) {
+      abortSession(uploadId);
+      throw err;
+    }
+  };
 
-      if (!res.ok) {
-        // 把服务端给的具体原因带出去（分片大小不对、会话过期等），
-        // 否则用户只看到一句「上传失败」，完全不知道下一步该干嘛
-        const text = await res.text().catch(() => '');
+  /*
+   * 自适应降级重试。
+   *
+   * HTTP 524 是 Cloudflare 的「源站超时」（约 100 秒），504/408 同理，连接被重置
+   * 也常是同一回事 —— 它们都**不表示请求有问题，只表示这一片在这个链路上传得太慢**。
+   * 分片大小能不能扛住，取决于用户上行带宽到源站的实际速度，事前猜不准：同一个
+   * 4 MiB 在光纤上几百毫秒，在绕经 Cloudflare 的慢链路上就会超过 100 秒。
+   *
+   * 所以不猜 —— 超时就减半重来，直到传得动为止。每次减半都要重建会话，
+   * 因为服务端的分片布局（总片数、每片偏移）是建会话时定死的。
+   */
+  let chunkSize: number | undefined;
+  let lastError: unknown;
+
+  for (let attempt = 1; attempt <= UPLOAD_CHUNK_RETRIES; attempt += 1) {
+    try {
+      const result = await runOnce(chunkSize);
+      options.onProgress?.(100);
+      return result;
+    } catch (err) {
+      lastError = err;
+      if (!isSlowLinkError(err)) throw err;
+
+      const used = chunkSize ?? UPLOAD_CHUNK_SIZE_DEFAULT;
+      const next = Math.floor(used / 2);
+      if (next < UPLOAD_CHUNK_SIZE_MIN) {
+        // 已经降到服务端接受的下界还是传不动，说明这条链路基本不可用，
+        // 再重试只是耗用户时间 —— 如实说清楚，把判断交给用户
         throw new ApiError(
-          res.status === 401 ? 'UNAUTHORIZED' : 'INTERNAL_ERROR',
-          `第 ${index + 1}/${totalChunks} 片上传失败（HTTP ${res.status}）${extractMessage(text)}`,
-          res.status,
+          'NETWORK_ERROR',
+          `上传持续超时：分片已降到最小的 ${formatKB(UPLOAD_CHUNK_SIZE_MIN)} 仍传不完。` +
+            `当前网络到服务器的上行速度过慢，请换网络后重试。`,
+          0,
         );
       }
 
-      done += 1;
-      // 只到 99%：最后 1% 留给服务端合并与入库，避免进度条早早停在 100% 却还没结束
-      options.onProgress?.(Math.min(99, Math.round((done / totalChunks) * 99)));
+      chunkSize = next;
+      options.onProgress?.(0);
+      options.onNotice?.(
+        `网络较慢，正在把分片减小到 ${formatKB(next)} 重试（第 ${attempt} 次）…`,
+      );
     }
-
-    const result = (await post(`/uploads/${uploadId}/complete`)) as BookDetail;
-    options.onProgress?.(100);
-    return result;
-  } catch (err) {
-    abortSession(uploadId);
-    throw err;
   }
+
+  throw lastError instanceof Error ? lastError : new Error('上传失败');
+}
+
+/**
+ * 判断错误是否属于「链路太慢」——只有这类才值得减小分片重试。
+ *
+ * 413 也算：那是中间层明确说「这个请求体太大」，减小分片正好对症。
+ * 而 400/401/415 属于请求本身有问题，重试多少次都一样，应当直接报错。
+ */
+function isSlowLinkError(err: unknown): boolean {
+  if (err instanceof DOMException && err.name === 'AbortError') return false;
+  if (err instanceof ApiError) {
+    return err.status === 0 || err.status === 413 || err.status === 408 || err.status === 504 || err.status === 524;
+  }
+  // fetch 本身抛错（连接被重置、断流）也按链路问题处理
+  return err instanceof TypeError;
+}
+
+function formatKB(bytes: number): string {
+  return bytes >= 1024 * 1024 ? `${(bytes / 1024 / 1024).toFixed(0)} MB` : `${Math.round(bytes / 1024)} KB`;
 }
 
 /** 从响应的错误信封里取出 message；拿不到就返回空串（不要污染上层提示） */

@@ -201,6 +201,7 @@ export async function registerLibraryRoutes(app: FastifyInstance): Promise<void>
       size: input.size,
       md5: input.md5,
       fields: input.fields as Record<string, string | undefined>,
+      chunkSize: input.chunkSize,
     });
 
     recordAudit('book.upload', auditContextFrom(req, user), {
