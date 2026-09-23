@@ -52,6 +52,24 @@ function kosyncError(reply: FastifyReply, status: number, message: string): Fast
 
 export async function registerKosyncRoutes(app: FastifyInstance): Promise<void> {
   /**
+   * 健康检查 —— 客户端用它判断「这个地址是不是 KOReader 同步服务器」。
+   *
+   * 官方 koreader-sync-server 暴露了 `GET /healthcheck`，其自带的探活脚本正是
+   * 靠它判定的：
+   *     curl -H "Accept: application/vnd.koreader.v1+json" .../healthcheck \
+   *       | grep -q '"state":"OK"'
+   *
+   * 部分第三方客户端（如 Reeden）在填写自定义同步地址时也做同样的探测，
+   * 探测失败就报「该地址不是 KOReader 同步服务器，请检查服务器地址」——
+   * 与账号密码无关。缺这个端点会让人完全摸不着头脑。
+   *
+   * 无需认证：它只回答「服务在不在」。
+   */
+  app.get('/healthcheck', async (_req, reply) => {
+    return reply.status(200).send({ state: 'OK' });
+  });
+
+  /**
    * 校验 KOSync 头。
    *
    * 恒定时间比较（safeEqualHex）是必须的：x-auth-key 是 32 位十六进制，
@@ -62,7 +80,10 @@ export async function registerKosyncRoutes(app: FastifyInstance): Promise<void> 
     if (!auth.ok) {
       return kosyncAuthFailed(req, reply, auth);
     }
-    return reply.status(200).type('text/plain').send('OK');
+    // 与官方一致返回 {"authorized":"OK"}（而不是纯文本）。
+    // KOReader 只看状态码，但部分第三方客户端会解析响应体，
+    // 拿到非 JSON 就判定「这不是 KOSync 服务器」。
+    return reply.status(200).send({ authorized: 'OK' });
   });
 
   /**
@@ -121,7 +142,8 @@ export async function registerKosyncRoutes(app: FastifyInstance): Promise<void> 
       meta: { protocol: 'kosync' },
     });
 
-    return reply.status(201).type('text/plain').send('OK');
+    // 与官方一致：返回 {"username": "..."}，而不是纯文本
+    return reply.status(201).send({ username: parsed.data.username });
   });
 
   /** 上报进度。响应是裸 JSON，timestamp 为 Unix 秒 */
@@ -196,6 +218,60 @@ export async function registerKosyncRoutes(app: FastifyInstance): Promise<void> 
       timestamp: unixSeconds(entry.updatedAt),
     };
     return reply.status(200).send(body);
+  });
+
+  /**
+   * 修改同步密码。
+   *
+   * 官方服务器用它让客户端在 App 内改密码，请求头带当前凭据、body 带新密码的
+   * md5（{ "password": "<md5>" }），成功返回 {"updated": true}。
+   *
+   * 我们的取舍：**只更新 KOSync 同步密码，不影响网页登录的主密码**。
+   * 两者在本项目里本就是分离的（见 docs/security.md），让一个阅读器客户端
+   * 改掉站点主密码既不符合预期，也会把用户锁在网页端之外。
+   */
+  app.put('/users/password', async (req, reply) => {
+    const auth = authenticateKosync(req);
+    if (!auth.ok) {
+      return kosyncAuthFailed(req, reply, auth);
+    }
+
+    const body = req.body as { password?: unknown } | undefined;
+    const newKey = typeof body?.password === 'string' ? body.password.trim().toLowerCase() : '';
+
+    // 客户端发的是 md5(新密码)，必须是 32 位十六进制
+    if (!/^[a-f0-9]{32}$/.test(newKey)) {
+      return kosyncError(reply, 403, '新密码格式不正确（应为密码的 MD5 十六进制串）');
+    }
+
+    getDb()
+      .update(users)
+      .set({ kosyncKey: newKey, updatedAt: new Date() })
+      .where(eq(users.id, auth.user.id))
+      .run();
+
+    recordAudit('user.password_change', auditContextFrom(req, auth.user), {
+      target: auth.user.username,
+      meta: { protocol: 'kosync', scope: 'sync-password-only' },
+    });
+
+    return reply.status(200).send({ updated: true });
+  });
+
+  /**
+   * 官方还有一个 `DELETE /users/me`（注销账号），这里**有意不实现**。
+   *
+   * 官方服务器里的账号就等于同步账号，删掉只影响同步数据；而本项目的账号
+   * 还持有网页登录、书库元数据、存储配置、阅读统计等。让阅读器里一次
+   * 「删除同步账号」把整站账号连同书库一起抹掉，影响远超用户预期，
+   * 且不可恢复。这里返回 501 并说明去哪里操作，而不是默默照做。
+   */
+  app.delete('/users/me', async (_req, reply) => {
+    return kosyncError(
+      reply,
+      501,
+      '为避免阅读器里误操作导致整站账号（含书库与存储配置）被删除，本服务器不支持通过 KOSync 注销账号。如需删除请登录网页端操作。',
+    );
   });
 
   /** 部分客户端（含某些反向代理后的 WebView）会先发 OPTIONS 预检 */

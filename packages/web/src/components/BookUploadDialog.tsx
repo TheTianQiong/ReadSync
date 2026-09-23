@@ -2,6 +2,7 @@ import { BOOK_FORMATS, DEFAULT_ALLOWED_EXTENSIONS, type BookSummary, type CheckB
 import { FileUp, ScanSearch } from 'lucide-react';
 import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { Link } from 'react-router-dom';
+import { useAuth } from '../contexts/AuthContext';
 import { api } from '../lib/api';
 import { useAsync } from '../lib/hooks';
 import { fileExtension, formatBytes, md5OfFile, parseTags } from '../lib/utils';
@@ -36,6 +37,9 @@ export function BookUploadDialog({
 }): ReactNode {
   const toast = useToast();
   const fileInputRef = useRef<HTMLInputElement>(null);
+  // 站点单文件上限/允许的类型。选文件时就据此预检，避免传完才被拒
+  const { settings } = useAuth();
+  const maxFileSize = settings?.upload?.maxFileSize ?? 0;
 
   const [file, setFile] = useState<File | null>(null);
   const [title, setTitle] = useState('');
@@ -86,6 +90,21 @@ export function BookUploadDialog({
 
     if (!picked) return;
 
+    /*
+     * 选文件时就拦下超限的文件。
+     *
+     * 不做这一步的话，用户会眼睁睁看着进度条爬到 100% 才收到失败提示 ——
+     * 或者更糟：请求在反向代理那一层被掐断，浏览器只报「网络连接中断」，
+     * 完全看不出是文件太大的缘故。上限由后端 /api/system/settings 下发。
+     */
+    if (maxFileSize > 0 && picked.size > maxFileSize) {
+      setError(
+        `文件大小 ${formatBytes(picked.size)}，超过本站单文件上限 ${formatBytes(maxFileSize)}。` +
+          `请联系管理员在「站点设置 → 上传」中调高上限。`,
+      );
+      return;
+    }
+
     if (mode === 'create') {
       // 文件名去掉扩展名作为默认书名，省一次输入
       const base = picked.name.replace(/\.[^.]+$/, '');
@@ -125,6 +144,13 @@ export function BookUploadDialog({
     }
     if (mode === 'create' && !title.trim()) {
       setError('请填写书名');
+      return;
+    }
+    // 兜底：文件可能是拖进来的，或设置在上传前刚被管理员改小
+    if (maxFileSize > 0 && file.size > maxFileSize) {
+      setError(
+        `文件大小 ${formatBytes(file.size)}，超过本站单文件上限 ${formatBytes(maxFileSize)}。`,
+      );
       return;
     }
 

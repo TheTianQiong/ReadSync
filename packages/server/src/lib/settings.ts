@@ -69,6 +69,11 @@ export function getPublicSettings(): PublicSettings {
     version: VERSION,
     // 前端据此决定：无法使用 WebCrypto 时是报错还是降级为明文提交
     allowPlaintextPassword: allowPlaintextPassword(),
+    // 前端据此在上传前预检大小与扩展名，避免白传一场
+    upload: {
+      maxFileSize: s.upload.maxFileSize,
+      allowedExtensions: [...s.upload.allowedExtensions],
+    },
   };
 }
 

@@ -239,10 +239,16 @@ export function upload<T>(
     if (token) xhr.setRequestHeader('Authorization', `Bearer ${token}`);
     xhr.setRequestHeader('Accept', 'application/json');
 
-    if (options.onProgress && xhr.upload) {
+    // 记下最后到达的进度：连接中断时它是判断「卡在哪一层」的唯一线索
+    let lastPercent = 0;
+    let sentBytes = 0;
+
+    if (xhr.upload) {
       xhr.upload.onprogress = (event) => {
+        sentBytes = event.loaded;
         if (event.lengthComputable) {
-          options.onProgress?.(Math.round((event.loaded / event.total) * 100));
+          lastPercent = Math.round((event.loaded / event.total) * 100);
+          options.onProgress?.(lastPercent);
         }
       };
     }
@@ -261,7 +267,36 @@ export function upload<T>(
       }
     };
 
-    xhr.onerror = () => reject(new ApiError('NETWORK_ERROR', '上传失败，网络连接中断', 0));
+    /*
+     * 连接中断。
+     *
+     * 这里必须把「传到哪儿了」讲清楚，否则用户只看到一句「网络连接中断」，
+     * 完全无从下手 —— 而这两种情况的处置方式截然不同：
+     *
+     *  - 一个字节都没发出去（sentBytes === 0）：是本机到服务器根本没通，
+     *    查地址、端口、防火墙。
+     *  - 传到一半才断：连接建立过、数据也发出去了一部分，说明链路是通的，
+     *    是**中途**被掐断的。自托管场景下最常见的原因是反向代理限制：
+     *    nginx 的 client_max_body_size（默认仅 1 MB）、Cloudflare 免费版
+     *    100 MB 请求体上限、以及 Cloudflare 100 秒的请求超时。
+     *    服务端本身不会这样断（它会返回 413），所以看到「传到一半断」
+     *    基本可以直接去查代理配置。
+     */
+    xhr.onerror = () => {
+      if (sentBytes === 0) {
+        reject(new ApiError('NETWORK_ERROR', '上传失败，无法连接服务器，请检查网络或后端是否已启动', 0));
+        return;
+      }
+      reject(
+        new ApiError(
+          'NETWORK_ERROR',
+          `上传在 ${lastPercent}% 处中断。连接是通的，但中途被切断了 —— ` +
+            `若经过 nginx/Cloudflare 等反向代理，请检查其请求体大小限制（nginx 的 ` +
+            `client_max_body_size 默认仅 1 MB）与超时设置，详见 docs/https-setup.md`,
+          0,
+        ),
+      );
+    };
     xhr.ontimeout = () => reject(new ApiError('NETWORK_ERROR', '上传超时', 0));
     xhr.onabort = () => reject(new DOMException('上传已取消', 'AbortError'));
 

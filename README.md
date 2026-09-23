@@ -277,6 +277,24 @@ readsync user kosync-check <用户名或邮箱> -p <你填进 KOReader 的密码
    设置过同步密码后，**主密码不再能用于 KOSync**（这是有意为之，避免主密码摘要外泄）。
 4. **Reeden 等 Android 应用报「连接失败」**：Android 默认禁止明文 HTTP 流量，这类应用通常只能用 **HTTPS** 地址。请先按 [HTTPS 配置指南](docs/https-setup.md) 配上证书。
 
+**Reeden 等 App 报「该地址不是 KOReader 同步服务器」**
+
+这是**地址探测失败，与账号密码无关**——同样的账号在 KOReader 上可能完全正常。这类客户端在保存服务器地址前会先探测 `GET /healthcheck`，判定条件是响应体里出现 `"state":"OK"`（与官方 `koreader-sync-server` 自带的探活脚本一致）：
+
+```bash
+curl -s http://<你的服务器地址>:3000/healthcheck
+# 期望输出：{"state":"OK"}
+```
+
+- 没有输出或报连接失败 → 地址/端口/反代的问题，不是账号问题。
+- 输出是 `{"ok":false,...}` 或 404 → 服务器版本过旧，升级到含 `/healthcheck` 的版本即可。
+
+**上传书籍失败，提示「上传失败，网络连接中断」**
+
+先看提示里的百分比：**「无法连接服务器」是链路没通；「上传在 xx% 处中断」是连接被中途掐断**——后者几乎都是反向代理的体积/超时限制（Nginx 的 `client_max_body_size` 默认只有 1 MB，Cloudflare 免费版请求体上限 100 MB 且超时 100 秒）。完整排查表见 [HTTPS 配置指南](docs/https-setup.md#七常见问题)。
+
+选文件时若已超过本站单文件上限（默认 200 MB），页面会立即提示，不会白传一场。
+
 **改了 `.env` 但不生效**
 
 服务启动时会自动读取工作目录下的 `.env`（已存在的环境变量优先）。注意要在项目根目录启动，且 systemd 方式下修改 `.env` 后需 `systemctl restart readsync`。
@@ -542,11 +560,19 @@ cd packages/server
 READSYNC_DATA_DIR=./data-smoke npx tsx src/scripts/smoke-crypto.ts
 READSYNC_DATA_DIR=./data-smoke npx tsx src/scripts/smoke-db.ts
 
-# 端到端集成测试（68 项断言：认证 / 2FA / 恢复码 / 上传秒传 / 同步 / 统计 / KOSync / 权限隔离）
+# 端到端集成测试（83 项断言：认证 / 2FA / 恢复码 / 上传秒传 / 同步 / 统计 / KOSync / 权限隔离）
 READSYNC_DATA_DIR=./data-e2e npx tsx src/scripts/smoke-e2e.ts
+
+# 真实 socket 的大文件上传（冒烟测试走进程内 inject，照不出传输层问题）
+READSYNC_DATA_DIR=./data-repro npx tsx src/scripts/repro-upload.ts 64
+
+# 验证服务端会等完整请求体（file 字段在前、文本字段在后的真实顺序）
+READSYNC_DATA_DIR=./data-repro npx tsx src/scripts/repro-socket.ts 8 2
 ```
 
 端到端测试使用独立的 `data-e2e` 目录，并带有路径护栏，不会误伤生产数据。
+
+排查「上传失败」类问题时，`repro-upload.ts` 是关键工具：它真的监听端口、真的发 HTTP，能区分失败发生在服务端还是链路中间 —— 而 `smoke-e2e.ts` 用的是 `app.inject()`，进程内直调，永远看不到网络层的失败。
 
 ### 模块开发约定
 

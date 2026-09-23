@@ -132,6 +132,12 @@ async function main(): Promise<void> {
     const pubSettings = await api({ method: 'GET', url: '/api/system/settings' });
     check('公开设置可匿名读取', pubSettings.statusCode === 200 && pubSettings.json().data?.version?.length > 0);
 
+    // 前端要靠它在上传前预检大小/类型：没下发的话，用户只能传完才被拒，
+    // 走反向代理时甚至只看到「网络连接中断」，根本猜不到是文件太大
+    const pubUpload = pubSettings.json().data?.upload;
+    check('公开设置含单文件上限（供前端上传前预检）', typeof pubUpload?.maxFileSize === 'number', pubUpload);
+    check('公开设置含允许的扩展名', Array.isArray(pubUpload?.allowedExtensions) && pubUpload.allowedExtensions.includes('epub'), pubUpload);
+
     /* ---------------------------- 2. 初始化管理员 ---------------------------- */
     section('2. 初始化管理员');
     const adminPassword = 'AdminPass123';
@@ -316,11 +322,29 @@ async function main(): Promise<void> {
     const kosyncKey = createHash('md5').update(adminPassword).digest('hex');
     const kAuth = { 'x-auth-user': 'admin', 'x-auth-key': kosyncKey };
 
+    // 探活：第三方客户端（如 Reeden）靠它判断「这是不是 KOSync 服务器」。
+    // 官方探活脚本的判定条件是响应体里出现 "state":"OK"。
+    const kHealth = await api({ method: 'GET', url: '/healthcheck' });
+    check(
+      'KOSync /healthcheck 返回 {"state":"OK"}',
+      kHealth.statusCode === 200 && kHealth.json().state === 'OK',
+      kHealth.body,
+    );
+    check('官方探活脚本能识别本站（grep \'"state":"OK"\'）', kHealth.body.replace(/\s/g, '').includes('"state":"OK"'), kHealth.body);
+
     const kAuthRes = await api({ method: 'GET', url: '/users/auth', headers: kAuth });
-    check('KOSync 认证返回 200 OK', kAuthRes.statusCode === 200 && kAuthRes.body.trim() === 'OK', kAuthRes.body);
+    // 上游是纯文本 OK，但第三方客户端会解析响应体，非 JSON 会被判成「不是 KOSync 服务器」。
+    // 返回 {"authorized":"OK"} 同时满足两者：KOReader 只看状态码。
+    check(
+      'KOSync 认证返回 200 + {"authorized":"OK"}',
+      kAuthRes.statusCode === 200 && kAuthRes.json().authorized === 'OK',
+      kAuthRes.body,
+    );
 
     const kBad = await api({ method: 'GET', url: '/users/auth', headers: { 'x-auth-user': 'admin', 'x-auth-key': 'f'.repeat(32) } });
     check('KOSync 错误密钥返回 401', kBad.statusCode === 401, kBad.statusCode);
+    check('KOSync 失败响应带 message 字段（否则客户端只显示「未知服务器错误」）', typeof kBad.json().message === 'string', kBad.body);
+    check('KOSync 失败响应不是 ApiResponse 信封', kBad.json().ok === undefined, kBad.body);
 
     const kPut = await api({
       method: 'PUT',
@@ -337,6 +361,33 @@ async function main(): Promise<void> {
 
     const kMissing = await api({ method: 'GET', url: '/syncs/progress/not-exist', headers: kAuth });
     check('KOSync 未找到返回 200 + 空对象（上游预期行为）', kMissing.statusCode === 200 && JSON.stringify(kMissing.json()) === '{}', kMissing.body);
+
+    // 改同步密码：客户端发 md5(新密码)，成功返回 {"updated": true}
+    const newKosyncKey = createHash('md5').update('RotatedPass456').digest('hex');
+    const kRotate = await api({ method: 'PUT', url: '/users/password', headers: kAuth, payload: { password: newKosyncKey } });
+    check('KOSync 改同步密码返回 {"updated":true}', kRotate.statusCode === 200 && kRotate.json().updated === true, kRotate.body);
+
+    const kOldKey = await api({ method: 'GET', url: '/users/auth', headers: kAuth });
+    check('改密后旧同步密码失效', kOldKey.statusCode === 401, kOldKey.statusCode);
+
+    const kNewAuth = { 'x-auth-user': 'admin', 'x-auth-key': newKosyncKey };
+    const kNewKey = await api({ method: 'GET', url: '/users/auth', headers: kNewAuth });
+    check('改密后新同步密码可用', kNewKey.statusCode === 200, kNewKey.body);
+
+    const kBadNew = await api({ method: 'PUT', url: '/users/password', headers: kNewAuth, payload: { password: 'not-a-md5' } });
+    check('KOSync 改密拒绝非 MD5 格式', kBadNew.statusCode === 403 && typeof kBadNew.json().message === 'string', kBadNew.body);
+
+    // 复原，避免影响后续断言或重复运行
+    const kRestore = await api({ method: 'PUT', url: '/users/password', headers: kNewAuth, payload: { password: kosyncKey } });
+    check('KOSync 同步密码可复原', kRestore.statusCode === 200 && kRestore.json().updated === true, kRestore.body);
+
+    // DELETE /users/me 有意不实现：返回 501 + 可读原因，而不是把整站账号删掉
+    const kDeleteMe = await api({ method: 'DELETE', url: '/users/me', headers: kAuth });
+    check('KOSync 注销账号返回 501（保护整站账号）', kDeleteMe.statusCode === 501, kDeleteMe.statusCode);
+    check('KOSync 注销失败给出可读原因', typeof kDeleteMe.json().message === 'string', kDeleteMe.body);
+
+    const kStillThere = await api({ method: 'GET', url: '/users/auth', headers: kAuth });
+    check('调用注销后账号依然存在', kStillThere.statusCode === 200, kStillThere.statusCode);
 
     /* ---------------------------- 9. 权限隔离 ---------------------------- */
     section('9. 权限隔离');

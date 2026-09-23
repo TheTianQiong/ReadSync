@@ -316,10 +316,13 @@ KOReader 固定发送两个请求头：
 
 | 方法 | 路径 | 请求 | 响应 |
 |---|---|---|---|
-| GET | `/users/auth` | 仅请求头 | `200` 纯文本 `OK` / `401` 纯文本 `Unauthorized` |
-| POST | `/users/create` | `{ "username": "...", "password": "<md5>" }` | `201` 创建成功 / `402` 用户名已存在 |
+| GET | `/healthcheck` | 无（无需认证） | `{ "state": "OK" }` |
+| GET | `/users/auth` | 仅请求头 | `200` `{ "authorized": "OK" }` / `401` `{ "message": "..." }` |
+| POST | `/users/create` | `{ "username": "...", "password": "<md5>" }` | `201` `{ "username": "..." }` / `402` 用户名已存在 |
+| PUT | `/users/password` | 仅请求头 + `{ "password": "<新md5>" }` | `200` `{ "updated": true }` |
 | PUT | `/syncs/progress` | `{ document, progress, percentage, device, device_id }` | `{ "document": "...", "timestamp": 1789737720 }` |
 | GET | `/syncs/progress/{document}` | 仅请求头 | 裸 JSON，见下 |
+| DELETE | `/users/me` | — | `501`，**有意不实现**，见 5.5 |
 
 `GET /syncs/progress/{document}` 响应（**未找到时返回 `{}` 而非 404**，这是 KOReader 的预期行为）：
 
@@ -336,12 +339,47 @@ KOReader 固定发送两个请求头：
 
 注意 `percentage` 是 **0-1 小数**，`timestamp` 是 **Unix 秒**。
 
-### 5.3 KOReader 配置
+### 5.3 探活
+
+部分客户端在保存服务器地址前会先探测。官方服务器自带的探活脚本判定条件就是 `GET /healthcheck` 的响应体中出现 `"state":"OK"`：
+
+```bash
+curl -sf -k -H "Accept: application/vnd.koreader.v1+json" \
+  https://<你的服务器地址>/healthcheck | grep -q '"state":"OK"'
+```
+
+如果客户端报「该地址不是 KOReader 同步服务器」，先用上面这条命令确认服务端这一层是否正常——它能区分「地址/网络问题」和「账号密码问题」。
+
+### 5.4 响应格式
+
+**成功响应改成了 JSON。** 上游 sync.koreader.rocks 在 `/users/auth` 与 `/users/create` 上返回的是纯文本 `OK`。本服务器改为返回 JSON，原因是有第三方客户端（如 Reeden）在填写自定义同步地址时会解析响应体，拿到非 JSON 就判定「该地址不是 KOReader 同步服务器，请检查服务器地址」——与账号密码无关，用户完全无从排查。KOReader 本身只看状态码，因此这一改动对它无影响。
+
+**失败响应一律是 `{"message": "..."}`**，绝不返回 `ApiResponse` 信封（`{ ok: false, error: {...} }`）。KOReader 客户端的代码是：
+
+```lua
+text = body and body.message or _("Unknown server error")
+```
+
+拿不到 `message` 字段时，界面上只会显示「未知服务器错误」，用户无法判断是密码错了、账号被禁用还是服务端故障。因此本文件里所有失败路径都直接 `reply`，不抛异常——全局错误处理器会把任何异常转成信封，那样客户端就读不到 `message` 了。
+
+认证失败的 `message` 会区分具体原因（用户名不存在 / 账号被禁用 / 未设置同步密码 / 密码不匹配），因为电子墨水屏上输入账号极易出错，笼统回一句「密码不正确」会让这些情况无从判断。服务端日志同时记录失败原因与用户名，但**不记录密钥本身**。
+
+### 5.5 未实现的端点
+
+| 方法 | 路径 | 本服务器行为 |
+|---|---|---|
+| DELETE | `/users/me` | `501` + 说明文案 |
+
+官方的 `DELETE /users/me` 用于注销账号。在官方服务器里账号就等于同步账号，删除只影响同步数据；而本项目的账号还持有网页登录、书库元数据、存储配置与阅读统计。让阅读器里一次「删除同步账号」把整站账号连同书库一起抹掉，影响远超用户预期且不可恢复，因此这里返回 `501` 并说明应到网页端操作，而不是默默照做。
+
+### 5.6 KOReader 配置
 
 在 KOReader 里打开「工具 → 云存储 → 进度同步」，填写：
 
 - 自定义同步服务器：`http://<你的服务器地址>:3000`
 - 用户名 / 密码：站点账号（或你单独设置的同步密码）
+
+若使用本项目自带的插件（见 `koreader-plugin/`），则可在插件菜单里直接登录，无需手动填写。
 
 ---
 

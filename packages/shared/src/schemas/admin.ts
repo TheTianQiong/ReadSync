@@ -54,6 +54,18 @@ export interface PublicSettings {
   footerText: string;
   version: string;
   /**
+   * 上传限制，公开给前端做**上传前预检**。
+   *
+   * 必须暴露：否则用户选中一个 300 MB 的文件、传了十分钟，才在最后被服务端
+   * 拒绝（或在反向代理那一层被掐断，浏览器只报「网络连接中断」）。
+   * 提前知道上限就能立刻给出「超过本站单文件上限 200 MB」这种可行动的错误。
+   */
+  upload: {
+    /** 单文件上限（字节），0 表示不限制 */
+    maxFileSize: number;
+    allowedExtensions: string[];
+  };
+  /**
    * 服务端是否接受明文密码。
    *
    * 背景：密码加密依赖浏览器的 WebCrypto，而它只在安全上下文（HTTPS 或
