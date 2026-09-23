@@ -183,26 +183,48 @@ node scripts/verify-deploy.mjs https://read.example.com:8443
 
 这是**反向代理掐断了连接**，不是 ReadSync 的问题 —— 服务端遇到超限会明确返回 413，不会无声断连。按代理类型排查：
 
-| 代理 | 限制 | 配置 |
+| 代理 | 限制 | 处理 |
 |---|---|---|
-| Nginx | `client_max_body_size` **默认仅 1 MB** | 在 `server` 或 `location` 块里设 `client_max_body_size 2g;` |
-| Cloudflare（橙云代理） | 免费/Pro 版**请求体上限 100 MB，且请求超时 100 秒** | 无法调整，只能绕开：给该子域关掉橙云（改灰云 DNS-only），或改用非标准端口直连 |
+| Nginx | `client_max_body_size` **默认仅 1 MB** | 在 `server` 或 `location` 块设 `client_max_body_size 2g;`，然后 `nginx -t && systemctl reload nginx` |
 | Caddy | 无默认体积限制 | 一般无需处理 |
-| Cloudflare Tunnel | 同样受上面的橙云限制约束 | 同上 |
+| Cloudflare（**橙云**代理） | 请求体与请求时长都有上限，且**免费版调不了** | 只能绕开，见下 |
+| **Cloudflare Tunnel** | 同橙云，**且无法用灰云绕开** | 见下 |
 
 判断方法：上传失败时前端会显示**中断在百分之几**。
 
 - 显示「无法连接服务器」（0%）→ 链路根本没通，查地址/端口/防火墙。
 - 显示「上传在 xx% 处中断」→ 连接是通的，是中途被切的，按上表查代理。
 
-Nginx 改完记得 `nginx -t && systemctl reload nginx`。验证配置是否生效：
+#### Cloudflare Tunnel 为什么不能靠灰云绕过
+
+Cloudflare 官方对长耗时请求的建议是「移到**未代理的子域（DNS-only，灰云）**」。但这条**对 Tunnel 不适用**：
+
+Tunnel 的 DNS 记录是一条 CNAME，指向 `<UUID>.cfargotunnel.com`。官方文档明确写着，这个子域**只为同一 Cloudflare 账号内的记录做代理**——它不是一个可从公网直接回源的地址，本质上就是 Cloudflare 边缘的入口。把这条记录改成灰云，等于让浏览器直接去连 `cfargotunnel.com`，隧道随即失效（报 1016 或解析失败）。
+
+也就是说：**灰云 = 完全不经过 Cloudflare，那时 Tunnel 本身就多余了**。二者不能共存。
+
+#### 可行的两条路
+
+**路线一：上传走一条不经过 Cloudflare 的通道（改动最小）**
+
+用一条灰云 A 记录直接指向服务器公网 IP，配上自有证书并监听非标准端口（本指南的方案 B / C）。这条通道不经 Cloudflare 边缘，因此没有请求体与超时限制。
+
+代价是要自己维护证书（acme.sh 可自动续期），且非标准端口需要在云厂商安全组放行。
+
+**路线二：改成分片上传（保留 Tunnel）**
+
+前端把文件切成若干小块逐个上传，服务端按序落盘后合并。每个请求都很小、很快，天然躲开请求体上限与超时限制。
+
+> 当前版本用的是整体上传，尚未支持分片。如果你必须在 Cloudflare Tunnel 后面传大文件，请提 issue。
+
+#### 先确认是不是代理的问题
 
 ```bash
-# 直接打后端，绕过代理：应当能正常上传
+# 在服务器本机上直接打后端，绕过一切代理：应当能正常上传
 curl -X POST http://127.0.0.1:3000/api/books/upload \
   -H "Authorization: Bearer <令牌>" -F "file=@一本大书.epub" -F "title=测试"
 ```
 
-若直连正常、走域名失败，就能确定是代理那一层。
+直连正常、走域名失败 → 确定是代理那一层；两边都失败 → 问题在服务端或存储配置（看 `journalctl -u readsync -f`）。
 
 另外，**选文件时若已超过本站单文件上限，前端会立即提示**（上限由「站点管理 → 站点设置 → 上传 → 单文件上限」控制，默认 200 MB），不会再让你白传一场。
