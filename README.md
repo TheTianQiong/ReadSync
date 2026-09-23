@@ -121,9 +121,22 @@ npm start
 > - `npm ci` 严格按 `package-lock.json` 安装并校验一致性，`npm install` 则可能改写依赖树。网络中断时 `npm install` 容易留下「半装」的 `node_modules`（目录在但文件缺失），且再跑一次未必修复。
 > - `--ignore-scripts` 跳过安装脚本。本项目所有原生模块都自带各平台预编译产物，无需现场编译；反之若允许执行脚本，npm 会因 `better-sqlite3` 带 `binding.gyp` 而调用 node-gyp，在没有编译工具链的机器上直接失败。
 
-### 方式四：Cloudflare Tunnel（免费 HTTPS，无需公网 IP 与证书）
+### 方式四：配置 HTTPS
 
-服务端很多功能依赖**安全上下文**（HTTPS 或 localhost）—— 浏览器的 WebCrypto 只在安全上下文可用，密码加密、通行密钥都基于它。如果你的服务器只能用 `http://<IP>:3000` 访问，推荐用 Cloudflare Tunnel 补上 HTTPS。
+服务端很多功能依赖**安全上下文**（HTTPS 或 localhost）—— 浏览器的 WebCrypto 只在安全上下文可用，密码加密、通行密钥都基于它。若你只能用 `http://<IP>:3000` 访问，需要补上 HTTPS。
+
+**有域名**：见 **[HTTPS 配置指南](docs/https-setup.md)**，涵盖
+
+| 情况 | 方案 | 端口 |
+|---|---|---|
+| 域名已备案 | Caddy 自动 HTTPS（最省心，配置仅数行） | 443 |
+| 域名未备案（大陆服务器） | 云厂商免费证书 + Nginx，或 acme.sh DNS 验证 | 8443 等非标准端口 |
+
+> 大陆服务器上 **80/443 要求域名完成 ICP 备案**，未备案会被拦截；其他端口不受限制。而 Let's Encrypt 的自动签发需要 80 或 443 做域名验证 —— 未备案时必须改用 DNS 验证。仓库里已备好可直接用的 [Nginx 配置](deploy/https/nginx-nonstandard-port.conf) 与 [Caddyfile](deploy/https/Caddyfile.standard)。
+
+**没有域名**：用 Cloudflare Tunnel，见下。
+
+#### Cloudflare Tunnel（免费 HTTPS，无需公网 IP 与证书）
 
 ```bash
 # 1. 安装 cloudflared（Debian/Ubuntu）
@@ -226,7 +239,7 @@ grep READSYNC_BASE_URL .env
 
 说明你在用 `http://<IP>:3000` 访问 —— 这不是安全上下文，浏览器不提供 WebCrypto，前端无法加密密码。有三种解决办法，按推荐顺序：
 
-1. **配 HTTPS**（推荐）：用上面的 [Cloudflare Tunnel](#方式四cloudflare-tunnel免费-https无需公网-ip-与证书)；
+1. **配 HTTPS**（推荐）：有域名见 [HTTPS 配置指南](docs/https-setup.md)，没有域名见 [Cloudflare Tunnel](#cloudflare-tunnel免费-https无需公网-ip-与证书)；
 2. **改用 `http://localhost:3000`** 在本机浏览器访问（localhost 属于安全上下文）；
 3. **确实只能走 HTTP 时**，在 `.env` 中显式开启明文降级后重启：
 
@@ -238,7 +251,7 @@ READSYNC_ALLOW_PLAINTEXT_PASSWORD=true
 
 **Cloudflare Tunnel 报 502 Bad Gateway**
 
-见 [方式四](#方式四cloudflare-tunnel免费-https无需公网-ip-与证书) 的排查清单。最常见的是源站地址写成 `https://`、端口不对，或 `localhost` 被解析到 IPv6 而源站只监听了 IPv4 —— 后者改用 `http://127.0.0.1:3000` 即可。
+见 [Cloudflare Tunnel](#cloudflare-tunnel免费-https无需公网-ip-与证书) 的排查清单。最常见的是源站地址写成 `https://`、端口不对，或 `localhost` 被解析到 IPv6 而源站只监听了 IPv4 —— 后者改用 `http://127.0.0.1:3000` 即可。
 
 **改了 `.env` 但不生效**
 
@@ -523,6 +536,7 @@ READSYNC_DATA_DIR=./data-e2e npx tsx src/scripts/smoke-e2e.ts
 |---|---|
 | [docs/api-reference.md](docs/api-reference.md) | 完整 API 参考，含统一同步接口与 KOSync 协议细节 |
 | [docs/plugin-development.md](docs/plugin-development.md) | 插件清单、上下文 API、钩子、存储驱动与同步协议扩展 |
+| [docs/https-setup.md](docs/https-setup.md) | 自有域名配置 HTTPS：备案判断、Caddy / Nginx / acme.sh 三种方案 |
 | [docs/security.md](docs/security.md) | 安全设计与权衡、部署检查清单 |
 | [docs/requirements.md](docs/requirements.md) | 原始需求文档与实现对照表（含已知差异） |
 | [packages/server/src/modules/CONVENTIONS.md](packages/server/src/modules/CONVENTIONS.md) | 后端模块开发约定 |

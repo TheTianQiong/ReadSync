@@ -20,10 +20,9 @@
 
 	reverse_proxy readsync:3000 {
 		# 传递真实客户端 IP；同时需要把 READSYNC_TRUST_PROXY 设为 true，
-		# 否则服务端不会采信这些头
+		# 否则服务端不会采信这些头。
+		# X-Forwarded-For / X-Forwarded-Proto 由 Caddy 默认传递，无需重复声明。
 		header_up X-Real-IP {remote_host}
-		header_up X-Forwarded-For {remote_host}
-		header_up X-Forwarded-Proto {scheme}
 
 		# 大文件上传/下载不走缓冲，直接透传
 		flush_interval -1
