@@ -41,8 +41,11 @@ export function toStorageSummary(row: StorageRow): StorageSummary {
     isDefault: row.isDefault,
     readOnly: row.readOnly,
     enabled: row.enabled,
-    // maskConfig 对密文直接输出 '••••••••'，对明文非敏感字段原样保留
-    config: maskConfig(row.config),
+    // 先按驱动 schema 规范化再脱敏。
+    // 历史数据里可能存在字符串形式的布尔值（配置页曾把布尔统一 String() 后提交），
+    // 若原样返回，前端会把 "false" 当真值渲染，开关显示与实际行为不符。
+    // maskConfig 对密文直接输出 '••••••••'，对明文非敏感字段原样保留。
+    config: maskConfig(normalizeConfigForRead(row.driver, row.config)),
     lastCheckAt: toIso(row.lastCheckAt),
     lastCheckOk: row.lastCheckOk,
     lastCheckMessage: row.lastCheckMessage,
@@ -99,9 +102,10 @@ export function createStorage(user: StorageOwner, input: StorageInput): StorageS
     throw forbidden('站点已关闭用户自定义存储，请联系管理员');
   }
 
-  const config = input.config as Record<string, unknown>;
-  // 写库前先校验配置，避免存进一份永远连不上的配置
-  validateStorageConfig(input.driver, config);
+  // 写库前先校验配置，避免存进一份永远连不上的配置。
+  // 必须用返回的规范化结果落库：schema 会做类型转换（表单传来的 "true" → 布尔 true）
+  // 与默认值补全，直接存原始输入会让字符串 "false" 在适配器里被当成真值。
+  const config = validateStorageConfig(input.driver, input.config as Record<string, unknown>);
 
   const db = getDb();
   if (input.isDefault) clearOtherDefaults(user.id);
@@ -155,6 +159,23 @@ function mergeConfig(
   return out;
 }
 
+/**
+ * 展示用的配置规范化。
+ *
+ * 与 validateStorageConfig 的区别：这里**不抛错**——读路径不该因为一条历史脏数据
+ * 就整页打不开，规范化失败时原样返回即可。
+ */
+function normalizeConfigForRead(
+  driver: string,
+  config: Record<string, unknown>,
+): Record<string, unknown> {
+  try {
+    return validateStorageConfig(driver, config);
+  } catch {
+    return config;
+  }
+}
+
 /** 部分更新存储配置 */
 export function updateStorage(
   id: number,
@@ -177,8 +198,8 @@ export function updateStorage(
 
   if (patch.config !== undefined) {
     const merged = mergeConfig(existing.config, patch.config);
-    validateStorageConfig(existing.driver, merged);
-    values.config = encryptConfig(merged);
+    // 同上：保存规范化后的结果，而不是合并后的原始值
+    values.config = encryptConfig(validateStorageConfig(existing.driver, merged));
   }
 
   if (patch.isDefault === true) {

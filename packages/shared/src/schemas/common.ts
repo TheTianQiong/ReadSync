@@ -43,6 +43,26 @@ export const ERROR_CODES = {
 } as const;
 export type ErrorCode = (typeof ERROR_CODES)[keyof typeof ERROR_CODES];
 
+/**
+ * 宽容的布尔值校验：接受真正的布尔，也接受 "true"/"false"/"1"/"0" 字符串。
+ *
+ * 为什么需要它：HTML 表单、部分 HTTP 客户端与序列化库会把布尔值写成字符串，
+ * 直接用 z.boolean() 会以
+ *     Invalid input: expected boolean, received string
+ * 拒绝请求 —— 这个报错既没指出是哪个字段，也完全看不出该怎么办
+ * （本项目就踩过：配置编辑页回填时统一 String()，导致编辑任何已有存储都保存失败）。
+ *
+ * 注意**不能**用 z.coerce.boolean()：它基于 JS 的 Boolean()，
+ * 会把字符串 "false" 也判成 true，是个很容易埋雷的陷阱。
+ */
+export const booleanLike = (options?: { default?: boolean }) => {
+  const schema = z
+    .union([z.boolean(), z.enum(['true', 'false', '1', '0'])])
+    .transform((value) => (typeof value === 'boolean' ? value : value === 'true' || value === '1'));
+
+  return options?.default === undefined ? schema : schema.default(options.default);
+};
+
 /** 分页查询参数 */
 export const paginationQuerySchema = z.object({
   page: z.coerce.number().int().min(1).default(1),

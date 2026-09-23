@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { S3_ADDRESSING_STYLES, STORAGE_DRIVERS } from '../constants.js';
+import { booleanLike } from './common.js';
 
 /**
  * 存储配置。
@@ -17,7 +18,7 @@ export const webdavConfigSchema = z.object({
   /** 远端根目录，留空表示账号根目录 */
   basePath: z.string().trim().default('/'),
   /** 是否允许自签名证书（自建 Nextcloud 常见） */
-  allowSelfSigned: z.boolean().default(false),
+  allowSelfSigned: booleanLike({ default: false }),
 });
 
 /** S3 兼容对象存储连接参数 */
@@ -30,7 +31,7 @@ export const s3ConfigSchema = z.object({
   /** 对象键前缀 */
   prefix: z.string().trim().default(''),
   /** 阿里云 OSS / MinIO 通常需要 path 风格 */
-  forcePathStyle: z.boolean().default(true),
+  forcePathStyle: booleanLike({ default: true }),
   addressingStyle: z.enum(S3_ADDRESSING_STYLES).default('path'),
 });
 
@@ -65,9 +66,9 @@ export const storageInputSchema = z
   .and(
     z.object({
       name: z.string().trim().min(1, '请填写名称').max(64),
-      isDefault: z.boolean().default(false),
+      isDefault: booleanLike({ default: false }),
       /** 是否仅作为书籍文件存储（否则也用于同步数据） */
-      readOnly: z.boolean().default(false),
+      readOnly: booleanLike({ default: false }),
     }),
   );
 
@@ -77,9 +78,9 @@ export type StorageInput = z.infer<typeof storageInputSchema>;
 export const storageUpdateSchema = z.object({
   name: z.string().trim().min(1).max(64).optional(),
   config: z.record(z.string(), z.unknown()).optional(),
-  isDefault: z.boolean().optional(),
-  readOnly: z.boolean().optional(),
-  enabled: z.boolean().optional(),
+  isDefault: booleanLike().optional(),
+  readOnly: booleanLike().optional(),
+  enabled: booleanLike().optional(),
 });
 
 /** 存储配置的对外表示（敏感字段已脱敏） */

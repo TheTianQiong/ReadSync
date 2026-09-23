@@ -1,4 +1,10 @@
-import { AUTH_METHOD_LABELS, type PasskeySummary, type TotpSetupResult } from '@readsync/shared';
+import {
+  AUTH_METHOD_LABELS,
+  type PasskeySummary,
+  type SyncPasswordResetResult,
+  type SyncPasswordStatus,
+  type TotpSetupResult,
+} from '@readsync/shared';
 import { Copy, Fingerprint, KeyRound, Plus, ShieldCheck, ShieldOff, Smartphone, Trash2 } from 'lucide-react';
 import { useCallback, useState, type ReactNode } from 'react';
 import { Alert } from '../../components/ui/Alert';
@@ -65,6 +71,51 @@ export function Security(): ReactNode {
   const [passkeyBusy, setPasskeyBusy] = useState(false);
   const [passkeyError, setPasskeyError] = useState<string | null>(null);
   const [pendingPasskeyDelete, setPendingPasskeyDelete] = useState<PasskeySummary | null>(null);
+
+  /* --------------------------- KOSync 同步密码 --------------------------- */
+  const syncPassword = useAsync(() => api.get<SyncPasswordStatus>('/users/me/sync-password'), []);
+  const [syncPasswordInput, setSyncPasswordInput] = useState('');
+  const [syncPasswordBusy, setSyncPasswordBusy] = useState(false);
+  const [syncPasswordError, setSyncPasswordError] = useState<string | null>(null);
+  const [generatedSyncPassword, setGeneratedSyncPassword] = useState<string | null>(null);
+
+  const handleSetSyncPassword = async (): Promise<void> => {
+    setSyncPasswordError(null);
+    setGeneratedSyncPassword(null);
+
+    if (syncPasswordInput.length < 8) {
+      setSyncPasswordError('同步密码至少 8 位');
+      return;
+    }
+
+    setSyncPasswordBusy(true);
+    try {
+      const payload = await buildPasswordPayload(syncPasswordInput);
+      await api.put('/users/me/sync-password', { password: payload });
+      toast.success('同步密码已设置，请在 KOReader 中使用它');
+      setSyncPasswordInput('');
+      syncPassword.reload();
+    } catch (err) {
+      setSyncPasswordError(err instanceof Error ? err.message : '设置失败');
+    } finally {
+      setSyncPasswordBusy(false);
+    }
+  };
+
+  const handleRegenerateSyncPassword = async (): Promise<void> => {
+    setSyncPasswordError(null);
+    setSyncPasswordBusy(true);
+    try {
+      const result = await api.post<SyncPasswordResetResult>('/users/me/sync-password/regenerate');
+      // 服务端只存 md5，无法回显，因此这个明文只出现这一次
+      setGeneratedSyncPassword(result.password);
+      syncPassword.reload();
+    } catch (err) {
+      setSyncPasswordError(err instanceof Error ? err.message : '生成失败');
+    } finally {
+      setSyncPasswordBusy(false);
+    }
+  };
 
   /* ------------------------------ 登录设备 ------------------------------ */
   const sessions = useAsync(() => api.get<LoginSession[]>('/users/me/sessions'), []);
@@ -413,6 +464,84 @@ export function Security(): ReactNode {
               </TBody>
             </Table>
           )}
+        </CardBody>
+      </Card>
+
+      {/* KOSync 同步密码 */}
+      <Card>
+        <CardHeader
+          title="KOSync 同步密码"
+          description="KOReader 等阅读器用它同步进度；留空则由主密码派生"
+        />
+        <CardBody className="flex flex-col gap-3">
+          <Alert tone={syncPassword.data?.configured ? 'info' : 'warning'}>
+            {syncPassword.data?.configured ? (
+              <>
+                已设置同步密码。若 KOReader 报「用户名或同步密码不正确」，说明你填入的密码与这里设置的不一致
+                —— 直接在此重新设置一个你记得住的密码即可，不必改动主密码。
+              </>
+            ) : (
+              <>
+                尚未设置同步密码，此时 KOReader 使用<strong>主密码</strong>登录。
+                若主密码较复杂或你希望两者分离，建议在此单独设置一个。
+              </>
+            )}
+          </Alert>
+
+          {generatedSyncPassword ? (
+            <Alert tone="warning">
+              新同步密码（<strong>只显示这一次</strong>，请立即记下并填入 KOReader）：
+              <div className="mt-2 flex items-center gap-2">
+                <code className="rounded-sm bg-paper-2 px-2 py-1 font-mono text-sm break-all">
+                  {generatedSyncPassword}
+                </code>
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  onClick={() => {
+                    void copyText(generatedSyncPassword);
+                    toast.success('已复制');
+                  }}
+                >
+                  复制
+                </Button>
+              </div>
+            </Alert>
+          ) : null}
+
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+            <Field label="设置新同步密码" hint="至少 8 位，需含大小写字母与数字">
+              <Input
+                type="password"
+                value={syncPasswordInput}
+                onChange={(e) => setSyncPasswordInput(e.target.value)}
+                autoComplete="new-password"
+              />
+            </Field>
+            <div className="flex items-end gap-2">
+              <Button
+                variant="secondary"
+                loading={syncPasswordBusy}
+                onClick={() => void handleSetSyncPassword()}
+              >
+                保存
+              </Button>
+              <Button
+                variant="quiet"
+                loading={syncPasswordBusy}
+                onClick={() => void handleRegenerateSyncPassword()}
+              >
+                随机生成
+              </Button>
+            </div>
+          </div>
+
+          {syncPasswordError ? <Alert tone="danger">{syncPasswordError}</Alert> : null}
+
+          <p className="font-sans text-xs text-muted">
+            KOReader 里填写「工具 → 云存储 → 进度同步」时，用户名填本站账号，
+            密码填这里设置的同步密码（未设置时即为主密码）。
+          </p>
         </CardBody>
       </Card>
 

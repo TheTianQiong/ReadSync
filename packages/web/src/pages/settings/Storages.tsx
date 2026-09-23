@@ -347,13 +347,22 @@ function StorageEditor({
     if (editing) {
       setName(editing.name);
       setDriver(editing.driver);
-      // 脱敏后的配置直接回填；带 ****** 的字段留空，表示不修改
-      const masked = Object.fromEntries(
-        Object.entries(editing.config ?? {}).map(([key, value]) => [
-          key,
-          typeof value === 'string' && value.includes('*') ? '' : String(value ?? ''),
-        ]),
-      );
+      // 脱敏后的配置直接回填；带 ****** 的字段留空，表示不修改。
+      //
+      // 注意这里**不能**统一 String() 处理：服务端返回的 forcePathStyle /
+      // allowSelfSigned 是布尔值，String() 会把它变成 "true"，下次提交时被
+      // 服务端的 z.boolean() 拒绝（Invalid input: expected boolean, received string）。
+      // 编辑任何已有存储都会触发，且报错信息完全指不到真正的原因。
+      const masked: ConfigForm = {};
+      for (const [key, value] of Object.entries(editing.config ?? {})) {
+        if (typeof value === 'string' && value.includes('*')) {
+          masked[key] = ''; // 掩码字段留空 = 保持原值不变
+        } else if (typeof value === 'boolean') {
+          masked[key] = value; // 布尔必须保持布尔，不能 String()
+        } else if (value !== null && value !== undefined) {
+          masked[key] = String(value);
+        }
+      }
       setConfig({ ...(DEFAULT_CONFIG[editing.driver] ?? {}), ...masked });
       setIsDefault(editing.isDefault);
       setReadOnly(editing.readOnly);

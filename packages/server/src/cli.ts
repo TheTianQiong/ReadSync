@@ -11,10 +11,17 @@
  */
 import { Command } from 'commander';
 import { and, desc, eq, like, or, sql } from 'drizzle-orm';
-import { APP_NAME_CN, USER_ROLES, VERSION } from '@readsync/shared';
+import { APP_NAME_CN, USER_ROLES, VERSION, passwordSchema } from '@readsync/shared';
 import { loadConfig, ConfigError } from './config.js';
 import { ensureKeyPair, getKeyFingerprint } from './crypto/keys.js';
-import { generateInviteCode, generateToken, hashPassword, md5Hex, sha256Hex } from './crypto/password.js';
+import {
+  generateInviteCode,
+  generateSyncPassword,
+  generateToken,
+  hashPassword,
+  md5Hex,
+  sha256Hex,
+} from './crypto/password.js';
 import { closeDatabase, getDb, openDatabase } from './db/index.js';
 import {
   auditLogs,
@@ -344,6 +351,55 @@ for (const [cmd, status, label] of [
       }),
     );
 }
+
+user
+  .command('sync-password <identifier>')
+  .description('查看或设置 KOSync 同步密码（KOReader 用它登录）')
+  .option('-p, --password <密码>', '设置为指定密码；省略则随机生成一个并显示')
+  .option('-s, --status', '只查看当前是否已设置')
+  .action(
+    withDb(async (identifier: string, opts: { password?: string; status?: boolean }) => {
+      const target = requireUser(identifier);
+      const db = getDb();
+      const row = db.select({ kosyncKey: users.kosyncKey }).from(users).where(eq(users.id, target.id)).get();
+
+      if (opts.status) {
+        console.log(
+          row?.kosyncKey
+            ? `${c(color.green, '已设置')} —— KOReader 需使用该同步密码登录`
+            : `${c(color.yellow, '未设置')} —— KOReader 将使用主密码登录`,
+        );
+        return;
+      }
+
+      // 服务端只存 md5，取不回明文；未指定密码时只能随机生成
+      const plain = opts.password ?? generateSyncPassword();
+
+      if (opts.password) {
+        const check = passwordSchema.safeParse(opts.password);
+        if (!check.success) {
+          fail(`密码不符合要求：${check.error.issues[0]?.message ?? '格式不正确'}`);
+          process.exit(1);
+        }
+      }
+
+      db.update(users)
+        .set({ kosyncKey: md5Hex(plain), updatedAt: new Date() })
+        .where(eq(users.id, target.id))
+        .run();
+
+      ok(`已为 ${c(color.bold, target.username)} 设置 KOSync 同步密码`);
+      console.log('');
+      console.log(`  ${c(color.yellow, '同步密码（仅显示这一次）：')}`);
+      console.log(`  ${c(color.bold, plain)}`);
+      console.log('');
+      console.log(c(color.dim, '  在 KOReader 的「工具 → 云存储 → 进度同步」里：'));
+      console.log(c(color.dim, `    用户名：${target.username}`));
+      console.log(c(color.dim, '    密码：上面这串'));
+      console.log('');
+      console.log(c(color.dim, '  注意：设置后 KOReader 将不再接受主密码，网页端登录不受影响。'));
+    }),
+  );
 
 user
   .command('delete <identifier>')
@@ -834,6 +890,14 @@ program
 /* -------------------------------- 入口 -------------------------------- */
 
 async function main(): Promise<void> {
+  /*
+   * CLI 的输出是给人看的结果，不该被服务端的基础设施日志淹没
+   * （例如每次打开数据库都会打印「数据库迁移已应用」）。
+   * 这里在未显式指定时把日志级别压到 warn —— 真出问题时仍会输出。
+   */
+  process.env.READSYNC_LOG_LEVEL = process.env.READSYNC_LOG_LEVEL ?? 'warn';
+  process.env.READSYNC_LOG_PRETTY = process.env.READSYNC_LOG_PRETTY ?? 'false';
+
   try {
     await program.parseAsync(process.argv);
   } catch (err) {

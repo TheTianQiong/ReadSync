@@ -253,6 +253,19 @@ READSYNC_ALLOW_PLAINTEXT_PASSWORD=true
 
 见 [Cloudflare Tunnel](#cloudflare-tunnel免费-https无需公网-ip-与证书) 的排查清单。最常见的是源站地址写成 `https://`、端口不对，或 `localhost` 被解析到 IPv6 而源站只监听了 IPv4 —— 后者改用 `http://127.0.0.1:3000` 即可。
 
+**KOReader 报「未知服务器错误」，或 Reeden 等 App 报「连接失败」**
+
+按顺序排查：
+
+1. **先确认服务端可达**：`curl -I http://127.0.0.1:3000/api/system/health`。
+2. **KOReader 的「未知服务器错误」= 服务端返回了非 200**，绝大多数是认证失败（密码不匹配）。客户端地址填 `http://<IP>:3000` 或你的 HTTPS 域名，用户名填本站账号，密码填「设置 → 账号安全 → KOSync 同步密码」。现在服务端会返回具体原因，KOReader 会直接显示出来。
+3. **忘记同步密码**：网页端「设置 → 账号安全 → KOSync 同步密码 → 随机生成」，或命令行
+   ```bash
+   readsync user sync-password <用户名>            # 随机生成并显示
+   readsync user sync-password <用户名> --status   # 只看是否已设置
+   ```
+4. **Reeden 等 Android 应用报「连接失败」**：Android 默认禁止明文 HTTP 流量，这类应用通常只能用 **HTTPS** 地址。请先按 [HTTPS 配置指南](docs/https-setup.md) 配上证书。
+
 **改了 `.env` 但不生效**
 
 服务启动时会自动读取工作目录下的 `.env`（已存在的环境变量优先）。注意要在项目根目录启动，且 systemd 方式下修改 `.env` 后需 `systemctl restart readsync`。
@@ -352,7 +365,16 @@ readsync secret    # 检查主密钥来源（确认备份完整性）
 - **自定义同步服务器**：`http://<你的服务器>:3000`
 - **用户名 / 密码**：站点账号
 
-> KOReader 固定发送 `md5(密码)` 作为认证凭据，这是协议限制。建议在「设置 → 账号安全 → 同步密码」里**单独设置一个与主密码不同的同步密码**，避免主密码的 MD5 泄露后被撞库。详见 [security.md](docs/security.md#二kosync-协议的同步密码)。
+> KOReader 固定发送 `md5(密码)` 作为认证凭据，这是协议限制。建议在「设置 → 账号安全 → **KOSync 同步密码**」里单独设置一个与主密码不同的同步密码，避免主密码的 MD5 泄露后被撞库；忘记时可在同一处随机重置。详见 [security.md](docs/security.md#二kosync-协议的同步密码)。
+
+#### 可选：用专用插件（推荐）
+
+内置同步在出错时提示很含糊（例如「未知服务器错误」）。仓库提供了 [KOReader 插件](koreader-plugin/README.md)：用访问令牌认证、上报阅读时长、给出具体的中文错误原因。
+
+```bash
+readsync sync-token create -u 你的用户名 -n "KOReader"   # 创建访问令牌
+bash koreader-plugin/package.sh                          # 打包插件
+```
 
 ### 其他阅读软件（统一同步接口）
 
@@ -536,6 +558,7 @@ READSYNC_DATA_DIR=./data-e2e npx tsx src/scripts/smoke-e2e.ts
 |---|---|
 | [docs/api-reference.md](docs/api-reference.md) | 完整 API 参考，含统一同步接口与 KOSync 协议细节 |
 | [docs/plugin-development.md](docs/plugin-development.md) | 插件清单、上下文 API、钩子、存储驱动与同步协议扩展 |
+| [koreader-plugin/README.md](koreader-plugin/README.md) | KOReader 同步插件：安装、配置、故障排查 |
 | [docs/https-setup.md](docs/https-setup.md) | 自有域名配置 HTTPS：备案判断、Caddy / Nginx / acme.sh 三种方案 |
 | [docs/security.md](docs/security.md) | 安全设计与权衡、部署检查清单 |
 | [docs/requirements.md](docs/requirements.md) | 原始需求文档与实现对照表（含已知差异） |

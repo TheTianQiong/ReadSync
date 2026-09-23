@@ -37,3 +37,7 @@ coverage/
 # 临时文件
 tmp/
 temp/
+
+# KOReader 插件打包产物
+koreader-plugin/*.zip
+koreader-plugin/*.tar.gz

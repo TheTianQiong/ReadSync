@@ -1,5 +1,5 @@
 import { eq } from 'drizzle-orm';
-import type { FastifyInstance, FastifyRequest } from 'fastify';
+import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import {
   kosyncCreateUserSchema,
   kosyncProgressUpdateSchema,
@@ -17,10 +17,12 @@ import { getProgress, upsertProgress } from './service.js';
  * KOSync 兼容协议（KOReader 原生）。
  *
  * 端点挂在根路径（没有 /api 前缀），并且**响应格式必须与上游一致**：
- * 纯文本 `OK` / `Unauthorized`、裸 JSON 对象、空对象 `{}` 表示未找到。
- * 因此这里不用 ApiResponse 信封，也不能抛 AppError —— 全局错误处理器会把
- * 任何异常转成 `{ ok:false, error:{...} }`，KOReader 无法解析。
- * 所有失败路径都在本文件内直接 reply 原始格式。
+ *  - 成功：纯文本 `OK`、裸 JSON 对象、未找到时返回空对象 `{}`；
+ *  - 失败：带 message 字段的 JSON，形如 `{"message":"..."}`。
+ *
+ * 这里不用 ApiResponse 信封，也不能抛 AppError —— 全局错误处理器会把任何
+ * 异常转成 `{ ok:false, error:{...} }`，KOReader 读不到 message，只会显示
+ * 「未知服务器错误」。因此所有失败路径都在本文件内直接 reply 上述格式。
  *
  * 协议本身的限制（客户端固定，服务端改不了）：
  *  - 认证只有 `x-auth-user` + `x-auth-key`，key 是密码的 MD5，不支持 JWT/OAuth；
@@ -30,6 +32,22 @@ import { getProgress, upsertProgress } from './service.js';
 const log = getModuleLogger('sync');
 
 const KOSYNC_PLATFORM = 'koreader';
+
+/**
+ * KOSync 的失败响应。
+ *
+ * 必须返回带 `message` 字段的 JSON，而不是纯文本：
+ * KOReader 客户端的代码是
+ *     text = body and body.message or _("Unknown server error")
+ * 若拿不到 message，界面上只会显示「未知服务器错误」—— 用户完全无从判断
+ * 是密码错了、账号被禁用，还是服务端出了问题。
+ * 官方 sync.koreader.rocks 同样返回 {"message": "..."}。
+ *
+ * 成功路径不受影响：`/users/auth` 仍返回纯文本 `OK`（这是协议规定）。
+ */
+function kosyncError(reply: FastifyReply, status: number, message: string): FastifyReply {
+  return reply.status(status).type('application/json; charset=utf-8').send({ message });
+}
 
 export async function registerKosyncRoutes(app: FastifyInstance): Promise<void> {
   /**
@@ -41,7 +59,7 @@ export async function registerKosyncRoutes(app: FastifyInstance): Promise<void> 
   app.get('/users/auth', async (req, reply) => {
     const user = authenticateKosync(req);
     if (!user) {
-      return reply.status(401).type('text/plain').send('Unauthorized');
+      return kosyncError(reply, 401, '用户名或同步密码不正确（KOSync 使用独立同步密码，可在「设置 → 账号安全」中查看或重置）');
     }
     return reply.status(200).type('text/plain').send('OK');
   });
@@ -59,19 +77,19 @@ export async function registerKosyncRoutes(app: FastifyInstance): Promise<void> 
     const settings = getSiteSettings();
     if (!settings.registrationEnabled) {
       // 站点关闭注册时拒绝，但为了兼容 KOReader 的错误提示不做成 5xx
-      return reply.status(403).type('text/plain').send('Registration disabled');
+      return kosyncError(reply, 403, '本站已关闭注册，请联系管理员开通账号');
     }
 
     const parsed = kosyncCreateUserSchema.safeParse(req.body);
     if (!parsed.success) {
-      return reply.status(400).type('text/plain').send('Bad request');
+      return kosyncError(reply, 400, '请求格式不正确（需要 username 与 password 字段）');
     }
 
     const db = getDb();
     const existing = db.select({ id: users.id }).from(users).where(eq(users.username, parsed.data.username)).get();
     if (existing) {
       // 上游约定：用户名已存在返回 402
-      return reply.status(402).type('text/plain').send('User already exists');
+      return kosyncError(reply, 402, '该用户名已被占用');
     }
 
     const kosyncKey = parsed.data.password.toLowerCase();
@@ -94,7 +112,7 @@ export async function registerKosyncRoutes(app: FastifyInstance): Promise<void> 
     } catch (err) {
       // 唯一索引冲突（并发注册）同样按「已存在」处理
       log.warn({ err, username: parsed.data.username }, 'KOSync 注册失败');
-      return reply.status(402).type('text/plain').send('User already exists');
+      return kosyncError(reply, 402, '该用户名已被占用');
     }
 
     recordAudit('user.register', auditContextFrom(req), {
@@ -109,12 +127,12 @@ export async function registerKosyncRoutes(app: FastifyInstance): Promise<void> 
   app.put('/syncs/progress', async (req, reply) => {
     const user = authenticateKosync(req);
     if (!user) {
-      return reply.status(401).type('text/plain').send('Unauthorized');
+      return kosyncError(reply, 401, '用户名或同步密码不正确（KOSync 使用独立同步密码，可在「设置 → 账号安全」中查看或重置）');
     }
 
     const parsed = kosyncProgressUpdateSchema.safeParse(req.body);
     if (!parsed.success) {
-      return reply.status(400).type('text/plain').send('Bad request');
+      return kosyncError(reply, 400, '进度数据格式不正确（需要 document、progress、percentage 等字段）');
     }
 
     const input = parsed.data;
@@ -157,7 +175,7 @@ export async function registerKosyncRoutes(app: FastifyInstance): Promise<void> 
   app.get<{ Params: { document: string } }>('/syncs/progress/:document', async (req, reply) => {
     const user = authenticateKosync(req);
     if (!user) {
-      return reply.status(401).type('text/plain').send('Unauthorized');
+      return kosyncError(reply, 401, '用户名或同步密码不正确（KOSync 使用独立同步密码，可在「设置 → 账号安全」中查看或重置）');
     }
 
     const entry = getProgress(user.id, req.params.document);

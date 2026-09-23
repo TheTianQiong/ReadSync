@@ -12,17 +12,22 @@ import {
   dashboardLayoutSchema,
   idParamSchema,
   readingPlatformSchema,
+  setSyncPasswordSchema,
   updatePreferencesSchema,
   updateProfileSchema,
   type ApiSuccess,
   type DashboardLayout,
   type ReadingPlatform,
   type SessionUser,
+  type SyncPasswordResetResult,
+  type SyncPasswordStatus,
   type ThemePreference,
   type UpdatePreferencesInput,
   type UserPreferences,
 } from '@readsync/shared';
 import { loadConfig } from '../../config.js';
+import { generateSyncPassword, md5Hex } from '../../crypto/password.js';
+import { resolveNewPassword } from '../../lib/password-input.js';
 import { getDb } from '../../db/index.js';
 import { readingPlatforms, sessions, users, type UserRow } from '../../db/schema.js';
 import {
@@ -467,5 +472,70 @@ export async function registerUserRoutes(app: FastifyInstance): Promise<void> {
     const ext = filename.split('.').pop()?.toLowerCase() ?? '';
     reply.header('Cache-Control', 'public, max-age=300');
     return reply.type(AVATAR_EXT_MIME[ext] ?? 'application/octet-stream').send(data);
+  });
+
+  /* ---------------------- KOSync 同步密码 ---------------------- */
+
+  /**
+   * 查询同步密码是否已设置。
+   *
+   * 不返回密码本身：服务端只存 md5，取不回明文。前端据此提示用户
+   * 「未设置 → KOReader 必定登录失败」或「已设置」。
+   */
+  app.get('/api/users/me/sync-password', { preHandler: requireAuth }, async (req) => {
+    const me = currentUser(req);
+    const row = getDb().select({ kosyncKey: users.kosyncKey }).from(users).where(eq(users.id, me.id)).get();
+    return {
+      ok: true,
+      data: { configured: Boolean(row?.kosyncKey) } satisfies SyncPasswordStatus,
+    } satisfies ApiSuccess<SyncPasswordStatus>;
+  });
+
+  /**
+   * 设置自定义同步密码。
+   *
+   * 用途有两个：
+   *  1. 安全：避免把主密码的 md5 交给 KOReader 与网络；
+   *  2. 救急：KOSync 报「认证失败」时，重新指定一个自己知道的密码即可恢复，
+   *     无需改动主密码。
+   */
+  app.put('/api/users/me/sync-password', { preHandler: requireAuth }, async (req) => {
+    const me = currentUser(req);
+    const input = setSyncPasswordSchema.parse(req.body);
+    const plain = resolveNewPassword(input.password, '同步密码');
+
+    getDb()
+      .update(users)
+      .set({ kosyncKey: md5Hex(plain), updatedAt: new Date() })
+      .where(eq(users.id, me.id))
+      .run();
+
+    recordAudit('user.update', auditContextFrom(req), { target: 'sync-password', meta: { action: 'set' } });
+
+    return { ok: true, data: { configured: true } satisfies SyncPasswordStatus } satisfies ApiSuccess<SyncPasswordStatus>;
+  });
+
+  /**
+   * 生成一个随机同步密码并返回一次。
+   *
+   * 服务端只存 md5，无法回显既有密码，所以「我忘了同步密码」的唯一出路是
+   * 重新生成。返回值仅此一次，前端必须提示用户立刻记下。
+   */
+  app.post('/api/users/me/sync-password/regenerate', { preHandler: requireAuth }, async (req) => {
+    const me = currentUser(req);
+    const generated = generateSyncPassword();
+
+    getDb()
+      .update(users)
+      .set({ kosyncKey: md5Hex(generated), updatedAt: new Date() })
+      .where(eq(users.id, me.id))
+      .run();
+
+    recordAudit('user.update', auditContextFrom(req), {
+      target: 'sync-password',
+      meta: { action: 'regenerate' },
+    });
+
+    return { ok: true, data: { password: generated } satisfies SyncPasswordResetResult } satisfies ApiSuccess<SyncPasswordResetResult>;
   });
 }

@@ -1,9 +1,44 @@
 import type { StorageDriver } from '@readsync/shared';
+import { localStorageConfigSchema, s3ConfigSchema, webdavConfigSchema } from '@readsync/shared';
 import { badRequest } from '../../../errors.js';
 import type { StorageAdapter, StorageAdapterFactory } from '../types.js';
 import { createLocalAdapter } from './local.js';
 import { createS3Adapter } from './s3.js';
 import { createWebdavAdapter } from './webdav.js';
+
+/** 驱动的中文名，用于拼接可读的错误信息 */
+const DRIVER_LABELS: Record<string, string> = {
+  local: '本地存储',
+  s3: '对象存储',
+  webdav: 'WebDAV',
+  plugin: '插件存储',
+};
+
+/** zod 解析结果的统一视图（三个 schema 的输出类型不同，这里只关心成功/失败与错误列表） */
+type ConfigParseResult =
+  | { success: true; data: Record<string, unknown> }
+  | { success: false; error: { issues: Array<{ path: PropertyKey[]; message: string }> } };
+
+/**
+ * 按驱动用对应 schema 解析配置。
+ * 返回 null 表示不是内置驱动（如插件驱动），由调用方另行处理。
+ */
+function parseBuiltinConfig(
+  driver: string,
+  config: Record<string, unknown>,
+): ConfigParseResult | null {
+  const schema =
+    driver === 'local'
+      ? localStorageConfigSchema
+      : driver === 's3'
+        ? s3ConfigSchema
+        : driver === 'webdav'
+          ? webdavConfigSchema
+          : null;
+
+  if (!schema) return null;
+  return schema.safeParse(config) as ConfigParseResult;
+}
 
 /**
  * 存储驱动注册表。
@@ -82,10 +117,37 @@ export function createAdapter(driver: string, config: Record<string, unknown>): 
  * 用于创建/更新存储时在写库前拦截错误配置。plugin 驱动若未注册则跳过校验
  * （由插件自己负责），避免「装了插件才能保存配置、但配置要先保存才能启用插件」的死循环。
  */
-export function validateStorageConfig(driver: string, config: Record<string, unknown>): void {
-  if (!factories.has(driver)) {
-    if (driver === 'plugin') return;
-    throw badRequest(`不支持的存储驱动：${driver}`);
+export function validateStorageConfig(
+  driver: string,
+  config: Record<string, unknown>,
+): Record<string, unknown> {
+  const parsedResult = parseBuiltinConfig(driver, config);
+
+  // 内置驱动：用 schema 校验**并规范化**
+  if (parsedResult) {
+    if (!parsedResult.success) {
+      const first = parsedResult.error.issues[0];
+      const label = DRIVER_LABELS[driver] ?? driver;
+      throw badRequest(
+        `${label}配置不合法：${first ? `${first.path.join('.')} ${first.message}` : '格式不正确'}`,
+        parsedResult.error.issues,
+      );
+    }
+    // 必须返回解析结果而不是原样返回输入：
+    // schema 会做类型规范化（如把表单传来的 "true" 转成布尔 true、补默认值）。
+    // 若把原始输入落库，字符串 "false" 在适配器里是**真值**，
+    // 会导致 forcePathStyle 之类的开关行为完全相反。
+    return parsedResult.data;
   }
-  factories.get(driver)!.create(config);
+
+  // 插件等外部驱动：由插件自行校验，这里只能确认能实例化，无法规范化
+  if (factories.has(driver)) {
+    factories.get(driver)!.create(config);
+    return config;
+  }
+
+  // plugin 驱动可能尚未注册（要先保存配置才能启用插件），跳过校验避免死循环
+  if (driver === 'plugin') return config;
+
+  throw badRequest(`不支持的存储驱动：${driver}`);
 }

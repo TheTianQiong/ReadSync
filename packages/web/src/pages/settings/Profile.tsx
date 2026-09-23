@@ -266,7 +266,14 @@ export function Profile(): ReactNode {
       <Card>
         <CardHeader title="账号信息" />
         <CardBody>
-          <dl className="grid grid-cols-2 gap-y-2 font-sans text-xs sm:grid-cols-3">
+          {/*
+            两栏布局：左列固定宽度放标题，右列放内容。
+            这里必须固定为 2 列（grid-cols-[...]）——
+            之前写的 grid-cols-2 sm:grid-cols-3 会在宽屏下变成 3 列，
+            而 dt/dd 是交替排列的，第 3 列会把下一个标题挤到上一行的末尾，
+            整张表随之错位（表现为「标题与内容各自换行、对不上」）。
+          */}
+          <dl className="grid grid-cols-[5.5rem_1fr] gap-x-4 gap-y-2 font-sans text-xs">
             <dt className="text-muted">用户 ID</dt>
             <dd className="text-ink-soft">{user.id}</dd>
             <dt className="text-muted">角色</dt>

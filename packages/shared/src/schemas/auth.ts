@@ -195,6 +195,31 @@ export const passkeyLoginVerifySchema = z.object({
   response: z.any(),
 });
 
+/* ------------------------- KOSync 同步密码 ------------------------- */
+
+/**
+ * 设置自定义同步密码。
+ *
+ * KOReader 的 KOSync 协议固定发送 md5(密码) 作为凭据，服务端无法要求它改用
+ * 更强的方案。用户设置一个与主密码不同的同步密码后，即使该 MD5 泄露也不会
+ * 危及主账号；同时这也是「登录 KOSync 报认证失败」时唯一可行的修复手段
+ * （重新指定一个自己知道的密码即可，不必改动主密码）。
+ */
+export const setSyncPasswordSchema = z.object({
+  password: passwordPayloadSchema,
+});
+
+export interface SyncPasswordStatus {
+  /** 是否已配置。未配置时 KOReader 一定登录失败 */
+  configured: boolean;
+}
+
+/** 重置同步密码的结果，明文仅此一次返回 */
+export interface SyncPasswordResetResult {
+  password: string;
+}
+
+/** 判断密码是否已设置同步密码，前端用于提示 */
 export interface PasskeySummary {
   id: number;
   name: string | null;

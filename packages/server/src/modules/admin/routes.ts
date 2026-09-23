@@ -5,6 +5,7 @@ import {
   adminResetPasswordSchema,
   adminUpdateUserSchema,
   createInviteSchema,
+  paginationQuerySchema,
   idParamSchema,
   listAuditQuerySchema,
   listUsersQuerySchema,
@@ -280,8 +281,9 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
 
   /* ------------------------------ 邀请码 ------------------------------ */
 
-  app.get('/api/admin/invites', { preHandler: requireAdmin }, async () => {
-    return { ok: true, data: listInviteCodes() } satisfies ApiSuccess<InviteCode[]>;
+  app.get('/api/admin/invites', { preHandler: requireAdmin }, async (req) => {
+    const query = paginationQuerySchema.parse(req.query);
+    return { ok: true, data: listInviteCodes(query) } satisfies ApiSuccess<Paginated<InviteCode>>;
   });
 
   app.post('/api/admin/invites', { preHandler: requireAdmin }, async (req) => {

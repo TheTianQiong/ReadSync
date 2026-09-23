@@ -200,6 +200,26 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
       return reply.status(413).send(body);
     }
 
+    /**
+     * Fastify 自身抛出的 4xx（请求解析、媒体类型等）。
+     *
+     * 典型例子：客户端带了 `Content-Type: application/json` 却发了空 body，
+     * Fastify 抛 FST_ERR_CTP_EMPTY_JSON_BODY（statusCode 400）。这类错误原本会
+     * 落到最后的 500 分支，让「客户端把请求写错了」显示成「服务器内部错误」，
+     * 既误导使用者，也污染错误日志。
+     */
+    if (error.statusCode && error.statusCode >= 400 && error.statusCode < 500) {
+      req.log.info({ err: error, code: error.code }, '请求不合法（Fastify 解析层）');
+      const body: ApiFailure = {
+        ok: false,
+        error: {
+          code: error.statusCode === 415 ? ERROR_CODES.UNSUPPORTED_MEDIA_TYPE : ERROR_CODES.BAD_REQUEST,
+          message: error.message,
+        },
+      };
+      return reply.status(error.statusCode).send(body);
+    }
+
     if (isAppError(error)) {
       // 4xx 用 info，5xx 用 error，避免日志级别失真
       const level = error.statusCode >= 500 ? 'error' : 'info';

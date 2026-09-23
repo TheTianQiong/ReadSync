@@ -9,6 +9,7 @@ import {
   type ListAuditQuery,
   type ListUsersQuery,
   type Paginated,
+  type PaginationQuery,
   type SystemInfo,
 } from '@readsync/shared';
 import { loadConfig } from '../../config.js';
@@ -262,9 +263,32 @@ export function toInviteCode(row: InviteCodeRow): InviteCode {
 }
 
 /** 列出全部邀请码（数量天然很小，不做分页），新创建的排前面 */
-export function listInviteCodes(): InviteCode[] {
+/**
+ * 分页查询邀请码。
+ *
+ * 返回 Paginated 而不是裸数组：管理后台的分页组件按 { items, total } 解析，
+ * 且与 /admin/users、/admin/audit 保持一致。此前返回数组，前端读 data.items
+ * 拿到 undefined，表现为「邀请码创建成功却不出现在列表里」。
+ */
+export function listInviteCodes(query: PaginationQuery): Paginated<InviteCode> {
   const db = getDb();
-  return db.select().from(inviteCodes).orderBy(desc(inviteCodes.createdAt)).all().map(toInviteCode);
+
+  const total = db.select({ value: count() }).from(inviteCodes).get()?.value ?? 0;
+  const rows = db
+    .select()
+    .from(inviteCodes)
+    .orderBy(desc(inviteCodes.createdAt))
+    .limit(query.pageSize)
+    .offset((query.page - 1) * query.pageSize)
+    .all();
+
+  return {
+    items: rows.map(toInviteCode),
+    total,
+    page: query.page,
+    pageSize: query.pageSize,
+    totalPages: Math.ceil(total / query.pageSize),
+  };
 }
 
 /** 判断邀请码是否已存在（创建前查重，避免撞唯一索引报 500） */
