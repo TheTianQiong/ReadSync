@@ -30,7 +30,7 @@
 
 - **KOSync 协议兼容** —— KOReader 开箱即用，无需改客户端
 - **统一同步接口** —— 标准 REST + Bearer 令牌，方便其他阅读软件接入，附带[完整接口参考](docs/api-reference.md)
-- **多存储后端** —— 本地磁盘 / WebDAV（坚果云、Nextcloud）/ S3 兼容对象存储（阿里云 OSS、腾讯云 COS、MinIO、R2）/ 插件自定义
+- **多存储后端** —— 本地磁盘 / WebDAV（坚果云、Nextcloud）/ S3 兼容对象存储（阿里云 OSS、腾讯云 COS、MinIO、R2）/ 插件自定义，配置见[存储后端配置指南](docs/storage-setup.md)
 - **书库元数据与版本管理** —— 本地只存 MD5、书目信息与版本记录，书籍文件放在外部网盘；支持秒传去重、版本历史与回滚
 - **文件中转** —— S3 走预签名 URL 直连下载，其余后端由服务端中转
 
@@ -288,6 +288,10 @@ curl -s http://<你的服务器地址>:3000/healthcheck
 
 - 没有输出或报连接失败 → 地址/端口/反代的问题，不是账号问题。
 - 输出是 `{"ok":false,...}` 或 404 → 服务器版本过旧，升级到含 `/healthcheck` 的版本即可。
+
+**上传报「尚未配置默认存储」**
+
+去 **设置 → 存储管理** 建一个存储并**设为默认** —— 没指定存储时文件放哪是由它决定的。S3 / R2 / OSS / COS / MinIO、WebDAV、本地磁盘的字段填法与各服务商的取值见 [存储后端配置指南](docs/storage-setup.md)。
 
 **上传书籍失败，提示「上传失败，网络连接中断」**
 
@@ -623,6 +627,7 @@ READSYNC_DATA_DIR=./data-repro PROXY_STATUS=524 npx tsx src/scripts/repro-proxy-
 
 | 文档 | 内容 |
 |---|---|
+| [docs/storage-setup.md](docs/storage-setup.md) | 存储后端配置：S3/R2/OSS/COS/MinIO、WebDAV、本地磁盘 |
 | [docs/storage-cors.md](docs/storage-cors.md) | 对象存储 CORS 配置（预签名直传必读） |
 | [docs/api-reference.md](docs/api-reference.md) | 完整 API 参考，含统一同步接口、分片上传与 KOSync 协议细节 |
 | [docs/plugin-development.md](docs/plugin-development.md) | 插件清单、上下文 API、钩子、存储驱动与同步协议扩展 |
