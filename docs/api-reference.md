@@ -468,7 +468,7 @@ Authorization: Bearer <令牌>
 - 分片**可以乱序上传，也可以重传覆盖**：服务端按 `index × chunkSize` 定位写入。
 - 服务端不信任客户端上报的内容，合并时会流式重算 MD5 与大小。
 
-### 6.4 合并入库
+### 6.4 合并入库（分片）
 
 ```http
 POST /api/uploads/{uploadId}/complete
@@ -483,6 +483,71 @@ POST /api/uploads/{uploadId}/complete
 ```
 
 此时可以补传缺失的分片再重试 `complete`（会话仍在）。会话保留 24 小时，超时由服务端自动清理。
+
+### 6.5 预签名直传（对象存储）
+
+> 面向自行接入的开发者。网页端在管理员选了「预签名直传」时走这条路径。
+
+数据**完全不经过本服务**：客户端拿服务端签发的 URL，直接 PUT 到对象存储。因此不占服务器带宽与磁盘，也不受任何前置反向代理/CDN 的体积与超时限制约束。
+
+**前提**：目标存储必须是 S3 兼容（R2 / OSS / COS / MinIO）。本地磁盘与 WebDAV 没有预签名概念，会返回 `403`，调用方应回退到分片上传。桶上还需配置 CORS，见 [storage-cors.md](storage-cors.md)。
+
+#### 第一步：签发
+
+```http
+POST /api/uploads/presign
+{
+  "filename": "book.epub",
+  "size": 52428800,
+  "md5": "d41d8cd98f00b204e9800998ecf8427e",
+  "mode": "create",
+  "fields": { "title": "书名", "format": "epub", "storageId": "1" }
+}
+```
+
+`md5` **必填**：服务端看不到文件内容，只能靠它派生对象位置，并用存储返回的 ETag 比对校验。客户端算好再提交。
+
+响应二选一：
+
+```json
+{ "ok": true, "data": { "kind": "presigned", "url": "https://…", "method": "PUT",
+                        "headers": { "Content-Type": "application/epub+zip" },
+                        "objectKey": "books/1/d4/d41d….epub", "expiresIn": 1800 } }
+```
+
+```json
+{ "ok": true, "data": { "kind": "deduped", "book": { "id": 7, "title": "…" } } }
+```
+
+命中 `deduped` 说明相同 MD5 已在书库中，**一个字节都不用传**，直接结束。
+
+#### 第二步：直传
+
+把文件 PUT 到 `url`，并**原样带上 `headers` 里的每一个头**（签名可能覆盖了它们，少一个就会被对象存储以签名不符拒绝）。
+
+```
+PUT https://<account>.r2.cloudflarestorage.com/<bucket>/books/1/d4/d41d….epub?X-Amz-…
+Content-Type: application/epub+zip
+
+<文件的原始字节>
+```
+
+#### 第三步：确认入库
+
+```http
+POST /api/uploads/presign/complete
+{ "filename": "book.epub", "size": 52428800, "md5": "d41d…",
+  "objectKey": "books/1/d4/d41d….epub", "mode": "create",
+  "fields": { "title": "书名", "format": "epub", "storageId": "1" } }
+```
+
+服务端会自己核对，**不轻信客户端**：
+
+1. 按 md5 重新推导对象位置，与提交的 `objectKey` 比对（防止把存储上任意对象登记成自己的书）；
+2. 对存储发 HEAD，确认对象存在且大小相符；
+3. 比对 ETag 与声明的 md5 —— 单次 PUT 的 ETag 就是内容的 MD5，这是服务端在不下载文件的前提下唯一能做的内容校验。不符则**删除该对象**并拒绝，不留孤儿。
+
+确认阶段不依赖任何服务端中间状态，因此服务重启不会让已传完的大文件白费。
 
 ---
 

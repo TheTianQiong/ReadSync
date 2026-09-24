@@ -57,6 +57,21 @@ export interface ListOptions {
   cursor?: string;
 }
 
+/** 预签名上传的约束条件；驱动支持时会把它们签进 URL，让存储侧也把住关 */
+export interface SignedUploadOptions {
+  contentType?: string | undefined;
+  /** 预期字节数。签进去之后，存储会拒绝大小不符的上传 */
+  contentLength?: number | undefined;
+}
+
+/** 预签名上传目标：客户端拿它直接 PUT */
+export interface SignedUploadTarget {
+  url: string;
+  method: 'PUT';
+  /** 客户端必须原样带回的请求头（签名可能覆盖了它们） */
+  headers: Record<string, string>;
+}
+
 export interface ListResult {
   objects: StorageObject[];
   /** 还有更多时返回下一页游标 */
@@ -104,6 +119,23 @@ export interface StorageAdapter {
    * 对象存储返回预签名 URL；本地与 WebDAV 返回 null（由上层走中转下载）。
    */
   getSignedUrl?(key: string, expiresInSeconds: number): Promise<string | null>;
+
+  /**
+   * 生成可直接上传的预签名 PUT 链接，让浏览器把文件**直接传给对象存储**，
+   * 完全不经过本服务。返回 null 表示该驱动不支持（本地磁盘、WebDAV 没有
+   * 预签名概念），调用方应回退到别的上传方式。
+   *
+   * 这是「大文件传输」最彻底的一条路：不占用本服务的带宽与磁盘，
+   * 也不受部署在服务前面的任何反向代理/CDN 的体积与超时限制约束 ——
+   * 请求根本不经过它们。
+   *
+   * key 由服务端按 md5 派生，不接受客户端指定；URL 有效期应当很短。
+   */
+  getSignedUploadUrl?(
+    key: string,
+    expiresInSeconds: number,
+    options?: SignedUploadOptions,
+  ): Promise<SignedUploadTarget | null>;
 
   /** 已用容量（字节）；无法统计时返回 null */
   usedBytes?(): Promise<number | null>;

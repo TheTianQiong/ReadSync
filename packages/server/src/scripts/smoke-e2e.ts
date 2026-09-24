@@ -16,6 +16,7 @@ import { buildApp } from '../app.js';
 import { loadConfig } from '../config.js';
 import { ensureKeyPair } from '../crypto/keys.js';
 import { closeDatabase, openDatabase } from '../db/index.js';
+import { startMockS3 } from './mock-s3.js';
 
 /**
  * inject 响应的结构化类型。
@@ -525,6 +526,192 @@ async function main(): Promise<void> {
 
       // 还原，避免影响后续用例（该变量是全局读取的）
       delete process.env.READSYNC_UPLOAD_CHUNK_SIZE;
+    }
+
+    /* ---------------------- 5c. 预签名直传 ---------------------- */
+    section('5c. 预签名直传（浏览器直接传给对象存储）');
+    {
+      const s3 = await startMockS3();
+      try {
+        const createdS3 = await api({
+          method: 'POST',
+          url: '/api/storages',
+          headers: auth,
+          payload: {
+            name: '假对象存储',
+            driver: 's3',
+            isDefault: false,
+            config: {
+              endpoint: s3.endpoint,
+              region: 'us-east-1',
+              bucket: s3.bucket,
+              accessKeyId: 'test-key',
+              secretAccessKey: 'test-secret',
+              prefix: 'readsync',
+              forcePathStyle: true,
+              addressingStyle: 'path',
+            },
+          },
+        });
+        check('创建对象存储（假 S3）成功', createdS3.statusCode === 200, createdS3.body);
+        const s3StorageId = createdS3.json().data?.id as number;
+
+        // 直传的内容与指纹
+        const payload = Buffer.from(`%PDF-1.4 presigned ${randomUUID()}`.repeat(80), 'utf8');
+        const payloadMd5 = createHash('md5').update(payload).digest('hex');
+
+        const presigned = await api({
+          method: 'POST',
+          url: '/api/uploads/presign',
+          headers: auth,
+          payload: {
+            filename: 'direct.epub',
+            size: payload.length,
+            md5: payloadMd5,
+            mode: 'create',
+            fields: { title: '直传的书', format: 'epub', storageId: String(s3StorageId) },
+          },
+        });
+        check('预签名：签发上传地址成功', presigned.statusCode === 200, presigned.body);
+        check('预签名：返回 presigned 类型', presigned.json().data?.kind === 'presigned', presigned.json().data);
+        const signedUrl = presigned.json().data?.url as string;
+        const objectKey = presigned.json().data?.objectKey as string;
+        check('预签名：URL 指向配置的 endpoint', signedUrl?.startsWith(s3.endpoint), signedUrl?.slice(0, 80));
+        check('预签名：objectKey 由 md5 派生', objectKey?.includes(payloadMd5), objectKey);
+
+        // 浏览器拿 URL 直接 PUT —— 这一步完全不经过本服务
+        const before = s3.requests.length;
+        const directPut = await fetch(signedUrl, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/epub+zip' },
+          body: new Uint8Array(payload),
+        });
+        check('预签名：客户端直传对象存储成功', directPut.ok, directPut.status);
+        check('预签名：直传确实打到了对象存储（未经过本服务）', s3.requests.length > before, s3.requests.length - before);
+        check(
+          '预签名：对象内容与原文一致',
+          s3.objects.get(`readsync/${objectKey}`)?.body.equals(payload) === true,
+          s3.objects.get(`readsync/${objectKey}`)?.body.length,
+        );
+
+        // 伪造 objectKey 必须被拒 —— 否则可以把存储上任意对象登记成自己的书
+        const forged = await api({
+          method: 'POST',
+          url: '/api/uploads/presign/complete',
+          headers: auth,
+          payload: {
+            filename: 'direct.epub',
+            size: payload.length,
+            md5: payloadMd5,
+            objectKey: 'books/1/zz/somebody-elses-file.epub',
+            mode: 'create',
+            fields: { title: '伪造', storageId: String(s3StorageId) },
+          },
+        });
+        check('预签名：伪造 objectKey 被拒', forged.statusCode === 400, forged.body);
+
+        // 大小不符必须被拒（对象还不存在）
+        const wrongSize = await api({
+          method: 'POST',
+          url: '/api/uploads/presign/complete',
+          headers: auth,
+          payload: {
+            filename: 'direct.epub',
+            size: payload.length + 10,
+            md5: payloadMd5,
+            objectKey,
+            mode: 'create',
+            fields: { title: '大小不符', storageId: String(s3StorageId) },
+          },
+        });
+        check('预签名：大小不符被拒', wrongSize.statusCode === 400, wrongSize.body);
+
+        // 内容校验：让存储返回一个与内容不符的 ETag，确认确实会拒绝并清掉对象
+        s3.corruptEtagFor(`readsync/${objectKey}`);
+        const badEtag = await api({
+          method: 'POST',
+          url: '/api/uploads/presign/complete',
+          headers: auth,
+          payload: {
+            filename: 'direct.epub',
+            size: payload.length,
+            md5: payloadMd5,
+            objectKey,
+            mode: 'create',
+            fields: { title: '内容不符', storageId: String(s3StorageId) },
+          },
+        });
+        check('预签名：ETag 与声明的 MD5 不符时拒绝', badEtag.statusCode === 400, badEtag.body);
+        check('预签名：校验失败的对象被清理（不留孤儿）', !s3.objects.has(`readsync/${objectKey}`));
+
+        // 恢复正常的 ETag 后再重传一份干净的，走完整的确认入库
+        s3.corruptEtagFor(`readsync/${objectKey}`, false);
+        await fetch(signedUrl, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/epub+zip' },
+          body: new Uint8Array(payload),
+        });
+        const completed = await api({
+          method: 'POST',
+          url: '/api/uploads/presign/complete',
+          headers: auth,
+          payload: {
+            filename: 'direct.epub',
+            size: payload.length,
+            md5: payloadMd5,
+            objectKey,
+            mode: 'create',
+            fields: { title: '直传的书', format: 'epub', storageId: String(s3StorageId) },
+          },
+        });
+        check('预签名：确认入库成功', completed.statusCode === 200, completed.body);
+        check('预签名：入库的 md5 正确', completed.json().data?.md5 === payloadMd5, completed.json().data?.md5);
+        check('预签名：入库的存储指向对象存储', completed.json().data?.storageId === s3StorageId, completed.json().data?.storageId);
+
+        // 秒传：同一份内容再签一次，应当直接返回已有书籍，一个字节都不用传
+        const again = await api({
+          method: 'POST',
+          url: '/api/uploads/presign',
+          headers: auth,
+          payload: {
+            filename: 'direct-copy.epub',
+            size: payload.length,
+            md5: payloadMd5,
+            mode: 'create',
+            fields: { title: '重复直传', storageId: String(s3StorageId) },
+          },
+        });
+        check(
+          '预签名：相同 MD5 命中秒传，不再签发 URL',
+          again.json().data?.kind === 'deduped' && again.json().data?.book?.id === completed.json().data?.id,
+          again.json().data,
+        );
+
+        // 上传后能正常下载（验证对象确实可用，且走的是预签名重定向）
+        const dl = await api({ method: 'GET', url: `/api/books/${completed.json().data?.id}/download`, headers: auth });
+        check('预签名：入库后可正常下载', dl.statusCode === 302 || dl.statusCode === 200, dl.statusCode);
+
+        // 本地存储不支持预签名，必须明确拒绝（前端据此回退到分片上传）
+        const localPresign = await api({
+          method: 'POST',
+          url: '/api/uploads/presign',
+          headers: auth,
+          payload: {
+            filename: 'local.epub',
+            size: 1024,
+            md5: createHash('md5').update('local-only').digest('hex'),
+            mode: 'create',
+            fields: { title: '本地存储直传', storageId: String(storageId) },
+          },
+        });
+        check(
+          '预签名：本地存储明确拒绝（供前端回退）',
+          localPresign.statusCode === 403,
+          localPresign.body,
+        );
+      } finally {
+        await s3.close();
+      }
     }
 
     /* ---------------------------- 6. 统一同步接口 ---------------------------- */

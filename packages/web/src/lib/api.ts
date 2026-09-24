@@ -1,3 +1,4 @@
+import { md5OfFile } from './utils';
 import {
   UPLOAD_CHUNK_SIZE_DEFAULT,
   UPLOAD_CHUNK_SIZE_MIN,
@@ -524,6 +525,169 @@ export async function uploadChunked(
   throw lastError instanceof Error ? lastError : new Error('上传失败');
 }
 
+/**
+ * 预签名直传：浏览器把文件**直接 PUT 到对象存储**，数据完全不经过本服务。
+ *
+ * 这是大文件最彻底的一条路 —— 不占服务端带宽与磁盘，也不受部署在服务前面的
+ * 任何反向代理/CDN 的体积与超时限制约束（Cloudflare 的 100 MB 上限、
+ * Nginx 的 client_max_body_size 都无从谈起，因为请求根本不经过它们）。
+ *
+ * 需要一个前提：服务端算不出 MD5（它压根看不到文件），所以要由浏览器先算好，
+ * 服务端再拿它派生对象位置、并用存储返回的 ETag 比对校验。
+ *
+ * 返回 null 表示**当前存储不支持**（本地磁盘、WebDAV 没有预签名概念），
+ * 调用方应回退到分片上传，而不是把用户卡在这里。
+ */
+export async function uploadPresigned(
+  file: File,
+  fields: Record<string, string>,
+  target: { mode: 'create' } | { mode: 'version'; bookId: number },
+  options: {
+    onProgress?: (percent: number) => void;
+    onNotice?: (message: string) => void;
+    signal?: AbortSignal;
+    /** 复用调用方已经算过的 MD5，省一次大文件哈希 */
+    knownMd5?: string;
+  } = {},
+): Promise<BookDetail | null> {
+  const token = getAccessToken();
+  const authHeaders: Record<string, string> = token ? { Authorization: `Bearer ${token}` } : {};
+
+  const postJson = async (url: string, body: unknown): Promise<unknown> => {
+    const res = await fetch(resolveUploadUrl(url), {
+      method: 'POST',
+      headers: { ...authHeaders, 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      ...(options.signal ? { signal: options.signal } : {}),
+    });
+    return unwrap<unknown>(await readBody(res), res.status, {});
+  };
+
+  // 大文件哈希要几秒钟，必须给提示，否则界面看起来像卡住了
+  if (!options.knownMd5) options.onNotice?.('正在计算文件指纹…');
+  const md5 = options.knownMd5 ?? (await md5OfFile(file, options.onProgress));
+
+  const base = {
+    filename: file.name,
+    size: file.size,
+    md5,
+    mode: target.mode,
+    ...(target.mode === 'version' ? { bookId: target.bookId } : {}),
+    fields,
+  };
+
+  let presign: {
+    kind: 'presigned' | 'deduped';
+    url?: string;
+    headers?: Record<string, string>;
+    objectKey?: string;
+    book?: BookDetail;
+  };
+  try {
+    presign = (await postJson('/uploads/presign', base)) as typeof presign;
+  } catch (err) {
+    // 存储不支持预签名（本地 / WebDAV）时服务端返回 403，回退到分片上传。
+    // 这是预期内的分支，不是错误 —— 管理员可能把上传方式设成了 presigned
+    // 但默认存储仍是本地磁盘。
+    if (err instanceof ApiError && err.isForbidden) {
+      options.onNotice?.('当前存储不支持直传，已改用分片上传…');
+      return null;
+    }
+    throw err;
+  }
+
+  if (presign.kind === 'deduped' && presign.book) {
+    options.onProgress?.(100);
+    return presign.book;
+  }
+
+  const { url, headers = {}, objectKey } = presign;
+  if (!url || !objectKey) throw new ApiError('INTERNAL_ERROR', '服务端未返回上传地址', 0);
+
+  options.onNotice?.('正在直传对象存储…');
+  await putWithProgress(url, file, headers, options.onProgress, options.signal);
+
+  return (await postJson('/uploads/presign/complete', { ...base, objectKey })) as BookDetail;
+}
+
+/** 用 XHR 直传以获得真实进度；fetch 无法上报上传进度 */
+function putWithProgress(
+  url: string,
+  file: File,
+  headers: Record<string, string>,
+  onProgress?: (percent: number) => void,
+  signal?: AbortSignal,
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('PUT', url, true);
+
+    let sentBytes = 0;
+    let lastPercent = 0;
+    // 签名可能覆盖了这些头，必须原样带回，否则对象存储会以签名不符拒绝
+    for (const [key, value] of Object.entries(headers)) xhr.setRequestHeader(key, value);
+
+    if (xhr.upload) {
+      xhr.upload.onprogress = (event) => {
+        sentBytes = event.loaded;
+        if (event.lengthComputable) {
+          lastPercent = Math.round((event.loaded / event.total) * 100);
+          onProgress?.(Math.min(99, lastPercent));
+        }
+      };
+    }
+
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        resolve();
+        return;
+      }
+      reject(
+        new ApiError(
+          'INTERNAL_ERROR',
+          `直传对象存储失败（HTTP ${xhr.status}）${xhr.responseText ? `：${xhr.responseText.slice(0, 200)}` : ''}`,
+          xhr.status,
+        ),
+      );
+    };
+
+    xhr.onerror = () => {
+      if (sentBytes === 0) {
+        // 一个字节都没发出去：多半是桶上没配 CORS，浏览器直接把跨域请求拦了
+        reject(
+          new ApiError(
+            'NETWORK_ERROR',
+            '无法连接对象存储。请确认存储桶已配置 CORS（允许本站域名以 PUT 方式上传），' +
+              '配置方法见 docs/storage-cors.md',
+            0,
+          ),
+        );
+        return;
+      }
+      reject(
+        new ApiError(
+          'NETWORK_ERROR',
+          `直传在 ${lastPercent}% 处中断，请检查网络后重试（已传部分不会入库）`,
+          0,
+        ),
+      );
+    };
+
+    xhr.ontimeout = () => reject(new ApiError('NETWORK_ERROR', '直传超时，请重试', 0));
+    xhr.onabort = () => reject(new DOMException('上传已取消', 'AbortError'));
+
+    if (signal) {
+      if (signal.aborted) {
+        xhr.abort();
+        return;
+      }
+      signal.addEventListener('abort', () => xhr.abort(), { once: true });
+    }
+
+    xhr.send(file);
+  });
+}
+
 /** 建会话阶段连不上时的提示；跨域时要把 CORS 这一最常见原因说清楚 */
 function uploadUnreachableHint(): string {
   if (!isUploadCrossOrigin()) {
@@ -596,4 +760,4 @@ export async function getBlob(path: string, query?: Record<string, QueryValue>):
   return res.blob();
 }
 
-export const api = { get, post, put, patch, del, upload, uploadChunked, getBlob };
+export const api = { get, post, put, patch, del, upload, uploadChunked, uploadPresigned, getBlob };

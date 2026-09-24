@@ -182,18 +182,24 @@ export function SiteSettings(): ReactNode {
             hint={
               form.upload.strategy === 'chunked'
                 ? '分片上传：每个请求都很小，能穿过 Nginx、Cloudflare 等对请求体大小与请求时长的限制。有反向代理时选它。'
-                : '整体上传：一次 POST 发完，请求数最少。仅在客户端与服务器之间没有代理限制时可靠（内网直连、本机访问）。'
+                : form.upload.strategy === 'presigned'
+                  ? '预签名直传：浏览器凭服务端签发的链接把文件直接传给对象存储，数据完全不经过本服务器 —— 不占服务器带宽与磁盘，也不受任何前置代理/CDN 限制。仅对象存储（R2/OSS/COS/MinIO）可用，且需在桶上配置 CORS；不支持时会自动回退到分片上传。'
+                  : '整体上传：一次 POST 发完，请求数最少。仅在客户端与服务器之间没有代理限制时可靠（内网直连、本机访问）。'
             }
           >
             <Select
               value={form.upload.strategy}
               onChange={(event) =>
                 patch({
-                  upload: { ...form.upload, strategy: event.target.value as 'chunked' | 'direct' },
+                  upload: {
+                    ...form.upload,
+                    strategy: event.target.value as 'chunked' | 'direct' | 'presigned',
+                  },
                 })
               }
             >
               <option value="chunked">分片上传（推荐，兼容反向代理）</option>
+              <option value="presigned">预签名直传（对象存储，不经过服务器）</option>
               <option value="direct">整体上传（无代理时更快）</option>
             </Select>
           </Field>

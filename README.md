@@ -293,11 +293,18 @@ curl -s http://<你的服务器地址>:3000/healthcheck
 
 网页端走**分片上传**，且分片大小会**自动适应链路**：某一片被中间层拒绝（Cloudflare `524` 源站超时、`504`、Nginx `413`）时，前端会把分片减半、重建会话重来，直到传得动（4 MiB → 2 → 1 → 512 → 256 KiB）。界面上会显示「网络较慢，正在把分片减小到 X 重试…」。
 
-**彻底绕开 CDN 的限制**：如果主站挂在 Cloudflare 后面，可以另开一个**灰云子域直连服务器**，只让上传走那条路。做法见 [HTTPS 配置指南](docs/https-setup.md#五之二上传走独立子域绕开-cdn-的请求体与超时限制)，配好后在「站点设置 → 上传 → 上传专用地址」填上即可，无需重新构建前端。
+**两条彻底绕开 CDN 限制的路**（在「站点设置 → 上传方式」里选）：
+
+| 方式 | 做法 | 代价 |
+|---|---|---|
+| **预签名直传**（推荐） | 浏览器凭服务端签发的链接**直接传给对象存储**，数据完全不经过你的服务器 | 仅对象存储（R2/OSS/COS/MinIO）可用；需给存储桶配 [CORS](docs/storage-cors.md) |
+| 上传专用地址 | 另开一个**灰云子域直连服务器**，只让上传走那条路。见 [HTTPS 配置指南](docs/https-setup.md#五之二上传走独立子域绕开-cdn-的请求体与超时限制) | 需自备证书、开非标准端口，且暴露源站 IP |
+
+预签名直传连服务器的带宽和磁盘都不占，也不用另开子域 —— 书籍本来就放在对象存储上的话，这是最省事的一条。存储不支持时（本地磁盘、WebDAV）前端会**自动回退到分片上传**，不会把用户卡住。
 
 > 注意：Cloudflare Tunnel **不能**用灰云绕过（Tunnel 的 DNS 记录必须是橙云）。灰云子域是一条独立通道，指向服务器的真实 IP。
 
-上传方式（分片 / 整体）也可在「站点设置 → 上传方式」里切换：有反向代理时选分片，内网直连时整体上传请求数更少。
+上传方式还可在「站点设置 → 上传方式」里选分片或整体：有反向代理时选分片，内网直连时整体上传请求数更少。
 
 若仍失败：
 
@@ -572,7 +579,7 @@ cd packages/server
 READSYNC_DATA_DIR=./data-smoke npx tsx src/scripts/smoke-crypto.ts
 READSYNC_DATA_DIR=./data-smoke npx tsx src/scripts/smoke-db.ts
 
-# 端到端集成测试（128 项断言：认证 / 2FA / 恢复码 / 上传 / 分片上传 / 跨域 / 存储浏览 / 同步 / 统计 / KOSync / 权限隔离）
+# 端到端集成测试（146 项断言：认证 / 2FA / 恢复码 / 上传 / 分片 / 预签名直传 / 跨域 / 存储浏览 / 同步 / 统计 / KOSync / 权限隔离）
 READSYNC_DATA_DIR=./data-e2e npx tsx src/scripts/smoke-e2e.ts
 
 # 真实 socket 的大文件整体上传（冒烟测试走进程内 inject，照不出传输层问题）
@@ -616,7 +623,8 @@ READSYNC_DATA_DIR=./data-repro PROXY_STATUS=524 npx tsx src/scripts/repro-proxy-
 
 | 文档 | 内容 |
 |---|---|
-| [docs/api-reference.md](docs/api-reference.md) | 完整 API 参考，含统一同步接口与 KOSync 协议细节 |
+| [docs/storage-cors.md](docs/storage-cors.md) | 对象存储 CORS 配置（预签名直传必读） |
+| [docs/api-reference.md](docs/api-reference.md) | 完整 API 参考，含统一同步接口、分片上传与 KOSync 协议细节 |
 | [docs/plugin-development.md](docs/plugin-development.md) | 插件清单、上下文 API、钩子、存储驱动与同步协议扩展 |
 | [koreader-plugin/README.md](koreader-plugin/README.md) | KOReader 同步插件：安装、配置、故障排查 |
 | [docs/https-setup.md](docs/https-setup.md) | 自有域名配置 HTTPS：备案判断、Caddy / Nginx / acme.sh 三种方案 |

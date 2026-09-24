@@ -220,6 +220,58 @@ export interface ChunkedUploadPartResult {
   total: number;
 }
 
+/* ---------------------------- 预签名直传 ---------------------------- */
+
+/**
+ * 预签名直传：浏览器把文件**直接 PUT 到对象存储**，不经过本服务。
+ *
+ * 这是大文件最彻底的一条路 —— 不占服务端带宽与磁盘，也不受部署在服务前面的
+ * 任何反向代理/CDN 的体积与超时限制约束，因为请求根本不经过它们。
+ * 但只有 S3 兼容存储（R2 / OSS / COS / MinIO）支持，且桶上必须配 CORS。
+ *
+ * 流程：客户端先算好 MD5 → presign 拿 URL（命中秒传就直接结束）→
+ *       XHR PUT 到该 URL（带进度）→ complete 确认入库。
+ */
+export const presignUploadSchema = z.object({
+  filename: z.string().trim().min(1).max(256),
+  size: z.coerce.number().int().nonnegative(),
+  /** 客户端算出的 MD5；服务端拿它派生对象 key，并用存储的 ETag 比对校验 */
+  md5: z
+    .string()
+    .trim()
+    .regex(/^[a-fA-F0-9]{32}$/, 'MD5 必须是 32 位十六进制串')
+    .transform((v) => v.toLowerCase()),
+  mode: z.enum(['create', 'version']).default('create'),
+  bookId: z.coerce.number().int().positive().optional(),
+  fields: z.record(z.string(), z.string()).default({}),
+});
+
+export type PresignUploadInput = z.infer<typeof presignUploadSchema>;
+
+/** 确认直传完成；服务端会去存储上核对对象确实存在且大小内容相符 */
+export const presignCompleteSchema = presignUploadSchema.extend({
+  /** presign 阶段返回的 objectKey，服务端会按 md5 重新推导并核对 */
+  objectKey: z.string().trim().min(1).max(1024),
+});
+
+export type PresignCompleteInput = z.infer<typeof presignCompleteSchema>;
+
+/** presign 的响应 */
+export type PresignUploadResult =
+  | {
+      /** 需要上传：客户端把文件 PUT 到 url */
+      kind: 'presigned';
+      url: string;
+      method: 'PUT';
+      /** 必须原样带回的请求头（签名可能覆盖了它们） */
+      headers: Record<string, string>;
+      objectKey: string;
+      /** URL 有效期（秒） */
+      expiresIn: number;
+    }
+  /** 相同 MD5 已在书库中，一个字节都不用传 */
+  | { kind: 'deduped'; book: BookDetail };
+
 export interface CheckBookExistsResult {
   /** 该 MD5 是否已存在于当前用户书库 */
   exists: boolean;

@@ -20,8 +20,12 @@ import { paginationQuerySchema } from './common.js';
  *   减半重试。**有中间层时这是唯一可靠的选择**，故为默认值。
  * - `direct`：整份文件一次 POST。请求数最少、服务端逻辑最短，但只在客户端与
  *   服务端之间没有体积/超时限制时可靠（内网直连、本机访问）。
+ * - `presigned`：浏览器凭服务端签发的 URL **直传对象存储**，数据完全不经过
+ *   本服务 —— 既省服务端的带宽与磁盘，也不受任何前置代理/CDN 的限制。
+ *   但只有 S3 兼容存储（R2 / OSS / COS / MinIO）支持，且桶上必须配 CORS；
+ *   存储不支持时前端会自动回退到分片上传。
  */
-export const uploadStrategySchema = z.enum(['chunked', 'direct']);
+export const uploadStrategySchema = z.enum(['chunked', 'direct', 'presigned']);
 export type UploadStrategy = z.infer<typeof uploadStrategySchema>;
 
 /**

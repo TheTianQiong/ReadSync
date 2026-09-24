@@ -477,7 +477,7 @@ const EXT_MIME: Record<string, string> = {
   json: 'application/json',
 };
 
-function mimeOfExt(ext: string): string {
+export function mimeOfExt(ext: string): string {
   return EXT_MIME[ext] ?? 'application/octet-stream';
 }
 
@@ -747,6 +747,61 @@ export async function uploadBook(userId: number, file: UploadedFile): Promise<Up
  * 秒传、配额、存储选择、事务写库这些都只实现一次。
  * 调用方负责清理 received.tmpPath。
  */
+/**
+ * 由 md5 与扩展名派生的目标对象位置，以及要写入的存储。
+ *
+ * 抽出来是因为「预签名直传」需要在**上传之前**就先算出 key 并签进 URL，
+ * 而上传流程则是先上传再算。两边必须用同一套规则，否则客户端直传写进去的
+ * 对象，与之后入库记录的位置会对不上。
+ */
+export interface BookTarget {
+  title: string;
+  format: BookFormat;
+  storageId: number;
+  adapter: StorageAdapter;
+  key: string;
+}
+
+/** 校验书名/解析存储/派生对象 key；上传前与入库前都要走一遍 */
+export async function resolveBookTarget(
+  userId: number,
+  md5: string,
+  ext: string,
+  fields: UploadFields,
+): Promise<BookTarget> {
+  const title = (fields.title ?? '').trim();
+  if (!title) throw badRequest('请填写书名（表单字段 title）');
+  if (title.length > 256) throw badRequest('书名不能超过 256 个字符');
+
+  const storageIdRaw = fields.storageId;
+  let storageId: number;
+  let adapter: StorageAdapter;
+  if (storageIdRaw !== undefined && storageIdRaw.trim() !== '') {
+    storageId = parsePositiveIntField(storageIdRaw, 'storageId');
+    adapter = await resolveStorageAdapter(storageId, userId);
+  } else {
+    const resolved = await resolveDefaultStorage(userId);
+    storageId = resolved.storageId;
+    adapter = resolved.adapter;
+  }
+  // 写路径要求存储属于当前用户且处于启用状态（getAdapterForStorage 不校验 enabled）
+  assertOwnedStorage(userId, storageId);
+
+  // key 由 md5 派生，天然安全；仍过一遍 assertSafeKey 作为纵深防御
+  const key = buildBookKey(userId, md5, ext);
+  safeKeyOrThrow(key);
+
+  return { title, format: resolveFormat(fields.format, ext), storageId, adapter, key };
+}
+
+/** 命中秒传时直接返回已有书籍，避免重复上传 */
+export function findDedupedBook(userId: number, md5: string): UploadBookResult | null {
+  const existing = findBookByMd5(userId, md5);
+  if (!existing) return null;
+  log.info({ userId, bookId: existing.book.id, md5 }, '命中秒传，跳过上传');
+  return { book: getBookDetail(userId, existing.book.id), deduped: true };
+}
+
 export async function commitNewBook(
   userId: number,
   received: ReceivedUpload,
@@ -754,43 +809,55 @@ export async function commitNewBook(
 ): Promise<UploadBookResult> {
   {
     // 秒传：命中则不上传、不落库，直接返回已有书籍（省流量的关键路径）
-    const existing = findBookByMd5(userId, received.md5);
-    if (existing) {
-      log.info({ userId, bookId: existing.book.id, md5: received.md5 }, '命中秒传，跳过上传');
-      return { book: getBookDetail(userId, existing.book.id), deduped: true };
-    }
+    const deduped = findDedupedBook(userId, received.md5);
+    if (deduped) return deduped;
 
-    const title = (fields.title ?? '').trim();
-    if (!title) throw badRequest('请填写书名（表单字段 title）');
-    if (title.length > 256) throw badRequest('书名不能超过 256 个字符');
-
-    const storageIdRaw = fields.storageId;
-    let storageId: number;
-    let adapter: StorageAdapter;
-    if (storageIdRaw !== undefined && storageIdRaw.trim() !== '') {
-      storageId = parsePositiveIntField(storageIdRaw, 'storageId');
-      adapter = await resolveStorageAdapter(storageId, userId);
-    } else {
-      const resolved = await resolveDefaultStorage(userId);
-      storageId = resolved.storageId;
-      adapter = resolved.adapter;
-    }
-    // 写路径要求存储属于当前用户且处于启用状态（getAdapterForStorage 不校验 enabled）
-    assertOwnedStorage(userId, storageId);
-
-    // key 由 md5 派生，天然安全；仍过一遍 assertSafeKey 作为纵深防御
-    const key = buildBookKey(userId, received.md5, received.ext);
-    safeKeyOrThrow(key);
+    const target = await resolveBookTarget(userId, received.md5, received.ext, fields);
 
     const stream = createReadStream(received.tmpPath);
     try {
-      await adapter.put(key, stream, { contentType: mimeOfExt(received.ext), md5: received.md5, overwrite: true });
+      await target.adapter.put(target.key, stream, {
+        contentType: mimeOfExt(received.ext),
+        md5: received.md5,
+        overwrite: true,
+      });
     } finally {
       stream.destroy();
     }
 
+    return insertBookRecords(userId, {
+      title: target.title,
+      format: target.format,
+      storageId: target.storageId,
+      key: target.key,
+      size: received.size,
+      md5: received.md5,
+      fields,
+    });
+  }
+}
+
+/**
+ * 写入书籍主记录 + 首个版本行 + 容量统计。
+ *
+ * 只碰数据库，不碰存储 —— 对象此时已经就位（无论是本服务刚传完，还是
+ * 浏览器凭预签名 URL 直传完成的），所以两条上传路径可以共用这一段。
+ */
+export function insertBookRecords(
+  userId: number,
+  input: {
+    title: string;
+    format: BookFormat;
+    storageId: number;
+    key: string;
+    size: number;
+    md5: string;
+    fields: UploadFields;
+  },
+): UploadBookResult {
+  const { title, format, storageId, key, md5, size, fields } = input;
+  {
     const now = new Date();
-    const format = resolveFormat(fields.format, received.ext);
 
     // 主记录 + 版本行 + 容量统计在同一事务内完成：唯一索引冲突时整体回滚，
     // 不会留下「有书没版本」或「容量已加但书没建」的中间状态。
@@ -808,8 +875,8 @@ export async function commitNewBook(
               publisher: nonEmpty(fields.publisher),
               isbn: nonEmpty(fields.isbn),
               format,
-              size: received.size,
-              md5: received.md5,
+              size: size,
+              md5: md5,
               objectKey: key,
               storageId,
               currentVersion: 1,
@@ -826,7 +893,7 @@ export async function commitNewBook(
           return { id: row.id, raced: false };
         } catch (err) {
           if (isUniqueConstraintError(err)) {
-            const existing = findBookByMd5(userId, received.md5);
+            const existing = findBookByMd5(userId, md5);
             if (existing) return { id: existing.book.id, raced: true };
           }
           throw err;
@@ -842,8 +909,8 @@ export async function commitNewBook(
         .values({
           bookId: outcome.id,
           version: 1,
-          size: received.size,
-          md5: received.md5,
+          size: size,
+          md5: md5,
           objectKey: key,
           storageId,
           note: '初次上传',
@@ -853,7 +920,7 @@ export async function commitNewBook(
         .run();
 
       tx.update(storages)
-        .set({ usedBytes: sql`coalesce(${storages.usedBytes}, 0) + ${received.size}`, updatedAt: now })
+        .set({ usedBytes: sql`coalesce(${storages.usedBytes}, 0) + ${size}`, updatedAt: now })
         .where(eq(storages.id, storageId))
         .run();
 
@@ -861,7 +928,7 @@ export async function commitNewBook(
     });
 
     log.info(
-      { userId, bookId: inserted.id, deduped: inserted.deduped, size: received.size, storageId },
+      { userId, bookId: inserted.id, deduped: inserted.deduped, size: size, storageId },
       inserted.deduped ? '并发秒传竞态，返回已存在书籍' : '上传书籍完成',
     );
     return { book: getBookDetail(userId, inserted.id), deduped: inserted.deduped };
@@ -896,67 +963,93 @@ export async function commitNewVersion(
   fields: UploadFields,
 ): Promise<BookDetail> {
   {
-    const { book } = getOwnedBook(userId, bookId);
-
-    // books(owner_id, md5) 唯一索引要求：新版本的 md5 不能与同用户其它书籍相同
-    const clash = findBookByMd5(userId, received.md5);
-    if (clash && clash.book.id !== bookId) {
-      throw conflict('相同 MD5 的文件已存在于书库中的其它书籍，请先处理该书籍');
-    }
-
-    const adapter = await resolveStorageAdapter(book.storageId, userId);
-    assertOwnedStorage(userId, book.storageId);
-    const key = buildBookKey(userId, received.md5, received.ext);
-    safeKeyOrThrow(key);
+    const target = await resolveVersionTarget(userId, bookId, received.md5, received.ext);
 
     const stream = createReadStream(received.tmpPath);
     try {
-      await adapter.put(key, stream, { contentType: mimeOfExt(received.ext), md5: received.md5, overwrite: true });
+      await target.adapter.put(target.key, stream, {
+        contentType: mimeOfExt(received.ext),
+        md5: received.md5,
+        overwrite: true,
+      });
     } finally {
       stream.destroy();
     }
 
-    const now = new Date();
-    const nextVersion = book.currentVersion + 1;
-    const note = nonEmpty(fields.note);
-
-    // 先更新主记录（md5 唯一冲突会在此抛出并回滚），再插版本行，最后累加容量；
-    // 三步同一事务，避免出现「版本行已写但 currentVersion 未变」导致后续版本号撞车。
-    getDb().transaction((tx) => {
-      tx.update(books)
-        .set({
-          size: received.size,
-          md5: received.md5,
-          objectKey: key,
-          currentVersion: nextVersion,
-          updatedAt: now,
-        })
-        .where(eq(books.id, bookId))
-        .run();
-
-      tx.insert(bookVersions)
-        .values({
-          bookId,
-          version: nextVersion,
-          size: received.size,
-          md5: received.md5,
-          objectKey: key,
-          storageId: book.storageId,
-          note,
-          uploadedBy: userId,
-          createdAt: now,
-        })
-        .run();
-
-      tx.update(storages)
-        .set({ usedBytes: sql`coalesce(${storages.usedBytes}, 0) + ${received.size}`, updatedAt: now })
-        .where(eq(storages.id, book.storageId))
-        .run();
+    return insertVersionRecords(userId, bookId, {
+      size: received.size,
+      md5: received.md5,
+      key: target.key,
+      storageId: target.storageId,
+      note: nonEmpty(fields.note),
     });
-
-    log.info({ userId, bookId, version: nextVersion, size: received.size }, '上传书籍新版本');
-    return getBookDetail(userId, bookId);
   }
+}
+
+/** 校验归属、md5 冲突与存储，并派生新版本的对象 key；上传前与入库前都要走一遍 */
+export async function resolveVersionTarget(
+  userId: number,
+  bookId: number,
+  md5: string,
+  ext: string,
+): Promise<{ adapter: StorageAdapter; key: string; storageId: number }> {
+  const { book } = getOwnedBook(userId, bookId);
+
+  // books(owner_id, md5) 唯一索引要求：新版本的 md5 不能与同用户其它书籍相同
+  const clash = findBookByMd5(userId, md5);
+  if (clash && clash.book.id !== bookId) {
+    throw conflict('相同 MD5 的文件已存在于书库中的其它书籍，请先处理该书籍');
+  }
+
+  const adapter = await resolveStorageAdapter(book.storageId, userId);
+  assertOwnedStorage(userId, book.storageId);
+  const key = buildBookKey(userId, md5, ext);
+  safeKeyOrThrow(key);
+
+  return { adapter, key, storageId: book.storageId };
+}
+
+/** 写入新版本行并推进 currentVersion；只碰数据库，供两条上传路径共用 */
+export function insertVersionRecords(
+  userId: number,
+  bookId: number,
+  input: { size: number; md5: string; key: string; storageId: number; note: string | null },
+): BookDetail {
+  const { size, md5, key, storageId, note } = input;
+  const book = getOwnedBook(userId, bookId).book;
+  const now = new Date();
+  const nextVersion = book.currentVersion + 1;
+
+  // 先更新主记录（md5 唯一冲突会在此抛出并回滚），再插版本行，最后累加容量；
+  // 三步同一事务，避免出现「版本行已写但 currentVersion 未变」导致后续版本号撞车。
+  getDb().transaction((tx) => {
+    tx.update(books)
+      .set({ size, md5, objectKey: key, currentVersion: nextVersion, updatedAt: now })
+      .where(eq(books.id, bookId))
+      .run();
+
+    tx.insert(bookVersions)
+      .values({
+        bookId,
+        version: nextVersion,
+        size,
+        md5,
+        objectKey: key,
+        storageId,
+        note,
+        uploadedBy: userId,
+        createdAt: now,
+      })
+      .run();
+
+    tx.update(storages)
+      .set({ usedBytes: sql`coalesce(${storages.usedBytes}, 0) + ${size}`, updatedAt: now })
+      .where(eq(storages.id, storageId))
+      .run();
+  });
+
+  log.info({ userId, bookId, version: nextVersion, size }, '上传书籍新版本');
+  return getBookDetail(userId, bookId);
 }
 
 /**

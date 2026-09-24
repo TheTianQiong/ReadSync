@@ -3,6 +3,8 @@ import {
   checkBookExistsSchema,
   chunkedUploadInitSchema,
   createBookSchema,
+  presignCompleteSchema,
+  presignUploadSchema,
   listBooksQuerySchema,
   updateBookSchema,
   type ApiSuccess,
@@ -12,12 +14,14 @@ import {
   type CheckBookExistsResult,
   type ChunkedUploadInitResult,
   type ChunkedUploadPartResult,
+  type PresignUploadResult,
   type Paginated,
 } from '@readsync/shared';
 import { badRequest, validationFailed } from '../../errors.js';
 import { auditContextFrom, recordAudit } from '../../lib/audit.js';
 import { currentUser, requireAuth } from '../../middleware/auth.js';
 import { completeSession, createSession, discardSession, writeChunk } from './chunked.js';
+import { completePresignedUpload, presignUpload } from './presign.js';
 import {
   checkBookExists,
   createBook,
@@ -282,6 +286,73 @@ export async function registerLibraryRoutes(app: FastifyInstance): Promise<void>
       return { ok: true, data: { discarded: true } } satisfies ApiSuccess<{ discarded: boolean }>;
     },
   );
+
+  /* ---------------------------- 预签名直传 ---------------------------- */
+
+  /**
+   * 签发预签名上传 URL，让浏览器直接传给对象存储。
+   *
+   * 数据完全不经过本服务，因此也不受任何前置反向代理/CDN 的体积与超时限制。
+   * 命中秒传时直接返回已有书籍，一个字节都不用传。
+   */
+  app.post('/api/uploads/presign', auth, async (req) => {
+    const user = currentUser(req);
+    const input = parseOrThrow(() => presignUploadSchema.parse(req.body));
+
+    const result = await presignUpload(user.id, {
+      filename: input.filename,
+      size: input.size,
+      md5: input.md5,
+      mode: input.mode,
+      bookId: input.bookId,
+      fields: input.fields,
+    });
+
+    if (result.kind === 'deduped') {
+      return { ok: true, data: result } satisfies ApiSuccess<PresignUploadResult>;
+    }
+
+    recordAudit('book.upload', auditContextFrom(req, user), {
+      target: input.filename,
+      meta: { mode: 'presigned', size: input.size, direct: true },
+    });
+
+    return { ok: true, data: result } satisfies ApiSuccess<PresignUploadResult>;
+  });
+
+  /**
+   * 确认直传完成并入库。
+   *
+   * 客户端说传完了不算数：这里会按 md5 重算对象位置核对，再去存储上确认
+   * 对象确实存在、大小相符、ETag 与声明的 MD5 一致。
+   */
+  app.post('/api/uploads/presign/complete', auth, async (req) => {
+    const user = currentUser(req);
+    const input = parseOrThrow(() => presignCompleteSchema.parse(req.body));
+
+    const result = await completePresignedUpload(user.id, {
+      filename: input.filename,
+      size: input.size,
+      md5: input.md5,
+      objectKey: input.objectKey,
+      mode: input.mode,
+      bookId: input.bookId,
+      fields: input.fields,
+    });
+
+    const detail = 'book' in result ? result.book : result;
+    recordAudit('book.upload', auditContextFrom(req, user), {
+      target: detail.title,
+      meta: {
+        mode: 'presigned-complete',
+        bookId: detail.id,
+        size: detail.size,
+        deduped: 'book' in result ? result.deduped : false,
+      },
+    });
+
+    return { ok: true, data: detail } satisfies ApiSuccess<BookDetail>;
+  });
 
   /**
    * 回滚到指定历史版本。

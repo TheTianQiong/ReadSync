@@ -187,28 +187,44 @@ export function BookUploadDialog({
       fields.note = note.trim();
     }
 
+    const target =
+      mode === 'create' ? { mode: 'create' as const } : { mode: 'version' as const, bookId: Number(bookId) };
+
     try {
-      if (strategy === 'direct') {
+      /*
+       * 走分片上传。三条路径按管理员的选择走，其中预签名直传可能不可用
+       * （存储是本地磁盘或 WebDAV 时服务端会拒绝），那时自动回退到分片 ——
+       * 用户不该因为管理员选错了一个选项就传不了书。
+       */
+      let done = false;
+
+      if (strategy === 'presigned') {
+        const result = await api.uploadPresigned(file, fields, target, {
+          onProgress: setProgress,
+          onNotice: setNotice,
+          ...(knownMd5 ? { knownMd5 } : {}),
+        });
+        // null 表示当前存储不支持直传，落到下面的分片路径
+        done = result !== null;
+      }
+
+      if (!done && strategy === 'direct') {
         // 整体上传：沿用 multipart 端点，字段随表单一起发
         const form = new FormData();
         form.append('file', file);
         for (const [key, value] of Object.entries(fields)) form.append(key, value);
-        await api.upload(
-          mode === 'create' ? '/books/upload' : `/books/${bookId}/versions`,
-          form,
-          { onProgress: setProgress },
-        );
-      } else {
-        await api.uploadChunked(
-          file,
-          fields,
-          mode === 'create' ? { mode: 'create' } : { mode: 'version', bookId: Number(bookId) },
-          {
-            onProgress: setProgress,
-            // 链路慢而降级重试时得让用户看见，否则进度条归零会像是卡死了
-            onNotice: setNotice,
-          },
-        );
+        await api.upload(mode === 'create' ? '/books/upload' : `/books/${bookId}/versions`, form, {
+          onProgress: setProgress,
+        });
+        done = true;
+      }
+
+      if (!done) {
+        await api.uploadChunked(file, fields, target, {
+          onProgress: setProgress,
+          // 链路慢而降级重试时得让用户看见，否则进度条归零会像是卡死了
+          onNotice: setNotice,
+        });
       }
       toast.success(mode === 'create' ? '上传完成' : '新版本已上传');
       onUploaded();

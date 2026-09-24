@@ -11,6 +11,8 @@ import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import { s3ConfigSchema, type StorageTestResult } from '@readsync/shared';
 import { badRequest, conflict, notFound, storageError } from '../../../errors.js';
 import type {
+  SignedUploadOptions,
+  SignedUploadTarget,
   GetOptions,
   GetResult,
   ListOptions,
@@ -275,6 +277,40 @@ export class S3StorageAdapter implements DirectoryAdapter {
         new GetObjectCommand({ Bucket: this.bucket, Key: this.fullKey(key) }),
         { expiresIn: Math.max(1, Math.floor(expiresInSeconds)) },
       );
+    } catch (err) {
+      throw storageError(describeError(err), err);
+    }
+  }
+
+  /**
+   * 预签名上传：让浏览器把文件直接 PUT 到对象存储，不经过本服务。
+   *
+   * 把 ContentType 与 ContentLength 一并签进去，存储侧就会拒绝内容类型或
+   * 大小不符的上传 —— 校验不能只放在确认阶段，那时数据已经写进去了。
+   *
+   * 注意用的是 this.fullKey(key)：逻辑 key 不含存储的命名空间前缀，
+   * 真正写进桶的必须带上，否则会和该存储的其它数据混在一起。
+   */
+  async getSignedUploadUrl(
+    key: string,
+    expiresInSeconds: number,
+    options: SignedUploadOptions = {},
+  ): Promise<SignedUploadTarget> {
+    const headers: Record<string, string> = {};
+    if (options.contentType) headers['Content-Type'] = options.contentType;
+
+    try {
+      const url = await getSignedUrl(
+        this.client,
+        new PutObjectCommand({
+          Bucket: this.bucket,
+          Key: this.fullKey(key),
+          ...(options.contentType ? { ContentType: options.contentType } : {}),
+          ...(options.contentLength !== undefined ? { ContentLength: options.contentLength } : {}),
+        }),
+        { expiresIn: Math.max(1, Math.floor(expiresInSeconds)) },
+      );
+      return { url, method: 'PUT', headers };
     } catch (err) {
       throw storageError(describeError(err), err);
     }
