@@ -112,6 +112,8 @@ function toBookSummary(row: BookWithStorage): BookSummary {
     currentVersion: b.currentVersion,
     storageId: b.storageId,
     storageName: row.storageName,
+    // 只有书目信息、没传过文件的书下载必然 404，前端据此隐藏下载按钮
+    hasFile: b.objectKey !== null && b.storageId !== null,
     totalReadingSeconds: b.totalReadingSeconds,
     // 时间统一按 RFC3339 字符串对外
     lastReadAt: b.lastReadAt ? b.lastReadAt.toISOString() : null,
@@ -311,11 +313,24 @@ export async function createBook(userId: number, input: CreateBookInput): Promis
     throw conflict('该文件已存在于你的书库中（相同 MD5）');
   }
 
-  // objectKey 由客户端提供，落库前必须校验安全性
-  safeKeyOrThrow(input.objectKey);
+  /*
+   * 两种登记方式：
+   *  - 带 objectKey：文件已经在某处（第三方上传或客户端直传），这里只补登记；
+   *  - 不带 objectKey：**只登记书目信息与 MD5，不关联任何文件**。
+   *
+   * 后者是给「不需要在服务器上存书、只要同步与统计」的用法准备的 ——
+   * 本项目的阅读进度同步与统计完全不依赖文件，只有下载与版本回滚需要。
+   * 因此这种情况下既不要求配置存储，也不去碰存储。
+   */
+  const hasFile = typeof input.objectKey === 'string' && input.objectKey.length > 0;
 
-  const storageId = input.storageId ?? (await resolveDefaultStorage(userId)).storageId;
-  assertOwnedStorage(userId, storageId);
+  let storageId: number | null = null;
+  if (hasFile) {
+    // objectKey 由客户端提供，落库前必须校验安全性
+    safeKeyOrThrow(input.objectKey!);
+    storageId = input.storageId ?? (await resolveDefaultStorage(userId)).storageId;
+    assertOwnedStorage(userId, storageId);
+  }
 
   const now = new Date();
   let bookId: number;
@@ -331,7 +346,7 @@ export async function createBook(userId: number, input: CreateBookInput): Promis
         format: input.format,
         size: input.size,
         md5: input.md5,
-        objectKey: input.objectKey,
+        objectKey: hasFile ? input.objectKey! : null,
         storageId,
         currentVersion: 1,
         coverUrl: input.coverUrl ?? null,
@@ -360,15 +375,16 @@ export async function createBook(userId: number, input: CreateBookInput): Promis
       version: 1,
       size: input.size,
       md5: input.md5,
-      objectKey: input.objectKey,
+      objectKey: hasFile ? input.objectKey! : null,
       storageId,
-      note: '初次入库',
+      // 无文件时备注区分开，版本历史里一眼能看出这本书本来就没传过文件
+      note: hasFile ? '初次入库' : '仅登记书目（未上传文件）',
       uploadedBy: userId,
       createdAt: now,
     })
     .run();
 
-  log.info({ userId, bookId, md5: input.md5, storageId }, '登记书籍');
+  log.info({ userId, bookId, md5: input.md5, storageId, hasFile }, '登记书籍');
   return getBookDetail(userId, bookId);
 }
 
@@ -407,14 +423,18 @@ export async function deleteBook(userId: number, bookId: number): Promise<Delete
 
   const versions = db.select().from(bookVersions).where(eq(bookVersions.bookId, bookId)).all();
 
-  // 用 storageId:objectKey 去重：同一对象可能被多个版本引用（如回滚后）
+  // 用 storageId:objectKey 去重：同一对象可能被多个版本引用（如回滚后）。
+  // 只登记书目、没有文件的书没有对象可删，直接跳过。
   const targets = new Map<string, { storageId: number; objectKey: string; size: number }>();
-  targets.set(`${book.storageId}:${book.objectKey}`, {
-    storageId: book.storageId,
-    objectKey: book.objectKey,
-    size: book.size,
-  });
+  if (book.storageId !== null && book.objectKey !== null) {
+    targets.set(`${book.storageId}:${book.objectKey}`, {
+      storageId: book.storageId,
+      objectKey: book.objectKey,
+      size: book.size,
+    });
+  }
   for (const v of versions) {
+    if (v.storageId === null || v.objectKey === null) continue;
     targets.set(`${v.storageId}:${v.objectKey}`, { storageId: v.storageId, objectKey: v.objectKey, size: v.size });
   }
 
@@ -1001,12 +1021,18 @@ export async function resolveVersionTarget(
     throw conflict('相同 MD5 的文件已存在于书库中的其它书籍，请先处理该书籍');
   }
 
-  const adapter = await resolveStorageAdapter(book.storageId, userId);
-  assertOwnedStorage(userId, book.storageId);
+  // 存储只在校验通过后才有值，因此这里能安全断言非空
+  const storageId = book.storageId;
+  if (storageId === null) {
+    throw badRequest('这本书只有书目信息，请先删除再用上传的方式重新添加，或改用「登记书目」');
+  }
+
+  const adapter = await resolveStorageAdapter(storageId, userId);
+  assertOwnedStorage(userId, storageId);
   const key = buildBookKey(userId, md5, ext);
   safeKeyOrThrow(key);
 
-  return { adapter, key, storageId: book.storageId };
+  return { adapter, key, storageId };
 }
 
 /** 写入新版本行并推进 currentVersion；只碰数据库，供两条上传路径共用 */
@@ -1121,6 +1147,10 @@ export function restoreBookVersion(userId: number, bookId: number, versionRowId:
  */
 export async function prepareBookDownload(userId: number, bookId: number): Promise<DownloadTarget> {
   const { book } = getOwnedBook(userId, bookId);
+  if (book.objectKey === null || book.storageId === null) {
+    // 说清楚是「本来就没传文件」而不是「文件丢了」，否则用户会以为数据出了问题
+    throw notFound('这本书只有书目信息，没有上传过文件，无法下载');
+  }
   const adapter = await resolveStorageAdapter(book.storageId, userId);
 
   // 扩展名只从 objectKey 取（buildBookKey 保证带扩展名），不从书名推断，

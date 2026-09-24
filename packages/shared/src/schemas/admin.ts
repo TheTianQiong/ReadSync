@@ -61,6 +61,16 @@ export const siteSettingsSchema = z.object({
   inviteRequired: z.boolean().default(false),
   /** 是否允许通过邮件找回密码 */
   passwordResetEnabled: z.boolean().default(true),
+  /**
+   * 是否允许上传书籍文件。
+   *
+   * 关掉之后前端不再显示上传入口，所有上传端点一律拒绝；但**登记书目**
+   * （只填书名、作者、MD5 等信息，不传文件）仍然可用。
+   *
+   * 适用场景：服务器在 CDN/代理后面传大文件总失败，而用户其实只需要
+   * 阅读进度同步与统计 —— 那些功能完全不需要文件，只有下载与版本回滚需要。
+   */
+  uploadEnabled: z.boolean().default(true),
   /** 上传限制与上传通道 */
   upload: z
     .object({
@@ -98,6 +108,8 @@ export interface PublicSettings {
   defaultTheme: 'light' | 'dark' | 'system';
   footerText: string;
   version: string;
+  /** 是否允许上传书籍文件；关闭后只能登记书目 */
+  uploadEnabled: boolean;
   /**
    * 上传限制，公开给前端做**上传前预检**。
    *

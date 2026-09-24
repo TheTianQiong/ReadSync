@@ -168,6 +168,13 @@ export function SiteSettings(): ReactNode {
             </Field>
           </div>
 
+          <Switch
+            checked={form.uploadEnabled}
+            onChange={(next) => patch({ uploadEnabled: next })}
+            label="允许上传书籍文件"
+            description="关闭后所有上传入口与上传接口都会被拒绝，但「登记书目」（只填书名、作者、MD5，不传文件）仍然可用。阅读进度同步与统计不依赖文件，只有下载与版本回滚需要 —— 若服务器在 CDN 后面传大文件总失败，而你只需要同步，可以关掉它。"
+          />
+
           <Field label="允许的文件扩展名" hint="逗号分隔，不带点；涵盖 epub、pdf、zip、json 等">
             <Textarea
               value={extensions}

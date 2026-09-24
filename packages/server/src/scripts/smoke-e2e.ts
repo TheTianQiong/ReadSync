@@ -95,11 +95,18 @@ async function main(): Promise<void> {
   const config = loadConfig();
 
   // 安全护栏：拒绝在看起来像生产目录的位置跑破坏性测试
-  if (!/data-e2e|data-smoke|tmp|test/i.test(config.dataDir)) {
+  if (!/data-e2e|data-smoke|data-mig|data-upgrade|tmp|test/i.test(config.dataDir)) {
     console.error(`拒绝执行：数据目录 ${config.dataDir} 看起来不是测试目录。`);
     console.error('请设置 READSYNC_DATA_DIR=./data-e2e 后重试。');
     process.exit(1);
   }
+
+  /*
+   * 本脚本要在同一个 IP 上做十几次登录（覆盖 2FA、恢复码、限流等各分支），
+   * 必然撞上按 IP+路由计的登录限流。放大配额而不是放宽产品默认值 ——
+   * 限流本身仍是被测对象，只是不再因为「测试全都从一个 IP 来」而误伤。
+   */
+  process.env.READSYNC_RATE_LIMIT_FACTOR = '50';
 
   console.log(`端到端测试，数据目录：${config.dataDir}`);
 
@@ -526,6 +533,212 @@ async function main(): Promise<void> {
 
       // 还原，避免影响后续用例（该变量是全局读取的）
       delete process.env.READSYNC_UPLOAD_CHUNK_SIZE;
+    }
+
+    /* ------------- 5b2. 只登记书目、不上传文件 ------------- */
+    section('5b2. 只登记书目（无文件）与上传总开关');
+    {
+      // 关闭上传
+      const off = await api({
+        method: 'PATCH',
+        url: '/api/admin/settings',
+        headers: auth,
+        payload: { uploadEnabled: false },
+      });
+      check('可关闭上传总开关', off.statusCode === 200 && off.json().data?.uploadEnabled === false, off.body);
+
+      const pub = await api({ method: 'GET', url: '/api/system/settings' });
+      check('上传开关随公开设置下发', pub.json().data?.uploadEnabled === false, pub.json().data?.uploadEnabled);
+
+      // 关掉之后所有上传入口都必须拒绝
+      const upBlocked = await api({
+        method: 'POST',
+        url: '/api/books/upload',
+        headers: auth,
+        payload: { title: 'x' },
+      });
+      check('关闭后整体上传被拒', upBlocked.statusCode === 403, upBlocked.body);
+
+      const chunkBlocked = await api({
+        method: 'POST',
+        url: '/api/uploads',
+        headers: auth,
+        payload: { filename: 'x.epub', size: 100, mode: 'create', fields: { title: 'x' } },
+      });
+      check('关闭后分片上传被拒', chunkBlocked.statusCode === 403, chunkBlocked.body);
+
+      const presignBlocked = await api({
+        method: 'POST',
+        url: '/api/uploads/presign',
+        headers: auth,
+        payload: {
+          filename: 'x.epub',
+          size: 100,
+          md5: 'e'.repeat(32),
+          mode: 'create',
+          fields: { title: 'x' },
+        },
+      });
+      check('关闭后预签名直传被拒', presignBlocked.statusCode === 403, presignBlocked.body);
+
+      // 未登录用户应当先拿到 401，而不是从 403 反推出「本站关闭了上传」
+      const anon = await api({
+        method: 'POST',
+        url: '/api/uploads',
+        payload: { filename: 'x.epub', size: 100, mode: 'create', fields: {} },
+      });
+      check('未登录时先返回 401（不泄露站点配置）', anon.statusCode === 401, anon.statusCode);
+
+      // 但登记书目必须照常可用 —— 这正是关掉上传的意义所在
+      const metaMd5 = createHash('md5').update('manual-register-book').digest('hex');
+      const registered = await api({
+        method: 'POST',
+        url: '/api/books',
+        headers: auth,
+        payload: {
+          title: '只登记的书',
+          author: '某人',
+          format: 'epub',
+          md5: metaMd5,
+          size: 0,
+          tags: ['测试'],
+        },
+      });
+      check('关闭上传后仍能登记书目（不传文件）', registered.statusCode === 200, registered.body);
+      check('登记的书标记为无文件', registered.json().data?.hasFile === false, registered.json().data?.hasFile);
+      check('登记的书 storageId 为空', registered.json().data?.storageId === null, registered.json().data?.storageId);
+      const metaBookId = registered.json().data?.id as number;
+
+      // 无文件的书不能下载 —— 而且要说清是「本来就没传」而不是「文件丢了」
+      const dl = await api({ method: 'GET', url: `/api/books/${metaBookId}/download`, headers: auth });
+      check('无文件的书下载给出明确提示', dl.statusCode === 404 && dl.json().error?.message?.includes('没有上传过文件'), dl.body);
+
+      // 无文件的书不能传新版本，但提示要指路而不是干巴巴报错
+      const verBlocked = await api({
+        method: 'POST',
+        url: `/api/books/${metaBookId}/versions`,
+        headers: auth,
+        payload: { title: 'x' },
+      });
+      check('关闭上传后传新版本被拒', verBlocked.statusCode === 403, verBlocked.body);
+
+      // 删除无文件的书不该去碰存储，也应正常成功
+      const metaDel = await api({ method: 'DELETE', url: `/api/books/${metaBookId}`, headers: auth });
+      check('删除无文件的书成功且不涉及对象删除', metaDel.statusCode === 200 && metaDel.json().data?.deletedFiles === 0, metaDel.body);
+
+      // 恢复上传开关，避免影响后续用例
+      await api({
+        method: 'PATCH',
+        url: '/api/admin/settings',
+        headers: auth,
+        payload: { uploadEnabled: true },
+      });
+    }
+
+    /* ---------------- 5b3. 同步与统计并不依赖文件 ---------------- */
+    section('5b3. 无文件的书照样能同步进度与统计');
+    {
+      /*
+       * 这是「关掉上传只登记书目」这条路能否成立的关键。
+       *
+       * 同步接口靠 books.md5 === document 把进度挂到书库里的书上
+       * （见 sync/service.ts），与有没有文件、有没有存储完全无关。
+       * 这里把这条链路真跑一遍，而不是靠读代码推断。
+       */
+      /*
+       * 用独立账号，不共用 admin —— 本段会累计阅读时长，而第 7 节要断言
+       * admin 的累计时长恰好是 300 秒。共用账号会让那个断言失败，
+       * 而失败的看起来是「统计坏了」，实际只是测试之间互相污染。
+       */
+      const nfPassword = 'NoFilePass123';
+      const nfPw = { ciphertext: encryptPassword(nfPassword, publicKey), encrypted: true };
+      const nfCreated = await api({
+        method: 'POST',
+        url: '/api/admin/users',
+        headers: auth,
+        payload: { username: 'nofileuser', email: 'nofile@example.com', password: nfPw },
+      });
+      check('为无文件用例创建独立账号', nfCreated.statusCode === 200, nfCreated.body);
+
+      const nfLogin = await api({
+        method: 'POST',
+        url: '/api/auth/login',
+        payload: { username: 'nofileuser', password: nfPw },
+      });
+      const nfAuth = { authorization: `Bearer ${nfLogin.json().data?.accessToken}` };
+      check('独立账号登录成功', nfLogin.statusCode === 200, nfLogin.body);
+
+      const docMd5 = createHash('md5').update('no-file-book-document').digest('hex');
+      const created = await api({
+        method: 'POST',
+        url: '/api/books',
+        headers: nfAuth,
+        payload: { title: '无文件同步书', format: 'epub', md5: docMd5, size: 0 },
+      });
+      check('登记一本无文件的书', created.statusCode === 200 && created.json().data?.hasFile === false, created.body);
+      const bookId = created.json().data?.id as number;
+
+      // 通过统一同步接口上报进度（document 用同一个 md5）
+      const push = await api({
+        method: 'PUT',
+        url: '/api/sync/progress',
+        headers: nfAuth,
+        payload: { document: docMd5, progress: '/body/DocFragment[7]/text().0', percentage: 0.63, device: 'Kindle', device_id: 'nf-1' },
+      });
+      check('无文件的书能上报同步进度', push.statusCode === 200, push.body);
+
+      const detail = await api({ method: 'GET', url: `/api/books/${bookId}`, headers: nfAuth });
+      check(
+        '进度已挂到该书（63%）',
+        Math.round(detail.json().data?.progressPercent ?? -1) === 63,
+        detail.json().data?.progressPercent,
+      );
+
+      // 阅读时长也要能记到这本书上
+      const session = await api({
+        method: 'PUT',
+        url: '/api/sync/progress',
+        headers: nfAuth,
+        payload: {
+          document: docMd5,
+          progress: '/body/DocFragment[9]/text().0',
+          percentage: 0.8,
+          device: 'Kindle',
+          device_id: 'nf-1',
+          readingSeconds: 1800,
+        },
+      });
+      check('无文件的书能记录阅读时长', session.statusCode === 200, session.body);
+
+      const after = await api({ method: 'GET', url: `/api/books/${bookId}`, headers: nfAuth });
+      check(
+        '阅读时长已累计到该书',
+        (after.json().data?.totalReadingSeconds ?? 0) >= 1800,
+        after.json().data?.totalReadingSeconds,
+      );
+
+      // 统计接口同样不依赖文件
+      const dash = await api({ method: 'GET', url: '/api/stats/dashboard', headers: nfAuth });
+      check('统计接口正常工作', dash.statusCode === 200 && dash.json().data?.status !== undefined, dash.body);
+
+      // KOSync 走的也是 document，与书库文件无关
+      const kKey = createHash('md5').update(nfPassword).digest('hex');
+      const kPut = await api({
+        method: 'PUT',
+        url: '/syncs/progress',
+        headers: { 'x-auth-user': 'nofileuser', 'x-auth-key': kKey },
+        payload: { document: docMd5, progress: '/body/DocFragment[11]/text().0', percentage: 0.9, device: 'Kindle', device_id: 'nf-2' },
+      });
+      check('KOSync 也能同步这本书的进度', kPut.statusCode === 200, kPut.body);
+
+      const kGet = await api({
+        method: 'GET',
+        url: `/syncs/progress/${docMd5}`,
+        headers: { 'x-auth-user': 'nofileuser', 'x-auth-key': kKey },
+      });
+      check('KOSync 能拉回该进度', kGet.json().percentage === 0.9, kGet.json());
+
+      await api({ method: 'DELETE', url: `/api/books/${bookId}`, headers: nfAuth });
     }
 
     /* ---------------------- 5c. 预签名直传 ---------------------- */

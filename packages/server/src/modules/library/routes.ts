@@ -19,6 +19,8 @@ import {
 } from '@readsync/shared';
 import { badRequest, validationFailed } from '../../errors.js';
 import { auditContextFrom, recordAudit } from '../../lib/audit.js';
+import { forbidden } from '../../errors.js';
+import { getSiteSettings } from '../../lib/settings.js';
 import { currentUser, requireAuth } from '../../middleware/auth.js';
 import { completeSession, createSession, discardSession, writeChunk } from './chunked.js';
 import { completePresignedUpload, presignUpload } from './presign.js';
@@ -45,6 +47,25 @@ import {
  */
 export async function registerLibraryRoutes(app: FastifyInstance): Promise<void> {
   const auth = { preHandler: requireAuth };
+
+  /**
+   * 上传总开关（站点设置 uploadEnabled）。
+   *
+   * 关掉之后所有上传端点一律拒绝，但**登记书目**照旧 —— 阅读进度同步与统计
+   * 完全不依赖文件，只有下载与版本回滚需要。这是给「服务器在 CDN 后面传大文件
+   * 总失败，但其实只要同步」这类部署准备的出口。
+   *
+   * 放在 preHandler：此时 multipart 的请求体还没被消费，直接回绝不会白读
+   * 几百 MB。前端在开关关闭时本就不显示上传入口，这里是服务端的兜底。
+   */
+  const assertUploadEnabled = async (): Promise<void> => {
+    if (!getSiteSettings().uploadEnabled) {
+      throw forbidden('本站已关闭文件上传，只能登记书目信息');
+    }
+  };
+  // 用 preHandler 数组：requireAuth 必须先行，否则未登录用户会先看到
+  // 「已关闭上传」而不是 401，等于泄露了站点配置
+  const requireUploadEnabled = { preHandler: [requireAuth, assertUploadEnabled] };
 
   /** 书库列表：搜索 / 过滤 / 排序 / 分页 */
   app.get('/api/books', auth, async (req) => {
@@ -110,7 +131,7 @@ export async function registerLibraryRoutes(app: FastifyInstance): Promise<void>
   });
 
   /** 上传并登记新书（核心接口，multipart） */
-  app.post('/api/books/upload', auth, async (req) => {
+  app.post('/api/books/upload', requireUploadEnabled, async (req) => {
     const user = currentUser(req);
     const file = await takeUploadedFile(req);
     const { book, deduped } = await uploadBook(user.id, file);
@@ -162,7 +183,7 @@ export async function registerLibraryRoutes(app: FastifyInstance): Promise<void>
   });
 
   /** 上传新版本 */
-  app.post('/api/books/:id/versions', auth, async (req) => {
+  app.post('/api/books/:id/versions', requireUploadEnabled, async (req) => {
     const user = currentUser(req);
     const bookId = parseIdParam(req.params);
     const file = await takeUploadedFile(req);
@@ -185,7 +206,7 @@ export async function registerLibraryRoutes(app: FastifyInstance): Promise<void>
    * （Nginx client_max_body_size 默认 1 MB、Cloudflare 橙云与 Tunnel 的体积
    * 与超时上限），这些都调不了。切成小块后每个请求都很小很快，限制自然不触发。
    */
-  app.post('/api/uploads', auth, async (req) => {
+  app.post('/api/uploads', requireUploadEnabled, async (req) => {
     const user = currentUser(req);
     const input = parseOrThrow(() => chunkedUploadInitSchema.parse(req.body));
 
@@ -231,7 +252,7 @@ export async function registerLibraryRoutes(app: FastifyInstance): Promise<void>
    */
   app.put<{ Params: { uploadId: string; index: string } }>(
     '/api/uploads/:uploadId/parts/:index',
-    auth,
+    requireUploadEnabled,
     async (req) => {
       const user = currentUser(req);
       const index = Number(req.params.index);
@@ -250,7 +271,7 @@ export async function registerLibraryRoutes(app: FastifyInstance): Promise<void>
   /** 合并分片并入库；成功后会话目录被清理，uploadId 随即失效 */
   app.post<{ Params: { uploadId: string } }>(
     '/api/uploads/:uploadId/complete',
-    auth,
+    requireUploadEnabled,
     async (req) => {
       const user = currentUser(req);
       const outcome = await completeSession(req.params.uploadId, user.id);
@@ -295,7 +316,7 @@ export async function registerLibraryRoutes(app: FastifyInstance): Promise<void>
    * 数据完全不经过本服务，因此也不受任何前置反向代理/CDN 的体积与超时限制。
    * 命中秒传时直接返回已有书籍，一个字节都不用传。
    */
-  app.post('/api/uploads/presign', auth, async (req) => {
+  app.post('/api/uploads/presign', requireUploadEnabled, async (req) => {
     const user = currentUser(req);
     const input = parseOrThrow(() => presignUploadSchema.parse(req.body));
 
@@ -326,7 +347,7 @@ export async function registerLibraryRoutes(app: FastifyInstance): Promise<void>
    * 客户端说传完了不算数：这里会按 md5 重算对象位置核对，再去存储上确认
    * 对象确实存在、大小相符、ETag 与声明的 MD5 一致。
    */
-  app.post('/api/uploads/presign/complete', auth, async (req) => {
+  app.post('/api/uploads/presign/complete', requireUploadEnabled, async (req) => {
     const user = currentUser(req);
     const input = parseOrThrow(() => presignCompleteSchema.parse(req.body));
 

@@ -32,6 +32,7 @@
 - **统一同步接口** —— 标准 REST + Bearer 令牌，方便其他阅读软件接入，附带[完整接口参考](docs/api-reference.md)
 - **多存储后端** —— 本地磁盘 / WebDAV（坚果云、Nextcloud）/ S3 兼容对象存储（阿里云 OSS、腾讯云 COS、MinIO、R2）/ 插件自定义，配置见[存储后端配置指南](docs/storage-setup.md)
 - **书库元数据与版本管理** —— 本地只存 MD5、书目信息与版本记录，书籍文件放在外部网盘；支持秒传去重、版本历史与回滚
+- **可以完全不存文件** —— 只登记书目与 MD5，进度同步与统计照常工作；上传可由管理员一键关闭，见[只登记书目](docs/metadata-only.md)
 - **文件中转** —— S3 走预签名 URL 直连下载，其余后端由服务端中转
 
 ### 阅读统计
@@ -292,6 +293,20 @@ curl -s http://<你的服务器地址>:3000/healthcheck
 **上传报「尚未配置默认存储」**
 
 去 **设置 → 存储管理** 建一个存储并**设为默认** —— 没指定存储时文件放哪是由它决定的。S3 / R2 / OSS / COS / MinIO、WebDAV、本地磁盘的字段填法与各服务商的取值见 [存储后端配置指南](docs/storage-setup.md)。
+
+**大文件怎么都传不上去，但我只需要进度同步**
+
+不必再跟网络较劲：管理后台「站点设置 → 上传限制 → 允许上传书籍文件」关掉，然后在书库页用「**登记书目**」——填书名与 MD5 即可。**阅读进度同步、阅读时长统计、书库管理全都不依赖文件**，只有下载和版本回滚需要。详见[只登记书目](docs/metadata-only.md)。
+
+注意 MD5 要填阅读器里显示的那个文档标识，服务端正是靠它把进度挂到这本书上。
+
+**多人共用一个公网 IP，老是提示「操作过于频繁」**
+
+登录限流按「IP + 路由」计数（默认 10 次/分钟）。一家人或小团队共享出口 IP 时容易被误伤，在 `.env` 里整体放宽：
+
+```bash
+READSYNC_RATE_LIMIT_FACTOR=3   # 全部接口配额 ×3
+```
 
 **上传书籍失败，提示「上传失败，网络连接中断」**
 
@@ -583,7 +598,10 @@ cd packages/server
 READSYNC_DATA_DIR=./data-smoke npx tsx src/scripts/smoke-crypto.ts
 READSYNC_DATA_DIR=./data-smoke npx tsx src/scripts/smoke-db.ts
 
-# 端到端集成测试（146 项断言：认证 / 2FA / 恢复码 / 上传 / 分片 / 预签名直传 / 跨域 / 存储浏览 / 同步 / 统计 / KOSync / 权限隔离）
+# 数据库迁移校验（含数据保留与外键完整性），会自建旧版库再升级
+READSYNC_DATA_DIR=./data-mig npx tsx src/scripts/check-migration.ts
+
+# 端到端集成测试（168 项断言：认证 / 2FA / 恢复码 / 上传 / 分片 / 预签名直传 / 只登记书目 / 跨域 / 同步 / 统计 / KOSync / 权限隔离）
 READSYNC_DATA_DIR=./data-e2e npx tsx src/scripts/smoke-e2e.ts
 
 # 真实 socket 的大文件整体上传（冒烟测试走进程内 inject，照不出传输层问题）
@@ -627,6 +645,7 @@ READSYNC_DATA_DIR=./data-repro PROXY_STATUS=524 npx tsx src/scripts/repro-proxy-
 
 | 文档 | 内容 |
 |---|---|
+| [docs/metadata-only.md](docs/metadata-only.md) | 只登记书目、不上传文件（哪些功能不依赖文件） |
 | [docs/storage-setup.md](docs/storage-setup.md) | 存储后端配置：S3/R2/OSS/COS/MinIO、WebDAV、本地磁盘 |
 | [docs/storage-cors.md](docs/storage-cors.md) | 对象存储 CORS 配置（预签名直传必读） |
 | [docs/api-reference.md](docs/api-reference.md) | 完整 API 参考，含统一同步接口、分片上传与 KOSync 协议细节 |

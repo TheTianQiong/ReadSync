@@ -91,8 +91,36 @@ export function openDatabase(): DbHandle {
   if (config.READSYNC_AUTO_MIGRATE) {
     try {
       const dir = resolveMigrationsDir();
-      migrate(db, { migrationsFolder: dir });
+      /*
+       * 迁移期间必须关掉外键约束 —— 这是 SQLite 官方推荐的建表迁移做法。
+       *
+       * SQLite 不支持 ALTER COLUMN，drizzle-kit 生成的迁移一律是
+       * 「建新表 → 拷贝 → 删旧表 → 改名」。而删旧表会触发外键动作：
+       * 指向它的 ON DELETE CASCADE 子表会被**清空**，ON DELETE SET NULL
+       * 的列会被**置空**。比如把 books.object_key 改成可空这条迁移，
+       * 若开着外键，`DROP TABLE books` 会顺带清掉全部 book_versions
+       * （版本历史全丢）、并把 reading_sessions / sync_entries 的 book_id
+       * 置空（进度与会话和书库脱钩）—— 而且悄无声息，没有任何报错。
+       *
+       * 注意迁移文件里自带的 PRAGMA foreign_keys 是**没用的**：drizzle 把
+       * 整个迁移包在 BEGIN…COMMIT 里，而 SQLite 规定事务内改不了这个开关。
+       * 只能在事务外、于调用 migrate() 前后自行切换。
+       */
+      raw.pragma('foreign_keys = OFF');
+      try {
+        migrate(db, { migrationsFolder: dir });
+      } finally {
+        raw.pragma('foreign_keys = ON');
+      }
       log.info({ migrationsDir: dir }, '数据库迁移已应用');
+
+      // 外键关掉期间的迁移若写出了悬空引用，必须在这里暴露出来，
+      // 而不是等到某次联表查询悄悄少几行
+      const violations = raw.pragma('foreign_key_check') as unknown[];
+      if (violations.length > 0) {
+        log.error({ violations: violations.slice(0, 10) }, '迁移后存在外键完整性违规');
+        throw new Error(`迁移后外键校验未通过（${violations.length} 处）`);
+      }
     } catch (err) {
       log.error({ err }, '数据库迁移失败');
       throw err;

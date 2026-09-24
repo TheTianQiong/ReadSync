@@ -24,12 +24,23 @@ export const createBookSchema = z.object({
   format: bookFormatSchema.default('epub'),
   /** 文件字节数 */
   size: z.coerce.number().int().min(0),
-  /** 文件 MD5，用于秒传与去重 */
+  /**
+   * 文件 MD5。
+   *
+   * 它不只是去重依据：统一同步接口正是靠 `books.md5 === document`
+   * 把阅读进度挂到书库里的这本书上（见 sync/service.ts）。因此即便是
+   * 只登记书目、不上传文件的书，也应当填真实值，否则进度关联不上。
+   */
   md5: md5Schema,
   /** 存放该文件的存储后端 ID；不传则用默认存储 */
   storageId: z.coerce.number().int().positive().optional(),
-  /** 存储上的对象键 */
-  objectKey: z.string().min(1),
+  /**
+   * 存储上的对象键。
+   *
+   * **留空即表示只登记书目信息、不关联任何文件** —— 用于「不需要在服务器上
+   * 存书，只要阅读进度同步与统计」的场景。此时不要求配置存储后端。
+   */
+  objectKey: z.string().min(1).optional(),
   /** 封面图 URL 或 data URI */
   coverUrl: z.string().max(2048).optional(),
   /** 简介 */
@@ -80,8 +91,9 @@ export interface BookVersion {
   version: number;
   size: number;
   md5: string;
-  objectKey: string;
-  storageId: number;
+  /** 为 null 表示该版本没有关联文件（仅登记书目） */
+  objectKey: string | null;
+  storageId: number | null;
   /** 该版本的备注，例如「修正排版」「替换封面」 */
   note: string | null;
   /** 上传者用户 ID */
@@ -110,8 +122,16 @@ export interface BookSummary {
   totalWords: number | null;
   /** 当前版本号 */
   currentVersion: number;
-  storageId: number;
+  /** 为 null 表示这本书只有书目信息、没有上传过文件 */
+  storageId: number | null;
   storageName: string | null;
+  /**
+   * 是否在服务器侧有可下载的文件。
+   *
+   * 前端据此决定要不要显示「下载」—— 只登记书目的书下载必然 404，
+   * 与其让用户点了才报错，不如一开始就不给这个按钮。
+   */
+  hasFile: boolean;
   /** 该书累计阅读时长（秒） */
   totalReadingSeconds: number;
   lastReadAt: string | null;

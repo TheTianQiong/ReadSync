@@ -231,13 +231,23 @@ export const books = sqliteTable(
     publisher: text('publisher'),
     isbn: text('isbn'),
     format: text('format').notNull().default('epub'),
-    /** 当前版本的文件大小与 MD5（历史版本见 book_versions） */
+    /** 当前版本的文件大小与 MD5（历史版本见 book_versions）；仅登记书目时为 0 与手填值 */
     size: integer('size').notNull().default(0),
+    /**
+     * 文件 MD5。它不只是去重依据 —— 统一同步接口正是靠
+     * `books.md5 === document` 把阅读进度挂到书库里的这本书上，
+     * 因此即便是「只登记书目、不上传文件」的书，这一列也必须填真值。
+     */
     md5: text('md5').notNull(),
-    objectKey: text('object_key').notNull(),
-    storageId: integer('storage_id')
-      .notNull()
-      .references(() => storages.id, { onDelete: 'restrict' }),
+    /**
+     * 对象键与所在的存储后端。
+     *
+     * 允许为空：书籍可以只登记书目信息与 MD5 而完全不上传文件 ——
+     * 本项目的同步与统计都不需要文件，只有下载/版本回滚需要。
+     * 为空即表示「这本书没有文件」。
+     */
+    objectKey: text('object_key'),
+    storageId: integer('storage_id').references(() => storages.id, { onDelete: 'restrict' }),
     currentVersion: integer('current_version').notNull().default(1),
 
     coverUrl: text('cover_url'),
@@ -286,10 +296,9 @@ export const bookVersions = sqliteTable(
     version: integer('version').notNull(),
     size: integer('size').notNull(),
     md5: text('md5').notNull(),
-    objectKey: text('object_key').notNull(),
-    storageId: integer('storage_id')
-      .notNull()
-      .references(() => storages.id, { onDelete: 'restrict' }),
+    // 与 books 同理：仅登记书目时没有对象可指，两列留空
+    objectKey: text('object_key'),
+    storageId: integer('storage_id').references(() => storages.id, { onDelete: 'restrict' }),
     note: text('note'),
     uploadedBy: integer('uploaded_by')
       .notNull()

@@ -5,10 +5,12 @@ import {
   type ListBooksQuery,
   type Paginated,
 } from '@readsync/shared';
-import { BookOpen, Download, Plus, RefreshCw, Search, Trash2 } from 'lucide-react';
+import { BookOpen, BookPlus, Download, Plus, RefreshCw, Search, Trash2 } from 'lucide-react';
 import { useState, type ReactNode } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
+import { BookRegisterDialog } from '../components/BookRegisterDialog';
 import { BookUploadDialog } from '../components/BookUploadDialog';
+import { useAuth } from '../contexts/AuthContext';
 import { Alert } from '../components/ui/Alert';
 import { Badge, StatusBadge } from '../components/ui/Badge';
 import { Button } from '../components/ui/Button';
@@ -61,6 +63,10 @@ export function Library(): ReactNode {
   const [sortBy, setSortBy] = useState<ListBooksQuery['sortBy']>('createdAt');
   const [page, setPage] = useState(1);
   const [uploadOpen, setUploadOpen] = useState(false);
+  const [registerOpen, setRegisterOpen] = useState(false);
+  // 管理员可以关掉文件上传（站点设置），关闭后只保留「登记书目」
+  const { settings } = useAuth();
+  const uploadEnabled = settings?.uploadEnabled !== false;
   const [pendingDelete, setPendingDelete] = useState<BookSummary | null>(null);
   const [deleting, setDeleting] = useState(false);
   const [downloadingId, setDownloadingId] = useState<number | null>(null);
@@ -124,8 +130,18 @@ export function Library(): ReactNode {
           <Button size="sm" variant="ghost" icon={<RefreshCw size={13} />} onClick={reload}>
             刷新
           </Button>
-          <Button size="sm" variant="primary" icon={<Plus size={13} />} onClick={() => setUploadOpen(true)}>
-            上传书籍
+          {uploadEnabled ? (
+            <Button size="sm" variant="primary" icon={<Plus size={13} />} onClick={() => setUploadOpen(true)}>
+              上传书籍
+            </Button>
+          ) : null}
+          <Button
+            size="sm"
+            variant={uploadEnabled ? 'secondary' : 'primary'}
+            icon={<BookPlus size={13} />}
+            onClick={() => setRegisterOpen(true)}
+          >
+            登记书目
           </Button>
         </div>
       </header>
@@ -202,12 +218,25 @@ export function Library(): ReactNode {
           description={
             debouncedSearch || format || readingStatus
               ? '试试调整搜索词或筛选条件'
-              : '支持 EPUB、PDF、MOBI、TXT、ZIP 等常见格式，上传后可在阅读器中通过同步接口关联'
+              : uploadEnabled
+                ? '支持 EPUB、PDF、MOBI、TXT、ZIP 等常见格式，上传后可在阅读器中通过同步接口关联'
+                : '本站已关闭文件上传，填写书名与 MD5 即可登记 —— 阅读进度同步与统计都能正常工作'
           }
           action={
-            <Button size="sm" variant="primary" icon={<Plus size={13} />} onClick={() => setUploadOpen(true)}>
-              上传第一本书
-            </Button>
+            uploadEnabled ? (
+              <Button size="sm" variant="primary" icon={<Plus size={13} />} onClick={() => setUploadOpen(true)}>
+                上传第一本书
+              </Button>
+            ) : (
+              <Button
+                size="sm"
+                variant="primary"
+                icon={<BookPlus size={13} />}
+                onClick={() => setRegisterOpen(true)}
+              >
+                登记第一本书
+              </Button>
+            )
           }
         />
       ) : (
@@ -246,14 +275,18 @@ export function Library(): ReactNode {
                   <TD className="text-right">
                     {/* 阻止冒泡，否则点下载/删除会同时触发行跳转 */}
                     <div className="flex justify-end gap-1" onClick={(event) => event.stopPropagation()}>
-                      <Button
-                        size="sm"
-                        variant="quiet"
-                        aria-label={`下载 ${book.title}`}
-                        loading={downloadingId === book.id}
-                        icon={<Download size={13} />}
-                        onClick={() => void handleDownload(book)}
-                      />
+                      {/* 只登记书目的书没有文件可下，按钮直接不给 —— 
+                          点了必然 404，不如一开始就别让用户白点 */}
+                      {book.hasFile ? (
+                        <Button
+                          size="sm"
+                          variant="quiet"
+                          aria-label={`下载 ${book.title}`}
+                          loading={downloadingId === book.id}
+                          icon={<Download size={13} />}
+                          onClick={() => void handleDownload(book)}
+                        />
+                      ) : null}
                       <Button
                         size="sm"
                         variant="quiet"
@@ -282,6 +315,7 @@ export function Library(): ReactNode {
       )}
 
       <BookUploadDialog open={uploadOpen} onClose={() => setUploadOpen(false)} onUploaded={reload} />
+      <BookRegisterDialog open={registerOpen} onClose={() => setRegisterOpen(false)} onRegistered={reload} />
 
       <ConfirmDialog
         open={pendingDelete !== null}

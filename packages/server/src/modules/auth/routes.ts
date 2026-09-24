@@ -99,8 +99,24 @@ export async function registerAuthRoutes(app: FastifyInstance): Promise<void> {
    * 而 app.ts 的错误处理器只对 AppError 保留 statusCode，普通 Error 会被当成
    * 未处理异常返回 500 —— 前端既拿不到 429 也拿不到 RATE_LIMITED 语义。
    */
+  /**
+   * 全局限流倍数（`READSYNC_RATE_LIMIT_FACTOR`）。
+   *
+   * 默认 1。自托管场景里常见「一家人/一个小团队共用一个公网 IP」，
+   * 按 IP 计的登录限流会把正常使用误伤成「操作过于频繁」；调大这个倍数
+   * 就能放宽全部接口的配额，而不必逐条改代码。
+   *
+   * 调小（如 0.5）则更严格，但注意 0 会被当作 1，别用它来「关闭」限流。
+   */
+  const factor = ((): number => {
+    const raw = Number(process.env.READSYNC_RATE_LIMIT_FACTOR ?? '');
+    return Number.isFinite(raw) && raw > 0 ? raw : 1;
+  })();
+
+  const scaledLimit = (max: number): number => Math.max(1, Math.round(max * factor));
+
   const limited = (max: number, timeWindow: string) => ({
-    max,
+    max: scaledLimit(max),
     timeWindow,
     errorResponseBuilder: () => rateLimited('操作过于频繁，请稍后再试'),
   });
