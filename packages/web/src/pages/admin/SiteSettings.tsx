@@ -55,6 +55,8 @@ export function SiteSettings(): ReactNode {
             .split(/[,，\s]+/)
             .map((item) => item.trim().toLowerCase().replace(/^\./, ''))
             .filter(Boolean),
+          strategy: form.upload.strategy,
+          baseUrl: form.upload.baseUrl.trim(),
         },
       });
       toast.success('站点设置已保存');
@@ -172,6 +174,38 @@ export function SiteSettings(): ReactNode {
               onChange={(event) => setExtensions(event.target.value)}
               rows={2}
               className="font-mono text-xs"
+            />
+          </Field>
+
+          <Field
+            label="上传方式"
+            hint={
+              form.upload.strategy === 'chunked'
+                ? '分片上传：每个请求都很小，能穿过 Nginx、Cloudflare 等对请求体大小与请求时长的限制。有反向代理时选它。'
+                : '整体上传：一次 POST 发完，请求数最少。仅在客户端与服务器之间没有代理限制时可靠（内网直连、本机访问）。'
+            }
+          >
+            <Select
+              value={form.upload.strategy}
+              onChange={(event) =>
+                patch({
+                  upload: { ...form.upload, strategy: event.target.value as 'chunked' | 'direct' },
+                })
+              }
+            >
+              <option value="chunked">分片上传（推荐，兼容反向代理）</option>
+              <option value="direct">整体上传（无代理时更快）</option>
+            </Select>
+          </Field>
+
+          <Field
+            label="上传专用地址"
+            hint="留空表示与本站同源。填了之后上传请求会发往该地址 —— 用于「主站走 CDN、上传另开一个直连子域以绕开 CDN 的请求体与超时限制」。必须是 http(s) 的源地址，不带路径。配置方法见 docs/https-setup.md。"
+          >
+            <Input
+              value={form.upload.baseUrl}
+              placeholder="https://upload.example.com:8443"
+              onChange={(event) => patch({ upload: { ...form.upload, baseUrl: event.target.value } })}
             />
           </Field>
         </CardBody>

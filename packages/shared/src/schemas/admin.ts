@@ -11,6 +11,43 @@ import { paginationQuerySchema } from './common.js';
 
 /* ---------------------------- 站点设置 ---------------------------- */
 
+/**
+ * 上传方式。
+ *
+ * - `chunked`：分片上传。每个请求都很小很快，能穿过反向代理的请求体大小与
+ *   超时限制（Nginx 的 client_max_body_size 默认仅 1 MB；Cloudflare 橙云与
+ *   Tunnel 免费版对体积和时长都有上限且调不了）。慢链路下前端还会自动把分片
+ *   减半重试。**有中间层时这是唯一可靠的选择**，故为默认值。
+ * - `direct`：整份文件一次 POST。请求数最少、服务端逻辑最短，但只在客户端与
+ *   服务端之间没有体积/超时限制时可靠（内网直连、本机访问）。
+ */
+export const uploadStrategySchema = z.enum(['chunked', 'direct']);
+export type UploadStrategy = z.infer<typeof uploadStrategySchema>;
+
+/**
+ * 上传专用地址（可选）。
+ *
+ * 用于「上传走一条不经过 CDN 的通道」这种部署：主站挂在 Cloudflare 后面
+ * （TLS 免维护），而大文件上传另开一个灰云子域直连服务器，绕开 CDN 对请求体
+ * 大小与请求时长的限制。
+ *
+ * 留空表示与主站同源。填了就必须是 http(s) 的**源地址**（含协议与端口、
+ * 不带路径），因为前端要拿它拼 `/api/uploads/...`。
+ */
+export const uploadBaseUrlSchema = z
+  .string()
+  .trim()
+  .max(512)
+  /*
+   * 用正则而不是 new URL()：shared 包的类型环境里没有 URL 全局，
+   * 而且这里要的约束本来就很窄 —— 只允许「协议 + 主机[:端口]」，
+   * 不能带路径、查询串或井号（前端要拿它拼 /api/uploads/...，
+   * 带了路径就会拼出意外结果）。正则比 URL 解析更能直白地表达这一点。
+   */
+  .regex(/^(|https?:\/\/[^\s/?#]+)$/, {
+    message: '上传地址必须形如 https://upload.example.com:8443（含协议，不带路径、查询串或井号）',
+  });
+
 export const siteSettingsSchema = z.object({
   /** 站点名称，展示在前端导航栏与邮件标题 */
   siteName: z.string().trim().min(1).max(64).default('读记服务器'),
@@ -20,17 +57,21 @@ export const siteSettingsSchema = z.object({
   inviteRequired: z.boolean().default(false),
   /** 是否允许通过邮件找回密码 */
   passwordResetEnabled: z.boolean().default(true),
-  /** 上传限制 */
+  /** 上传限制与上传通道 */
   upload: z
     .object({
       maxFileSize: z.coerce.number().int().min(0).default(DEFAULT_MAX_FILE_SIZE),
       allowedExtensions: z
         .array(z.string().trim().toLowerCase().regex(/^[a-z0-9]+$/))
         .default([...DEFAULT_ALLOWED_EXTENSIONS]),
+      strategy: uploadStrategySchema.default('chunked'),
+      baseUrl: uploadBaseUrlSchema.default(''),
     })
     .default({
       maxFileSize: DEFAULT_MAX_FILE_SIZE,
       allowedExtensions: [...DEFAULT_ALLOWED_EXTENSIONS],
+      strategy: 'chunked',
+      baseUrl: '',
     }),
   /** 单用户书库容量上限（字节），0 表示不限制 */
   userQuotaBytes: z.coerce.number().int().min(0).default(0),
@@ -64,6 +105,13 @@ export interface PublicSettings {
     /** 单文件上限（字节），0 表示不限制 */
     maxFileSize: number;
     allowedExtensions: string[];
+    /**
+     * 上传方式。前端据此选分片还是整体上传 ——
+     * 这是运行时可改的站点设置，改完即时生效，不需要重新构建前端。
+     */
+    strategy: UploadStrategy;
+    /** 上传专用地址；空串表示与主站同源 */
+    baseUrl: string;
   };
   /**
    * 服务端是否接受明文密码。

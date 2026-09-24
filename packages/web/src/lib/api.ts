@@ -118,6 +118,40 @@ export interface RequestOptions {
   skipAuthRedirect?: boolean;
 }
 
+/**
+ * 上传专用地址（来自站点设置 `upload.baseUrl`），留空表示与主站同源。
+ *
+ * 用于「上传走一条不经过 CDN 的通道」的部署：主站挂在 Cloudflare 后面享受
+ * 免维护的 TLS，大文件上传另开一个灰云子域直连服务器，绕开 CDN 对请求体大小
+ * 与请求时长的限制。由 AuthContext 在读到站点设置后调用 setUploadBaseUrl 注入，
+ * 因此管理员改完即时生效，不需要重新构建前端。
+ */
+let uploadBaseUrl = '';
+
+export function setUploadBaseUrl(url: string): void {
+  uploadBaseUrl = url.trim().replace(/\/+$/, '');
+}
+
+export function getUploadBaseUrl(): string {
+  return uploadBaseUrl;
+}
+
+/** 上传接口是否为跨域（用于给出更准确的失败提示） */
+export function isUploadCrossOrigin(): boolean {
+  if (!uploadBaseUrl) return false;
+  try {
+    return new URL(uploadBaseUrl).origin !== window.location.origin;
+  } catch {
+    return false;
+  }
+}
+
+/** 把上传路径拼到上传地址上；与主站同源时返回相对路径 */
+function resolveUploadUrl(path: string): string {
+  const normalized = path.startsWith('/api/') ? path : `/api${path.startsWith('/') ? path : `/${path}`}`;
+  return uploadBaseUrl ? `${uploadBaseUrl}${normalized}` : normalized;
+}
+
 /** 把 '/auth/login' 之类的相对路径补成 '/api/auth/login'；已是绝对 API 路径则原样保留 */
 function resolveUrl(path: string, query?: Record<string, QueryValue>): string {
   const base = path.startsWith('/api/') || path === '/api' ? path : `/api${path.startsWith('/') ? path : `/${path}`}`;
@@ -245,7 +279,7 @@ export function upload<T>(
 ): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     const xhr = new XMLHttpRequest();
-    xhr.open('POST', resolveUrl(path), true);
+    xhr.open('POST', resolveUploadUrl(path), true);
     xhr.responseType = 'text';
 
     const token = getAccessToken();
@@ -352,26 +386,41 @@ export async function uploadChunked(
   const authHeaders: Record<string, string> = token ? { Authorization: `Bearer ${token}` } : {};
 
   const abortSession = (id: string): void => {
-    void fetch(resolveUrl(`/uploads/${id}`), { method: 'DELETE', headers: authHeaders }).catch(
+    void fetch(resolveUploadUrl(`/uploads/${id}`), { method: 'DELETE', headers: authHeaders }).catch(
       () => undefined,
     );
   };
 
   /** 跑完一轮：建会话 → 逐片上传 → 合并。任何一步失败都由调用方决定是否降级重试 */
   const runOnce = async (chunkSize?: number): Promise<BookDetail> => {
-    const initRes = await fetch(resolveUrl('/uploads'), {
-      method: 'POST',
-      headers: { ...authHeaders, 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        filename: file.name,
-        size: file.size,
-        mode: target.mode,
-        ...(target.mode === 'version' ? { bookId: target.bookId } : {}),
-        ...(chunkSize !== undefined ? { chunkSize } : {}),
-        fields,
-      }),
-      ...(options.signal ? { signal: options.signal } : {}),
-    });
+    /*
+     * 建会话这一步的失败**绝不能**按「链路慢」去重试。
+     *
+     * 它是一个 134 字节的 JSON POST，再慢的链路也传得完；它失败只可能是
+     * 连不上、跨域被拦、或令牌/参数有问题。若和分片的超时混为一谈，
+     * 一次 CORS 配置失误会被演成「重试 6 轮后报上传持续超时」，
+     * 把排查方向整个带偏 —— 而这类问题恰恰是「上传走独立域名」最容易踩的。
+     */
+    let initRes: Response;
+    try {
+      initRes = await fetch(resolveUploadUrl('/uploads'), {
+        method: 'POST',
+        headers: { ...authHeaders, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          filename: file.name,
+          size: file.size,
+          mode: target.mode,
+          ...(target.mode === 'version' ? { bookId: target.bookId } : {}),
+          ...(chunkSize !== undefined ? { chunkSize } : {}),
+          fields,
+        }),
+        ...(options.signal ? { signal: options.signal } : {}),
+      });
+    } catch (err) {
+      if (err instanceof DOMException && err.name === 'AbortError') throw err;
+      throw new ApiError('NETWORK_ERROR', uploadUnreachableHint(), 0);
+    }
+
     const init = (await unwrap<unknown>(await readBody(initRes), initRes.status, {})) as {
       uploadId: string;
       chunkSize: number;
@@ -386,17 +435,25 @@ export async function uploadChunked(
         const start = index * init.chunkSize;
         const blob = file.slice(start, Math.min(start + init.chunkSize, file.size));
 
-        const res = await fetch(resolveUrl(`/uploads/${uploadId}/parts/${index}`), {
-          method: 'PUT',
-          headers: { ...authHeaders, 'Content-Type': 'application/octet-stream' },
-          body: blob,
-          ...(options.signal ? { signal: options.signal } : {}),
-        });
+        let res: Response;
+        try {
+          res = await fetch(resolveUploadUrl(`/uploads/${uploadId}/parts/${index}`), {
+            method: 'PUT',
+            headers: { ...authHeaders, 'Content-Type': 'application/octet-stream' },
+            body: blob,
+            ...(options.signal ? { signal: options.signal } : {}),
+          });
+        } catch (err) {
+          if (err instanceof DOMException && err.name === 'AbortError') throw err;
+          // 分片阶段拿不到响应（连接被重置/断流）：这才是「这一片传不完」的典型形态，
+          // 交给上层减半重试。用 UPLOAD_CHUNK_FAILED 标记，与建会话失败区分开。
+          throw new ApiError('UPLOAD_CHUNK_FAILED', `第 ${index + 1}/${totalChunks} 片传输中断`, 0);
+        }
 
         if (!res.ok) {
           const text = await res.text().catch(() => '');
           throw new ApiError(
-            res.status === 401 ? 'UNAUTHORIZED' : 'INTERNAL_ERROR',
+            res.status === 401 ? 'UNAUTHORIZED' : 'UPLOAD_CHUNK_FAILED',
             `第 ${index + 1}/${totalChunks} 片上传失败（HTTP ${res.status}）${extractMessage(text)}`,
             res.status,
           );
@@ -407,7 +464,7 @@ export async function uploadChunked(
         options.onProgress?.(Math.min(99, Math.round((done / totalChunks) * 99)));
       }
 
-      const doneRes = await fetch(resolveUrl(`/uploads/${uploadId}/complete`), {
+      const doneRes = await fetch(resolveUploadUrl(`/uploads/${uploadId}/complete`), {
         method: 'POST',
         headers: { ...authHeaders, 'Content-Type': 'application/json' },
         body: '{}',
@@ -467,19 +524,31 @@ export async function uploadChunked(
   throw lastError instanceof Error ? lastError : new Error('上传失败');
 }
 
+/** 建会话阶段连不上时的提示；跨域时要把 CORS 这一最常见原因说清楚 */
+function uploadUnreachableHint(): string {
+  if (!isUploadCrossOrigin()) {
+    return '无法连接服务器，请检查网络或后端是否已启动';
+  }
+  return (
+    `无法连接上传地址 ${getUploadBaseUrl()}。该地址与本站不同源，请确认：` +
+    `① 上传地址可从浏览器直接访问且证书有效；② 服务器的 CORS 白名单包含本站域名` +
+    `（设 READSYNC_CORS_ORIGINS 时需一并包含，详见 docs/https-setup.md）。`
+  );
+}
+
 /**
- * 判断错误是否属于「链路太慢」——只有这类才值得减小分片重试。
+ * 判断错误是否属于「这一片在这个链路上传不完」——只有这类才值得减小分片重试。
+ *
+ * 关键前提：只认**分片阶段**的失败。建会话是 134 字节的请求，它失败必然不是
+ * 「片太大」，减半重试毫无意义，只会把 CORS/连通性问题演成「上传持续超时」。
  *
  * 413 也算：那是中间层明确说「这个请求体太大」，减小分片正好对症。
  * 而 400/401/415 属于请求本身有问题，重试多少次都一样，应当直接报错。
  */
 function isSlowLinkError(err: unknown): boolean {
   if (err instanceof DOMException && err.name === 'AbortError') return false;
-  if (err instanceof ApiError) {
-    return err.status === 0 || err.status === 413 || err.status === 408 || err.status === 504 || err.status === 524;
-  }
-  // fetch 本身抛错（连接被重置、断流）也按链路问题处理
-  return err instanceof TypeError;
+  if (!(err instanceof ApiError) || err.code !== 'UPLOAD_CHUNK_FAILED') return false;
+  return err.status === 0 || err.status === 413 || err.status === 408 || err.status === 504 || err.status === 524;
 }
 
 function formatKB(bytes: number): string {

@@ -113,10 +113,34 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
     crossOriginResourcePolicy: { policy: 'cross-origin' },
   });
 
+  /**
+   * 跨域白名单。
+   *
+   * 主站自己的 origin 必须始终在列：上传可以配到另一条通道上（如绕开 CDN 的
+   * 灰云子域），那时上传请求是**从主站页面发往上传地址**的跨域请求，上传地址
+   * 这一侧必须放行主站 origin。若只认 READSYNC_CORS_ORIGINS 里手填的值，
+   * 管理员设了上传地址却忘了同步 CORS 配置，浏览器就会直接拦掉上传 ——
+   * 而报错是「CORS 预检失败」，和上传功能看起来毫无关系，极难排查。
+   */
+  const corsOrigins = ((): true | string[] => {
+    if (config.corsOrigins.length === 0) return true; // 未限制，反射任意来源
+    const list = [...config.corsOrigins];
+    try {
+      const self = new URL(config.READSYNC_BASE_URL).origin;
+      if (!list.includes(self)) list.push(self);
+    } catch {
+      // READSYNC_BASE_URL 非法时已在上面的 CSP 逻辑里按 HTTP 处理，这里不重复报错
+    }
+    return list;
+  })();
+
   await app.register(cors, {
-    origin: config.corsOrigins.length > 0 ? config.corsOrigins : true,
+    origin: corsOrigins,
     credentials: true,
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS', 'PROPFIND'],
+    // 分片上传用 PUT + application/octet-stream，且要带 Authorization，
+    // 三者都会触发预检；这里显式放行，不依赖插件对请求头的反射行为
+    allowedHeaders: ['Content-Type', 'Authorization', 'Accept', 'X-Requested-With'],
   });
 
   await app.register(cookie, {

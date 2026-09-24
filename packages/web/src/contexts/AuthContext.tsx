@@ -8,7 +8,14 @@ import {
   useState,
   type ReactNode,
 } from 'react';
-import { UNAUTHORIZED_EVENT, api, clearTokens, getAccessToken, setTokens } from '../lib/api';
+import {
+  UNAUTHORIZED_EVENT,
+  api,
+  clearTokens,
+  getAccessToken,
+  setTokens,
+  setUploadBaseUrl,
+} from '../lib/api';
 import { buildPasswordPayload, setPlaintextFallbackAllowed } from '../lib/crypto';
 
 /**
@@ -76,6 +83,11 @@ export function AuthProvider({ children }: { children: ReactNode }): ReactNode {
     // 非安全上下文（http://内网IP）下浏览器不提供 WebCrypto，前端无法加密；
     // 只有服务端显式开启该开关时才降级为明文提交，否则明确报错而不是默默发出明文。
     setPlaintextFallbackAllowed(publicSettings?.allowPlaintextPassword === true);
+
+    // 把「上传专用地址」注入接口层。上传可以配到另一条通道（如绕开 CDN 的
+    // 灰云子域）上，接口层需要知道往哪发；这是运行时可改的站点设置，
+    // 管理员改完刷新页面即生效，无需重新构建前端。
+    setUploadBaseUrl(publicSettings?.upload?.baseUrl ?? '');
 
     setInitialized(bootstrapResult.status === 'fulfilled' ? bootstrapResult.value.initialized : true);
   }, []);

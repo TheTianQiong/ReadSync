@@ -40,6 +40,8 @@ export function BookUploadDialog({
   // 站点单文件上限/允许的类型。选文件时就据此预检，避免传完才被拒
   const { settings } = useAuth();
   const maxFileSize = settings?.upload?.maxFileSize ?? 0;
+  // 上传方式由站点设置决定（默认分片，见 handleUpload 里的说明）
+  const strategy = settings?.upload?.strategy ?? 'chunked';
 
   const [file, setFile] = useState<File | null>(null);
   const [title, setTitle] = useState('');
@@ -162,12 +164,13 @@ export function BookUploadDialog({
     setProgress(0);
 
     /*
-     * 一律走分片上传，不再用整体 POST。
+     * 走分片还是整体上传，由管理员在「站点设置 → 上传方式」里定。
      *
-     * 整体上传只在「客户端与服务端之间没有任何中间层」时才可靠：Nginx 的
-     * client_max_body_size 默认 1 MB，Cloudflare 橙云与 Tunnel 对请求体大小和
-     * 请求时长都有上限且免费版调不了。这些限制服务端绕不过去，只有把请求切小
-     * 才能解决 —— 而小文件走分片也完全没问题，没必要为此维护两条代码路径。
+     * 默认分片：整体上传只在「客户端与服务端之间没有任何中间层」时才可靠 ——
+     * Nginx 的 client_max_body_size 默认 1 MB，Cloudflare 橙云与 Tunnel 对请求体
+     * 大小和请求时长都有上限且免费版调不了。把请求切小是唯一能绕开它们的办法。
+     * 而内网直连、本机访问这类没有中间层的场景，整体上传请求数更少、更直接，
+     * 所以保留这个选项交给管理员判断。
      */
     const fields: Record<string, string> = {};
     if (mode === 'create') {
@@ -185,16 +188,28 @@ export function BookUploadDialog({
     }
 
     try {
-      await api.uploadChunked(
-        file,
-        fields,
-        mode === 'create' ? { mode: 'create' } : { mode: 'version', bookId: Number(bookId) },
-        {
-          onProgress: setProgress,
-          // 链路慢而降级重试时得让用户看见，否则进度条归零会像是卡死了
-          onNotice: setNotice,
-        },
-      );
+      if (strategy === 'direct') {
+        // 整体上传：沿用 multipart 端点，字段随表单一起发
+        const form = new FormData();
+        form.append('file', file);
+        for (const [key, value] of Object.entries(fields)) form.append(key, value);
+        await api.upload(
+          mode === 'create' ? '/books/upload' : `/books/${bookId}/versions`,
+          form,
+          { onProgress: setProgress },
+        );
+      } else {
+        await api.uploadChunked(
+          file,
+          fields,
+          mode === 'create' ? { mode: 'create' } : { mode: 'version', bookId: Number(bookId) },
+          {
+            onProgress: setProgress,
+            // 链路慢而降级重试时得让用户看见，否则进度条归零会像是卡死了
+            onNotice: setNotice,
+          },
+        );
+      }
       toast.success(mode === 'create' ? '上传完成' : '新版本已上传');
       onUploaded();
       onClose();

@@ -28,6 +28,8 @@ interface InjectResponse {
   statusCode: number;
   body: string;
   rawPayload: Buffer;
+  /** 响应头（CORS 相关断言需要读它） */
+  headers: Record<string, string | string[] | undefined>;
   json<T = any>(): T;
 }
 
@@ -137,6 +139,9 @@ async function main(): Promise<void> {
     const pubUpload = pubSettings.json().data?.upload;
     check('公开设置含单文件上限（供前端上传前预检）', typeof pubUpload?.maxFileSize === 'number', pubUpload);
     check('公开设置含允许的扩展名', Array.isArray(pubUpload?.allowedExtensions) && pubUpload.allowedExtensions.includes('epub'), pubUpload);
+    // 上传方式与上传地址由前端消费，必须随公开设置下发（改完即时生效，无需重建前端）
+    check('公开设置含上传方式，默认分片', pubUpload?.strategy === 'chunked', pubUpload?.strategy);
+    check('公开设置含上传专用地址，默认空（同源）', pubUpload?.baseUrl === '', pubUpload?.baseUrl);
 
     /* ---------------------------- 2. 初始化管理员 ---------------------------- */
     section('2. 初始化管理员');
@@ -676,6 +681,85 @@ async function main(): Promise<void> {
     check('管理员可读取系统信息', sysInfo.statusCode === 200, sysInfo.body);
 
     /* ---------------------------- 10. 审计与设置 ---------------------------- */
+    /* ---------------- 9b. 上传走独立子域（跨域） ---------------- */
+    section('9b. 上传专用地址与跨域');
+    {
+      // 管理员配一条独立的上传通道（如绕开 CDN 的灰云子域）
+      const setUpload = await api({
+        method: 'PATCH',
+        url: '/api/admin/settings',
+        headers: auth,
+        payload: {
+          upload: { strategy: 'direct', baseUrl: 'https://upload.example.com:8443' },
+        },
+      });
+      check('可设置上传方式与上传专用地址', setUpload.statusCode === 200, setUpload.body);
+
+      const pub2 = await api({ method: 'GET', url: '/api/system/settings' });
+      check('上传设置随公开设置下发', pub2.json().data?.upload?.baseUrl === 'https://upload.example.com:8443', pub2.json().data?.upload);
+      check('上传方式变更随公开设置下发', pub2.json().data?.upload?.strategy === 'direct', pub2.json().data?.upload?.strategy);
+
+      // 带路径的地址会让前端拼出意外 URL，必须拒绝
+      const badUrl = await api({
+        method: 'PATCH',
+        url: '/api/admin/settings',
+        headers: auth,
+        payload: { upload: { baseUrl: 'https://upload.example.com/api' } },
+      });
+      check('上传专用地址拒绝带路径的值', badUrl.statusCode === 400, badUrl.body);
+
+      const badScheme = await api({
+        method: 'PATCH',
+        url: '/api/admin/settings',
+        headers: auth,
+        payload: { upload: { baseUrl: 'ftp://upload.example.com' } },
+      });
+      check('上传专用地址拒绝非 http(s) 协议', badScheme.statusCode === 400, badScheme.body);
+
+      // 分片上传走的是 PUT + application/octet-stream + Authorization，
+      // 三项都会触发 CORS 预检；跨域部署下这里不通过，上传会被浏览器直接拦掉
+      const preflight = await api({
+        method: 'OPTIONS',
+        url: '/api/uploads',
+        headers: {
+          origin: 'http://localhost:80',
+          'access-control-request-method': 'POST',
+          'access-control-request-headers': 'authorization,content-type',
+        },
+      });
+      const allowOrigin = String(preflight.headers['access-control-allow-origin'] ?? '');
+      check('上传端点允许主站 origin 跨域', allowOrigin === 'http://localhost:80', allowOrigin);
+      check(
+        '预检放行 Authorization 与 Content-Type',
+        /authorization/i.test(String(preflight.headers['access-control-allow-headers'] ?? '')),
+        preflight.headers['access-control-allow-headers'],
+      );
+
+      const putPreflight = await api({
+        method: 'OPTIONS',
+        url: '/api/uploads/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/parts/0',
+        headers: {
+          origin: 'http://localhost:80',
+          'access-control-request-method': 'PUT',
+          'access-control-request-headers': 'authorization,content-type',
+        },
+      });
+      check(
+        '分片 PUT 的预检放行',
+        String(putPreflight.headers['access-control-allow-origin'] ?? '') === 'http://localhost:80',
+        putPreflight.headers['access-control-allow-origin'],
+      );
+
+      // 复原，避免影响后续用例（也顺带验证配置可回退）
+      const resetUpload = await api({
+        method: 'PATCH',
+        url: '/api/admin/settings',
+        headers: auth,
+        payload: { upload: { strategy: 'chunked', baseUrl: '' } },
+      });
+      check('上传设置可回退到默认', resetUpload.statusCode === 200, resetUpload.body);
+    }
+
     section('10. 审计与站点设置');
     const audit = await api({ method: 'GET', url: '/api/admin/audit', headers: auth });
     check('审计日志有记录', audit.statusCode === 200 && audit.json().data?.total > 0, audit.body);

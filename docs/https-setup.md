@@ -144,6 +144,74 @@ READSYNC_TRUST_PROXY=true                         # 位于反向代理之后，�
 
 ---
 
+## 五之二、上传走独立子域（绕开 CDN 的请求体与超时限制）
+
+**适用场景**：主站挂在 Cloudflare（橙云 / Tunnel）后面享受免维护的 TLS，但大文件上传总是失败。原因是 CDN 边缘对请求体大小和请求时长都有上限（免费版尤其严），而这些限制**用户调不了**。
+
+做法：另开一个**灰云（DNS only）**子域直连服务器，只让上传走这条路。
+
+### 1. 为什么灰云 + Tunnel 不能共存
+
+Cloudflare Tunnel 的 DNS 记录是指向 `<UUID>.cfargotunnel.com` 的 CNAME，官方明确该子域**只为同一账号内的记录做代理** —— 它本身就是 Cloudflare 边缘的入口，不是能公网回源的地址。把它改成灰云，隧道立即失效。
+
+所以这里的灰云子域**必须指向服务器的真实 IP**，走的是完全独立的另一条通道，与 Tunnel 无关。
+
+### 2. 为什么必须是 HTTPS
+
+主站是 HTTPS，浏览器会拦截「HTTPS 页面发往 HTTP 地址」的请求（混合内容）。所以 `upload.你的域名` 必须能终止 TLS，证书得自己出。
+
+### 3. 解析与证书
+
+```bash
+# ① 加一条灰云 A 记录：upload.example.com → 服务器公网 IP（务必是灰云，不要开代理）
+# ② 用 DNS 验证签证书（不需要 80/443，未备案也能用）
+export CF_Token="你的 Cloudflare API Token"   # 需 Zone:DNS:Edit 权限
+acme.sh --issue --dns dns_cf -d upload.example.com
+```
+
+### 4. 反代监听非标准端口
+
+```bash
+# /etc/caddy/Caddyfile
+upload.example.com:8443 {
+    tls /etc/caddy/certs/upload.example.com/fullchain.pem \
+        /etc/caddy/certs/upload.example.com/privkey.pem
+    reverse_proxy 127.0.0.1:3000
+}
+```
+
+```bash
+sudo systemctl reload caddy
+# 云厂商安全组放行 8443/tcp
+```
+
+> 上传子域反代到**同一个后端**（`127.0.0.1:3000`）即可，不需要另起一个 ReadSync 实例 —— 上传接口与主站是同一套，只是从另一个域名进来。
+
+### 5. 告诉 ReadSync 用这条通道
+
+管理后台「站点设置 → 上传」两项：
+
+| 项 | 值 |
+|---|---|
+| 上传方式 | 分片上传（推荐）或整体上传 |
+| 上传专用地址 | `https://upload.example.com:8443` |
+
+保存后**刷新页面即生效**，不需要重新构建前端。
+
+### 6. 跨域
+
+主站与上传子域是不同 origin，上传是跨域请求。服务端已自动把 `READSYNC_BASE_URL` 的 origin 加入 CORS 白名单，正常情况下**无需额外配置**。
+
+只有当你显式设置了 `READSYNC_CORS_ORIGINS` 时才需要留意 —— 但那也被自动并入了，不会漏。
+
+若仍报跨域错误，从浏览器 F12 的 Network 里看 `POST /api/uploads` 那条：**预检（OPTIONS）失败**说明 CORS 没放行，**预检通过但 PUT 失败**则多半是证书或端口没通。
+
+### 7. 回滚
+
+把「上传专用地址」清空即恢复走主站，无需改任何部署配置。
+
+---
+
 ## 六、验证
 
 ```bash
