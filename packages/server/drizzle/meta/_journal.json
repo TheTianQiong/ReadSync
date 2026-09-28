@@ -15,6 +15,13 @@
       "when": 1790241881482,
       "tag": "0001_nasty_night_nurse",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1790602851521,
+      "tag": "0002_cloudy_callisto",
+      "breakpoints": true
     }
   ]
 }

@@ -25,13 +25,19 @@ export const createBookSchema = z.object({
   /** 文件字节数 */
   size: z.coerce.number().int().min(0),
   /**
-   * 文件 MD5。
+   * 整文件 MD5，用于秒传去重。
    *
-   * 它不只是去重依据：统一同步接口正是靠 `books.md5 === document`
-   * 把阅读进度挂到书库里的这本书上（见 sync/service.ts）。因此即便是
-   * 只登记书目、不上传文件的书，也应当填真实值，否则进度关联不上。
+   * **它不用于关联阅读进度** —— 阅读器上报的是「采样 MD5」（见 documentId），
+   * 与整文件 MD5 永不相等，早先拿它比对导致上传的书一直关联不上进度。
    */
   md5: md5Schema,
+  /**
+   * 阅读器的文档标识（KOReader 的采样 MD5）。
+   *
+   * 只登记书目时必须由用户填 —— 服务端没有文件，算不出来。它才是把
+   * 阅读进度挂到这本书上的钥匙。留空则关联退化为按整文件 MD5、再按书名。
+   */
+  documentId: md5Schema.optional(),
   /** 存放该文件的存储后端 ID；不传则用默认存储 */
   storageId: z.coerce.number().int().positive().optional(),
   /**
@@ -111,7 +117,14 @@ export interface BookSummary {
   isbn: string | null;
   format: (typeof BOOK_FORMATS)[number];
   size: number;
+  /** 整文件 MD5（去重用）；**不用于关联阅读进度** */
   md5: string;
+  /**
+   * 阅读器的文档标识（采样 MD5）；null 表示未知。
+   *
+   * 拿它和阅读器里显示的文档标识对比，就能判断这本书能不能收到进度。
+   */
+  documentId: string | null;
   coverUrl: string | null;
   description: string | null;
   tags: string[];
@@ -263,6 +276,18 @@ export const presignUploadSchema = z.object({
     .transform((v) => v.toLowerCase()),
   mode: z.enum(['create', 'version']).default('create'),
   bookId: z.coerce.number().int().positive().optional(),
+  /**
+   * 阅读器的文档标识。
+   *
+   * 直传时文件不经过服务端，服务端没机会自己算，只能由浏览器算好带上来。
+   * 不带也能传，只是这本书收不到进度关联（会退化为按整文件 MD5 / 书名）。
+   */
+  documentId: z
+    .string()
+    .trim()
+    .regex(/^[a-fA-F0-9]{32}$/, 'documentId 必须是 32 位十六进制串')
+    .transform((v) => v.toLowerCase())
+    .optional(),
   fields: z.record(z.string(), z.string()).default({}),
 });
 

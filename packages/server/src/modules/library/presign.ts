@@ -50,6 +50,8 @@ export interface PresignInput {
   md5: string;
   mode: 'create' | 'version';
   bookId?: number | undefined;
+  /** 浏览器算好的阅读器文档标识；直传时服务端拿不到文件，只能靠客户端带 */
+  documentId?: string | undefined;
   fields: UploadFields;
 }
 
@@ -135,6 +137,7 @@ export interface PresignCompleteInput {
   objectKey: string;
   mode: 'create' | 'version';
   bookId?: number | undefined;
+  documentId?: string | undefined;
   fields: UploadFields;
 }
 
@@ -228,6 +231,7 @@ export async function completePresignedUpload(
     key: target.key,
     size: input.size,
     md5: input.md5,
+    documentId: input.documentId ?? null,
     fields: input.fields,
   });
 }

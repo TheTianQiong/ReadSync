@@ -1,4 +1,4 @@
-import { md5OfFile } from './utils';
+import { koreaderDocumentIdOfFile, md5OfFile } from './utils';
 import {
   UPLOAD_CHUNK_SIZE_DEFAULT,
   UPLOAD_CHUNK_SIZE_MIN,
@@ -565,12 +565,20 @@ export async function uploadPresigned(
 
   // 大文件哈希要几秒钟，必须给提示，否则界面看起来像卡住了
   if (!options.knownMd5) options.onNotice?.('正在计算文件指纹…');
+  // 整文件 MD5：用于秒传去重与存储侧的 ETag 校验
   const md5 = options.knownMd5 ?? (await md5OfFile(file, options.onProgress));
+  /*
+   * 阅读器的文档标识。服务端在其它上传方式下能自己从文件算，
+   * 但直传时文件不经过它 —— 不带这个值，这本书以后就收不到进度关联，
+   * 只能退化成按书名去猜。只多读 12KB，代价可以忽略。
+   */
+  const documentId = await koreaderDocumentIdOfFile(file);
 
   const base = {
     filename: file.name,
     size: file.size,
     md5,
+    documentId,
     mode: target.mode,
     ...(target.mode === 'version' ? { bookId: target.bookId } : {}),
     fields,

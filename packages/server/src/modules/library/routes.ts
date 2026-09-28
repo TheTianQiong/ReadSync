@@ -326,6 +326,7 @@ export async function registerLibraryRoutes(app: FastifyInstance): Promise<void>
       md5: input.md5,
       mode: input.mode,
       bookId: input.bookId,
+      documentId: input.documentId,
       fields: input.fields,
     });
 
@@ -358,6 +359,7 @@ export async function registerLibraryRoutes(app: FastifyInstance): Promise<void>
       objectKey: input.objectKey,
       mode: input.mode,
       bookId: input.bookId,
+      documentId: input.documentId,
       fields: input.fields,
     });
 

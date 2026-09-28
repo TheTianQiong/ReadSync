@@ -1,0 +1,1 @@
+ALTER TABLE `books` ADD `document_id` text;

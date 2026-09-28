@@ -33,6 +33,7 @@ import {
 } from '../../errors.js';
 import { getModuleLogger } from '../../logger.js';
 import { getSiteSettings } from '../../lib/settings.js';
+import { koreaderDocumentIdFromFile } from '../../lib/document-id.js';
 import { getAdapterForStorage, getDefaultAdapter } from '../storage/service.js';
 import { assertSafeKey, buildBookKey, type StorageAdapter } from '../storage/types.js';
 
@@ -101,6 +102,7 @@ function toBookSummary(row: BookWithStorage): BookSummary {
     format: (BOOK_FORMATS as readonly string[]).includes(b.format) ? (b.format as BookFormat) : 'other',
     size: b.size,
     md5: b.md5,
+    documentId: b.documentId,
     coverUrl: b.coverUrl,
     description: b.description,
     tags: b.tags ?? [],
@@ -346,6 +348,9 @@ export async function createBook(userId: number, input: CreateBookInput): Promis
         format: input.format,
         size: input.size,
         md5: input.md5,
+        // 登记书目时用户填的就是阅读器里的文档标识，直接存这一列；
+        // 上传路径则由服务端从文件算出后写入
+        documentId: input.documentId ?? (hasFile ? null : input.md5),
         objectKey: hasFile ? input.objectKey! : null,
         storageId,
         currentVersion: 1,
@@ -683,7 +688,15 @@ function assertAllowedExtension(file: UploadedFile): { ext: string; allowed: str
 export interface ReceivedUpload {
   ext: string;
   size: number;
+  /** 整文件 MD5，用于秒传去重 */
   md5: string;
+  /**
+   * 阅读器的文档标识（采样 MD5）；算不出来时为 null。
+   *
+   * 与 md5 是两码事：md5 是整文件的、用来去重；这个是采样 12KB 算出来的、
+   * 用来把阅读器上报的进度关联到这本书。两者永不相等。
+   */
+  documentId: string | null;
   tmpPath: string;
 }
 
@@ -708,7 +721,10 @@ async function receiveUpload(
     }
     // 配额检查放在这里：此时已知精确大小，且尚未写入任何远端存储
     assertWithinQuota(userId, size);
-    return { ext, size, md5, tmpPath };
+    // 顺手算出阅读器的文档标识：文件就在本地，只读 12KB。
+    // 上传时不算，之后就只能靠书名去关联进度了。
+    const documentId = await koreaderDocumentIdFromFile(tmpPath);
+    return { ext, size, md5, documentId, tmpPath };
   } catch (err) {
     // 任何一条校验失败都要清理临时文件，避免 tmpDir 无限增长
     await rm(tmpPath, { force: true }).catch(() => undefined);
@@ -852,6 +868,7 @@ export async function commitNewBook(
       key: target.key,
       size: received.size,
       md5: received.md5,
+      documentId: received.documentId,
       fields,
     });
   }
@@ -872,10 +889,13 @@ export function insertBookRecords(
     key: string;
     size: number;
     md5: string;
+    /** 阅读器的文档标识；null 表示未知（关联退化为按 md5 / 书名匹配） */
+    documentId?: string | null | undefined;
     fields: UploadFields;
   },
 ): UploadBookResult {
   const { title, format, storageId, key, md5, size, fields } = input;
+  const documentId = input.documentId ?? null;
   {
     const now = new Date();
 
@@ -895,8 +915,9 @@ export function insertBookRecords(
               publisher: nonEmpty(fields.publisher),
               isbn: nonEmpty(fields.isbn),
               format,
-              size: size,
-              md5: md5,
+              size,
+              md5,
+              documentId,
               objectKey: key,
               storageId,
               currentVersion: 1,

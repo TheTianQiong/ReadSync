@@ -72,7 +72,10 @@ export function BookRegisterDialog({
         title: title.trim(),
         ...(author.trim() ? { author: author.trim() } : {}),
         format,
+        // 这里没有文件，整文件 MD5 无从得知，用填进来的文档标识兼作去重键；
+        // 真正用于关联进度的是 documentId 那一列
         md5: md5.trim().toLowerCase(),
+        documentId: md5.trim().toLowerCase(),
         // 不传 objectKey ⇒ 服务端落库为一本「没有文件」的书
         size: Math.max(0, Math.round((Number(sizeMb) || 0) * 1024 * 1024)),
         tags: parseTags(tags),
@@ -115,8 +118,9 @@ export function BookRegisterDialog({
     >
       <div className="flex flex-col gap-3.5">
         <Alert tone="info">
-          下载与版本回滚需要文件，其余功能不受影响。同一本书在阅读器里同步进度时，
-          服务端会拿进度里的文档标识与这里的 MD5 比对，比对成功才会把进度挂到这本书上。
+          下载与版本回滚需要文件，其余功能不受影响。阅读器上报进度时会带一个「文档标识」，
+          服务端拿它与这里填的值比对，比对成功才会把进度挂到这本书上 ——
+          所以这个值要照抄阅读器里的，别自己算文件的 MD5（两者不是一回事）。
         </Alert>
 
         <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
@@ -129,9 +133,9 @@ export function BookRegisterDialog({
         </div>
 
         <Field
-          label="MD5"
+          label="文档标识（MD5）"
           required
-          hint="32 位十六进制。填阅读器里显示的那个文档标识，填错会导致同步进度挂不到这本书上"
+          hint="填阅读器里显示的那个「文档标识 / document hash」。服务端拿它把阅读器上报的进度挂到这本书上，填错就会挂不上（注意：这不是文件的完整 MD5）"
         >
           <Input
             value={md5}

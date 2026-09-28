@@ -1,4 +1,5 @@
 import { clsx, type ClassValue } from 'clsx';
+import { KOREADER_SAMPLE_OFFSETS, KOREADER_SAMPLE_SIZE } from '@readsync/shared';
 import { format, formatDistanceToNowStrict, isValid, parseISO } from 'date-fns';
 import { zhCN } from 'date-fns/locale';
 import { twMerge } from 'tailwind-merge';
@@ -203,6 +204,28 @@ const MD5_TABLE = ((): Uint32Array => {
   }
   return table;
 })();
+
+/**
+ * 按 KOReader 的规则算出阅读器的文档标识（采样 MD5）。
+ *
+ * 服务端在文件经过它时能自己算，但**预签名直传时文件不经过服务端** ——
+ * 只能由浏览器算好随请求带上。算法常量取自 @readsync/shared，与
+ * 服务端实现共用同一份偏移表，避免两边算出的值不一样。
+ *
+ * 只读约 12KB，对上百 MB 的书也是瞬间完成。
+ */
+export async function koreaderDocumentIdOfFile(file: File): Promise<string> {
+  const hasher = new Md5();
+  for (const offset of KOREADER_SAMPLE_OFFSETS) {
+    if (offset >= file.size) break;
+    const end = Math.min(offset + KOREADER_SAMPLE_SIZE, file.size);
+    const buffer = await file.slice(offset, end).arrayBuffer();
+    const bytes = new Uint8Array(buffer);
+    if (bytes.length === 0) break;
+    hasher.update(bytes);
+  }
+  return hasher.digest();
+}
 
 export class Md5 {
   private a = 0x67452301;

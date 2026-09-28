@@ -7,6 +7,7 @@
 
 export * from './version.js';
 export * from './constants.js';
+export * from './koreader.js';
 
 export * from './schemas/common.js';
 export * from './schemas/auth.js';

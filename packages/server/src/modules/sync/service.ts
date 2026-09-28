@@ -207,17 +207,32 @@ function findByDocument(userId: number, document: string): SyncEntryRow | undefi
 /**
  * 把 document 关联到书库中的书。
  *
- * KOReader 的 document 通常是文件内容的部分 MD5，因此优先按 MD5 精确匹配；
- * 其他客户端可能只传一个自定义 id，此时退化为按标题匹配（同名书取任意一本，
- * 因为同步接口无法知道客户端指的是哪个版本）。匹配不上就不关联，不影响进度写入。
+ * 按可靠性从高到低依次尝试：
+ *
+ *  1. **documentId**：阅读器的文档标识（KOReader 的采样 MD5）。这是唯一
+ *     真正对得上的键 —— 上传时由服务端从文件算出，登记书目时由用户填入。
+ *  2. **md5**：整文件 MD5。阅读器不会发这个值，但第三方客户端可能直接
+ *     用整文件 MD5 当文档标识，所以留着这一档。
+ *  3. **title**：书名精确匹配。前两档都没命中时的兜底，也是最脆的一档 ——
+ *     改过书名就断，同名的两本书还会认错。
+ *
+ * 匹配不上就不关联，不影响进度本身写入 sync_entries。
  */
 function resolveBookId(userId: number, document: string, title: string | undefined): number | null {
   const db = getDb();
+  const needle = document.toLowerCase();
+
+  const byDocumentId = db
+    .select({ id: books.id })
+    .from(books)
+    .where(and(eq(books.ownerId, userId), eq(books.documentId, needle)))
+    .get();
+  if (byDocumentId) return byDocumentId.id;
 
   const byMd5 = db
     .select({ id: books.id })
     .from(books)
-    .where(and(eq(books.ownerId, userId), eq(books.md5, document.toLowerCase())))
+    .where(and(eq(books.ownerId, userId), eq(books.md5, needle)))
     .get();
   if (byMd5) return byMd5.id;
 

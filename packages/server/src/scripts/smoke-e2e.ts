@@ -16,6 +16,7 @@ import { buildApp } from '../app.js';
 import { loadConfig } from '../config.js';
 import { ensureKeyPair } from '../crypto/keys.js';
 import { closeDatabase, openDatabase } from '../db/index.js';
+import { computeKoreaderDocumentId } from '@readsync/shared';
 import { startMockS3 } from './mock-s3.js';
 
 /**
@@ -739,6 +740,100 @@ async function main(): Promise<void> {
       check('KOSync 能拉回该进度', kGet.json().percentage === 0.9, kGet.json());
 
       await api({ method: 'DELETE', url: `/api/books/${bookId}`, headers: nfAuth });
+    }
+
+    /* ------------- 5b4. 文档标识把进度关联到上传的书 ------------- */
+    section('5b4. 进度关联：按阅读器的文档标识（而非整文件 MD5）');
+    {
+      /*
+       * 这是本次修复的核心：KOReader 上报的 document 是「采样 MD5」，
+       * 而 books.md5 是「整文件 MD5」，两者永不相等 —— 早先拿后者去比对，
+       * 上传的书一次都没关联上过，全靠书名兜底。
+       *
+       * 这里先用一份**真实的算法**算出上传文件的采样 MD5，再用它上报进度，
+       * 验证进度确实落到了这本书上。
+       */
+      const content = Buffer.from(`document-id-linkage ${randomUUID()}`.repeat(200), 'utf8');
+      const wholeMd5 = createHash('md5').update(content).digest('hex');
+
+      // 与服务端同源的算法，独立算一遍（常量来自 shared）
+      const docId = await computeKoreaderDocumentId(
+        () => {
+          const hash = createHash('md5');
+          return { update: (d: Uint8Array) => hash.update(d), digest: () => hash.digest('hex') };
+        },
+        async (offset, length) => {
+          if (offset >= content.length) return null;
+          return content.subarray(offset, Math.min(offset + length, content.length));
+        },
+      );
+      check('采样 MD5 与整文件 MD5 不同（这正是原先关联不上的原因）', docId !== wholeMd5, { docId, wholeMd5 });
+
+      const mp = buildMultipart(
+        { title: '带文档标识的书', format: 'epub' },
+        { field: 'file', filename: 'docid.epub', content, contentType: 'application/epub+zip' },
+      );
+      const uploaded = await api({
+        method: 'POST',
+        url: '/api/books/upload',
+        headers: { ...auth, 'content-type': mp.contentType },
+        payload: mp.body,
+      });
+      check('上传成功', uploaded.statusCode === 200, uploaded.body);
+      const bookId = uploaded.json().data?.id as number;
+      check('上传的书记录了整文件 MD5', uploaded.json().data?.md5 === wholeMd5, uploaded.json().data?.md5);
+      check(
+        '上传时服务端自动算出了文档标识（与独立计算一致）',
+        uploaded.json().data?.documentId === docId,
+        { got: uploaded.json().data?.documentId, want: docId },
+      );
+
+      // 用文档标识上报进度 —— 应当精确关联到这本书
+      const push = await api({
+        method: 'PUT',
+        url: '/api/sync/progress',
+        headers: auth,
+        payload: { document: docId, progress: '/body/DocFragment[3]/text().0', percentage: 0.42, device: 'Kindle', device_id: 'd1' },
+      });
+      check('用文档标识上报进度成功', push.statusCode === 200, push.body);
+
+      const detail = await api({ method: 'GET', url: `/api/books/${bookId}`, headers: auth });
+      check(
+        '进度已挂到这本书（42%）',
+        Math.round(detail.json().data?.progressPercent ?? -1) === 42,
+        detail.json().data?.progressPercent,
+      );
+
+      // 反证：用整文件 MD5 上报也能匹配（第三方客户端可能这么发），
+      // 但用文档标识才是 KOReader 的真实行为
+      const other = Buffer.from(`another book ${randomUUID()}`.repeat(100), 'utf8');
+      const otherMd5 = createHash('md5').update(other).digest('hex');
+      const mp2 = buildMultipart(
+        { title: '另一本书', format: 'epub' },
+        { field: 'file', filename: 'other.epub', content: other, contentType: 'application/epub+zip' },
+      );
+      const second = await api({
+        method: 'POST',
+        url: '/api/books/upload',
+        headers: { ...auth, 'content-type': mp2.contentType },
+        payload: mp2.body,
+      });
+      const secondId = second.json().data?.id as number;
+      await api({
+        method: 'PUT',
+        url: '/api/sync/progress',
+        headers: auth,
+        payload: { document: otherMd5, progress: '/body/2', percentage: 0.1, device: 'X', device_id: 'x1' },
+      });
+      const secondDetail = await api({ method: 'GET', url: `/api/books/${secondId}`, headers: auth });
+      check(
+        '整文件 MD5 作为 document 时也能匹配（兼容第三方客户端）',
+        Math.round(secondDetail.json().data?.progressPercent ?? -1) === 10,
+        secondDetail.json().data?.progressPercent,
+      );
+
+      await api({ method: 'DELETE', url: `/api/books/${bookId}`, headers: auth });
+      await api({ method: 'DELETE', url: `/api/books/${secondId}`, headers: auth });
     }
 
     /* ---------------------- 5c. 预签名直传 ---------------------- */

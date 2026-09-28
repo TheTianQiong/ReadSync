@@ -4,6 +4,7 @@ import { mkdir, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import path from 'node:path';
 import { clampChunkSize, type ChunkedUploadSession } from '@readsync/shared';
 import { loadConfig } from '../../config.js';
+import { koreaderDocumentIdFromFile } from '../../lib/document-id.js';
 import { badRequest, notFound, payloadTooLarge } from '../../errors.js';
 import { getModuleLogger } from '../../logger.js';
 import {
@@ -287,7 +288,9 @@ export async function completeSession(
 
   await assertWithinQuota(userId, session.size);
 
-  const received: ReceivedUpload = { ext, size: session.size, md5, tmpPath: blobPath };
+  // 合并后的文件就在本地，顺手算出阅读器的文档标识（只读 12KB）
+  const documentId = await koreaderDocumentIdFromFile(blobPath);
+  const received: ReceivedUpload = { ext, size: session.size, md5, documentId, tmpPath: blobPath };
 
   try {
     if (session.mode === 'version') {
