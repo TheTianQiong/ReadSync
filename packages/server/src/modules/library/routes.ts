@@ -1,5 +1,6 @@
 import type { FastifyInstance, FastifyRequest } from 'fastify';
 import {
+  addBookDocumentSchema,
   checkBookExistsSchema,
   chunkedUploadInitSchema,
   createBookSchema,
@@ -12,6 +13,7 @@ import {
   type BookSummary,
   type BookVersion,
   type CheckBookExistsResult,
+  type BookDocumentIds,
   type ChunkedUploadInitResult,
   type ChunkedUploadPartResult,
   type PresignUploadResult,
@@ -23,6 +25,7 @@ import { forbidden } from '../../errors.js';
 import { getSiteSettings } from '../../lib/settings.js';
 import { currentUser, requireAuth } from '../../middleware/auth.js';
 import { completeSession, createSession, discardSession, writeChunk } from './chunked.js';
+import { addDocumentId, listDocumentIds, removeDocumentId } from './documents.js';
 import { completePresignedUpload, presignUpload } from './presign.js';
 import {
   checkBookExists,
@@ -196,6 +199,53 @@ export async function registerLibraryRoutes(app: FastifyInstance): Promise<void>
 
     return { ok: true, data: detail } satisfies ApiSuccess<BookDetail>;
   });
+
+  /* -------------------------- 文档标识管理 -------------------------- */
+
+  /**
+   * 给一本书补一个阅读器的文档标识。
+   *
+   * 同一本书在不同平台各下一份时，内容采样算出的标识往往不同 ——
+   * 补进来之后，那台设备上报的进度才会挂到这本书上。
+   * 添加时会**顺带回填**该标识下已有的进度与会话，否则界面上还是空的。
+   */
+  app.post('/api/books/:id/documents', auth, async (req) => {
+    const user = currentUser(req);
+    const bookId = parseIdParam(req.params);
+    const input = parseOrThrow(() => addBookDocumentSchema.parse(req.body));
+
+    const result = addDocumentId(user.id, bookId, input.documentId, input.label);
+
+    recordAudit('book.update', auditContextFrom(req, user), {
+      target: String(bookId),
+      meta: {
+        action: 'add-document-id',
+        documentId: input.documentId,
+        relinkedSyncEntries: result.relinked.syncEntries,
+        relinkedSessions: result.relinked.sessions,
+      },
+    });
+
+    return {
+      ok: true,
+      data: { ...result, documents: listDocumentIds(bookId) },
+    } satisfies ApiSuccess<typeof result & { documents: BookDocumentIds }>;
+  });
+
+  /** 移除一个补充的标识（主标识不在此列，它由文件算出来） */
+  app.delete<{ Params: { id: string; aliasId: string } }>(
+    '/api/books/:id/documents/:aliasId',
+    auth,
+    async (req) => {
+      const user = currentUser(req);
+      const bookId = parseIdParam(req.params, 'id');
+      const aliasId = parseIdParam(req.params, 'aliasId');
+
+      removeDocumentId(user.id, bookId, aliasId);
+
+      return { ok: true, data: listDocumentIds(bookId) } satisfies ApiSuccess<BookDocumentIds>;
+    },
+  );
 
   /* ---------------------------- 分片上传 ---------------------------- */
 

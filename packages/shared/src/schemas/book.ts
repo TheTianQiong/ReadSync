@@ -152,9 +152,43 @@ export interface BookSummary {
   updatedAt: string;
 }
 
-/** 书籍详情，附带版本历史 */
+/**
+ * 一本书的额外文档标识。
+ *
+ * 阅读器的文档标识按**文件内容采样**算出，同一本书的不同副本（不同平台各下
+ * 一份、版本或格式不同）算出的值往往不同。补充进来后，那些设备上报的进度
+ * 就能挂到这本书上。
+ */
+export interface BookDocumentAlias {
+  id: number;
+  documentId: string;
+  /** 备注，例如「Kindle 上的那份」 */
+  label: string | null;
+  createdAt: string;
+}
+
+export interface BookDocumentIds {
+  /** 服务端自己算出来的那个（上传时）；没有则为 null */
+  primary: string | null;
+  /** 手工补充的其它标识 */
+  aliases: BookDocumentAlias[];
+}
+
+/** 新增一个文档标识 */
+export const addBookDocumentSchema = z.object({
+  documentId: z
+    .string()
+    .trim()
+    .regex(/^[a-fA-F0-9]{32}$/, '文档标识必须是 32 位十六进制（阅读器里显示的那个值）')
+    .transform((v) => v.toLowerCase()),
+  label: z.string().trim().max(64).optional(),
+});
+export type AddBookDocumentInput = z.infer<typeof addBookDocumentSchema>;
+
+/** 书籍详情，附带版本历史与已知的文档标识 */
 export interface BookDetail extends BookSummary {
   versions: BookVersion[];
+  documents: BookDocumentIds;
 }
 
 /** 上传前的秒传/去重检查 */

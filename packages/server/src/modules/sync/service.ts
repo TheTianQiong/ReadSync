@@ -8,6 +8,7 @@ import type {
 } from '@readsync/shared';
 import { getDb } from '../../db/index.js';
 import { books, readingSessions, syncEntries, users, type SyncEntryRow } from '../../db/schema.js';
+import { findBookByDocumentId } from '../library/documents.js';
 import { getModuleLogger } from '../../logger.js';
 
 /**
@@ -222,12 +223,10 @@ function resolveBookId(userId: number, document: string, title: string | undefin
   const db = getDb();
   const needle = document.toLowerCase();
 
-  const byDocumentId = db
-    .select({ id: books.id })
-    .from(books)
-    .where(and(eq(books.ownerId, userId), eq(books.documentId, needle)))
-    .get();
-  if (byDocumentId) return byDocumentId.id;
+  // 主标识与手工补充的别名一起查 —— 同一本书的不同副本会算出不同标识，
+  // 用户可以把它们都挂到同一本书上
+  const byDocumentId = findBookByDocumentId(userId, needle);
+  if (byDocumentId !== null) return byDocumentId;
 
   const byMd5 = db
     .select({ id: books.id })

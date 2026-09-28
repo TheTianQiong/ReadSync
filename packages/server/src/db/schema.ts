@@ -296,6 +296,39 @@ export const books = sqliteTable(
 );
 
 /** 书籍文件版本历史 */
+/**
+ * 一本书的额外文档标识。
+ *
+ * 为什么需要：阅读器的文档标识是按**文件内容采样**算出来的，同一个书名下
+ * 若有多个副本（不同平台各下一份、不同版本、转过格式），算出的标识往往
+ * 各不相同 —— 但它们确实是同一本书。只认一个标识的话，这些设备上报的进度
+ * 就永远关联不到这本书上。
+ *
+ * books.documentId 放「服务端能自己算出来的那个」（上传时算的），
+ * 这张表放其余需要手工补充的。匹配时两处都查。
+ */
+export const bookDocuments = sqliteTable(
+  'book_documents',
+  {
+    id: integer('id').primaryKey({ autoIncrement: true }),
+    bookId: integer('book_id')
+      .notNull()
+      .references(() => books.id, { onDelete: 'cascade' }),
+    documentId: text('document_id').notNull(),
+    /** 备注，例如「Kindle 上的那份」。纯展示用 */
+    label: text('label'),
+    createdAt: integer('created_at', { mode: 'timestamp_ms' })
+      .notNull()
+      .default(sql`(unixepoch() * 1000)`),
+  },
+  (t) => [
+    // 同一本书下不重复；跨书、跨用户的唯一性在服务层按 owner 校验
+    // （不同用户各有一份相同的书是正常的，标识相同也应当允许）
+    uniqueIndex('book_documents_unique').on(t.bookId, t.documentId),
+    index('book_documents_book_idx').on(t.bookId),
+  ],
+);
+
 export const bookVersions = sqliteTable(
   'book_versions',
   {

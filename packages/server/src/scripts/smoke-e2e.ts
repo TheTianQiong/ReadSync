@@ -884,6 +884,153 @@ async function main(): Promise<void> {
       await adapter.delete(key).catch(() => undefined);
     }
 
+    /* ---------- 5b6. 一本书多个文档标识（多平台同一本书） ---------- */
+    section('5b6. 一本书对应多个文档标识');
+    {
+      /*
+       * 实情：同一本书在不同平台各下一份时，内容采样算出的标识往往不同。
+       * 用户手上就是这种情况 —— 三个标识互不相同，但确实是同一本书。
+       * 只认一个标识的话，那些设备上报的进度永远挂不上。
+       *
+       * 这里模拟：书的主标识是 SRV，另有两个平台上报过进度（当时挂不上），
+       * 把两个标识补进来后，历史进度应当被认领回来。
+       */
+      /*
+       * 用独立账号，不共用 admin —— 本段会写入阅读时长，而第 7 节要断言
+       * admin 的累计时长恰好是 300 秒。共用账号会让那个断言失败，
+       * 而失败的看起来是「统计坏了」，实际只是测试之间互相污染。
+       */
+      const multiPassword = 'MultiDocPass123';
+      const multiPw = { ciphertext: encryptPassword(multiPassword, publicKey), encrypted: true };
+      await api({
+        method: 'POST',
+        url: '/api/admin/users',
+        headers: auth,
+        payload: { username: 'multidoc', email: 'multidoc@example.com', password: multiPw },
+      });
+      const multiLogin = await api({
+        method: 'POST',
+        url: '/api/auth/login',
+        payload: { username: 'multidoc', password: multiPw },
+      });
+      const mAuth = { authorization: `Bearer ${multiLogin.json().data?.accessToken}` };
+
+      const srvDoc = createHash('md5').update('server-doc').digest('hex');
+      const docA = createHash('md5').update('platform-a-doc').digest('hex');
+      const docC = createHash('md5').update('platform-c-doc').digest('hex');
+
+      const created = await api({
+        method: 'POST',
+        url: '/api/books',
+        headers: mAuth,
+        payload: { title: '多平台同一本书', format: 'epub', md5: srvDoc, documentId: srvDoc, size: 0 },
+      });
+      const multiId = created.json().data?.id as number;
+      check('登记一本带主标识的书', created.statusCode === 200, created.body);
+      check(
+        '详情里带上 documents（主标识 + 空别名表）',
+        created.json().data?.documents?.primary === srvDoc &&
+          created.json().data?.documents?.aliases?.length === 0,
+        created.json().data?.documents,
+      );
+
+      // 两个平台先后上报，此时都挂不上（进度照常存下，只是不与书关联）
+      for (const [device, doc] of [
+        ['platform-a', docA],
+        ['platform-c', docC],
+      ] as const) {
+        await api({
+          method: 'PUT',
+          url: '/api/sync/progress',
+          headers: mAuth,
+          payload: { document: doc, progress: '/body/1', percentage: 0.4, device, device_id: device, readingSeconds: 600 },
+        });
+      }
+      const beforeAdd = await api({ method: 'GET', url: `/api/books/${multiId}`, headers: mAuth });
+      check('补标识前进度为 0（关联不上）', beforeAdd.json().data?.progressPercent === 0, beforeAdd.json().data?.progressPercent);
+
+      // 补 A 平台的标识
+      const addA = await api({
+        method: 'POST',
+        url: `/api/books/${multiId}/documents`,
+        headers: mAuth,
+        payload: { documentId: docA, label: 'A 平台' },
+      });
+      check('可补充文档标识', addA.statusCode === 200, addA.body);
+      check('补充时回填了历史进度', addA.json().data?.relinked?.syncEntries === 1, addA.json().data?.relinked);
+      check('补充时回填了历史会话', addA.json().data?.relinked?.sessions === 1, addA.json().data?.relinked);
+
+      // 补 C 平台的标识
+      const addC = await api({
+        method: 'POST',
+        url: `/api/books/${multiId}/documents`,
+        headers: mAuth,
+        payload: { documentId: docC, label: 'C 平台' },
+      });
+      check('可补充第二个标识', addC.statusCode === 200, addC.body);
+
+      const afterAdd = await api({ method: 'GET', url: `/api/books/${multiId}`, headers: mAuth });
+      check(
+        '补完后进度被认领回来（40%）',
+        Math.round(afterAdd.json().data?.progressPercent ?? -1) === 40,
+        afterAdd.json().data?.progressPercent,
+      );
+      check(
+        '补完后阅读时长被认领回来（1200 秒）',
+        afterAdd.json().data?.totalReadingSeconds === 1200,
+        afterAdd.json().data?.totalReadingSeconds,
+      );
+      check('两个别名都在', afterAdd.json().data?.documents?.aliases?.length === 2, afterAdd.json().data?.documents);
+
+      // 之后再上报也应当直接挂上（走的是别名匹配）
+      const later = await api({
+        method: 'PUT',
+        url: '/api/sync/progress',
+        headers: mAuth,
+        payload: { document: docA, progress: '/body/2', percentage: 0.75, device: 'platform-a', device_id: 'platform-a', readingSeconds: 60 },
+      });
+      check('别名上报进度成功', later.statusCode === 200, later.body);
+      const afterLater = await api({ method: 'GET', url: `/api/books/${multiId}`, headers: mAuth });
+      check('别名上报的进度也挂上了（75%）', Math.round(afterLater.json().data?.progressPercent ?? -1) === 75, afterLater.json().data?.progressPercent);
+
+      // 同一账号下另一本书不能占用同一个标识，否则匹配无从判断
+      const other = await api({
+        method: 'POST',
+        url: '/api/books',
+        headers: mAuth,
+        payload: { title: '另一本书', format: 'epub', md5: createHash('md5').update('other-book').digest('hex'), size: 0 },
+      });
+      const clash = await api({
+        method: 'POST',
+        url: `/api/books/${other.json().data?.id}/documents`,
+        headers: mAuth,
+        payload: { documentId: docA },
+      });
+      check('标识被别的书占用时明确拒绝', clash.statusCode === 409, clash.body);
+      check('拒绝信息指出是哪一本', clash.json().error?.message?.includes('多平台同一本书'), clash.json().error?.message);
+
+      // 格式校验
+      const badFormat = await api({
+        method: 'POST',
+        url: `/api/books/${multiId}/documents`,
+        headers: mAuth,
+        payload: { documentId: 'not-a-hash' },
+      });
+      check('非 32 位十六进制被拒', badFormat.statusCode === 400, badFormat.body);
+
+      // 移除别名后，进度主标识仍在，不影响书本身
+      const aliasId = afterAdd.json().data?.documents?.aliases?.[0]?.id as number;
+      const removed = await api({
+        method: 'DELETE',
+        url: `/api/books/${multiId}/documents/${aliasId}`,
+        headers: mAuth,
+      });
+      check('可移除别名', removed.statusCode === 200 && removed.json().data?.aliases?.length === 1, removed.body);
+
+      await api({ method: 'DELETE', url: `/api/books/${multiId}`, headers: mAuth });
+      await api({ method: 'DELETE', url: `/api/books/${other.json().data?.id}`, headers: mAuth });
+    }
+
     /* ---------------------- 5c. 预签名直传 ---------------------- */
     section('5c. 预签名直传（浏览器直接传给对象存储）');
     {

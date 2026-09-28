@@ -1,9 +1,10 @@
 import {
   READING_STATUSES,
   type BookDetail as BookDetailData,
+  type BookDocumentIds,
   type BookVersion,
 } from '@readsync/shared';
-import { ArrowLeft, Download, History, Pencil, RotateCcw, Save, Trash2, Upload } from 'lucide-react';
+import { ArrowLeft, Download, Fingerprint, History, Pencil, Plus, RotateCcw, Save, Trash2, Upload, X } from 'lucide-react';
 import { useEffect, useState, type ReactNode } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import { BookUploadDialog } from '../components/BookUploadDialog';
@@ -49,6 +50,13 @@ export function BookDetail(): ReactNode {
   const [busy, setBusy] = useState(false);
   const [downloading, setDownloading] = useState(false);
 
+  // 文档标识：补充 / 移除
+  const [newDocumentId, setNewDocumentId] = useState('');
+  const [newDocumentLabel, setNewDocumentLabel] = useState('');
+  const [addingDocumentId, setAddingDocumentId] = useState(false);
+  const [documentError, setDocumentError] = useState<string | null>(null);
+  const [documentNotice, setDocumentNotice] = useState<string | null>(null);
+
   const { data: book, loading, error, reload } = useAsync(
     () => api.get<BookDetailData>(`/books/${bookId}`),
     [bookId],
@@ -83,6 +91,59 @@ export function BookDetail(): ReactNode {
       />
     );
   }
+
+  /**
+   * 补充一个文档标识。
+   *
+   * 服务端会顺带回填该标识下已有的进度与会话，所以补完要 reload ——
+   * 否则页面上的进度还是补之前的旧值，用户会以为没生效。
+   */
+  const handleAddDocumentId = async (): Promise<void> => {
+    const value = newDocumentId.trim();
+    if (!/^[a-fA-F0-9]{32}$/.test(value)) {
+      setDocumentError('文档标识是 32 位十六进制，请照抄阅读器里显示的那个值');
+      return;
+    }
+
+    setAddingDocumentId(true);
+    setDocumentError(null);
+    setDocumentNotice(null);
+    try {
+      const result = await api.post<{
+        relinked: { syncEntries: number; sessions: number };
+        documents: BookDocumentIds;
+      }>(`/books/${bookId}/documents`, {
+        documentId: value,
+        ...(newDocumentLabel.trim() ? { label: newDocumentLabel.trim() } : {}),
+      });
+
+      const { syncEntries, sessions } = result.relinked;
+      setNewDocumentId('');
+      setNewDocumentLabel('');
+      setDocumentNotice(
+        syncEntries > 0 || sessions > 0
+          ? `已添加，并认领回 ${syncEntries} 条进度记录、${sessions} 条阅读会话`
+          : '已添加。这台设备下次上报进度时就会挂到这本书上',
+      );
+      reload();
+    } catch (err) {
+      setDocumentError(err instanceof Error ? err.message : '添加失败');
+    } finally {
+      setAddingDocumentId(false);
+    }
+  };
+
+  const handleRemoveDocumentId = async (aliasId: number): Promise<void> => {
+    setDocumentError(null);
+    setDocumentNotice(null);
+    try {
+      await api.del(`/books/${bookId}/documents/${aliasId}`);
+      setDocumentNotice('已移除。该标识下已有的进度不会再显示在这本书上');
+      reload();
+    } catch (err) {
+      setDocumentError(err instanceof Error ? err.message : '移除失败');
+    }
+  };
 
   const handleDownload = async (): Promise<void> => {
     setDownloading(true);
@@ -201,6 +262,88 @@ export function BookDetail(): ReactNode {
           value={book.lastReadAt ? formatDateTime(book.lastReadAt) : '从未'}
         />
       </div>
+
+      {/*
+        文档标识卡片：阅读器上报进度时带的那个值。同一本书在不同平台各下一份、
+        或格式/版本不同时，采样算出的标识往往互不相同 —— 补进来之后，
+        那台设备上报的进度才会挂到这本书上。
+      */}
+      <Card>
+        <CardHeader
+          title="文档标识"
+          description="阅读器用它标识这本书。同一本书的不同副本（不同平台、不同版本）标识可能不同，都补上即可，补完会立刻把已有的进度认领回来"
+          actions={<Fingerprint size={14} className="text-muted" />}
+        />
+        <CardBody className="flex flex-col gap-3">
+          <div className="flex flex-col gap-1.5">
+            <div className="flex items-center justify-between gap-2 rounded-sm border border-line bg-surface-2 px-3 py-2">
+              <span className="flex min-w-0 flex-col">
+                <span className="font-sans text-xs text-ink-soft">
+                  {book.documentId ?? '（未知）'}
+                </span>
+                <span className="font-sans text-[11px] text-muted">
+                  {book.documentId ? '服务端从文件算出' : '这本没有可算的文件，需手工补充'}
+                </span>
+              </span>
+              {book.documentId ? <Badge tone="accent">主标识</Badge> : null}
+            </div>
+
+            {(book.documents?.aliases ?? []).map((alias) => (
+              <div
+                key={alias.id}
+                className="flex items-center justify-between gap-2 rounded-sm border border-line px-3 py-2"
+              >
+                <span className="flex min-w-0 flex-col">
+                  <span className="truncate font-sans text-xs text-ink-soft">{alias.documentId}</span>
+                  <span className="font-sans text-[11px] text-muted">
+                    {alias.label || '手工补充'} · {formatDateTime(alias.createdAt)}
+                  </span>
+                </span>
+                <Button
+                  size="sm"
+                  variant="quiet"
+                  aria-label={`移除 ${alias.documentId}`}
+                  icon={<X size={13} />}
+                  onClick={() => void handleRemoveDocumentId(alias.id)}
+                />
+              </div>
+            ))}
+          </div>
+
+          <div className="flex flex-wrap items-end gap-2">
+            <Field label="补充标识" className="min-w-52 flex-1">
+              <Input
+                value={newDocumentId}
+                onChange={(event) => setNewDocumentId(event.target.value)}
+                placeholder="c8a8c738d279b04550626c6536890776"
+                className="font-mono text-xs"
+                maxLength={32}
+              />
+            </Field>
+            <Field label="备注（可选）" className="min-w-36 flex-1">
+              <Input
+                value={newDocumentLabel}
+                onChange={(event) => setNewDocumentLabel(event.target.value)}
+                placeholder="Kindle 上的那份"
+                maxLength={64}
+              />
+            </Field>
+            <Button
+              size="md"
+              variant="secondary"
+              icon={<Plus size={13} />}
+              loading={addingDocumentId}
+              disabled={!newDocumentId.trim()}
+              onClick={() => void handleAddDocumentId()}
+            >
+              添加
+            </Button>
+          </div>
+
+          {documentError ? <Alert tone="danger">{documentError}</Alert> : null}
+          {documentNotice ? <Alert tone="success">{documentNotice}</Alert> : null}
+        </CardBody>
+      </Card>
 
       <Card>
         <CardHeader

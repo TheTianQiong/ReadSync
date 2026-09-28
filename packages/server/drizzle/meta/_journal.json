@@ -22,6 +22,13 @@
       "when": 1790602851521,
       "tag": "0002_cloudy_callisto",
       "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "6",
+      "when": 1790605622479,
+      "tag": "0003_opposite_agent_zero",
+      "breakpoints": true
     }
   ]
 }

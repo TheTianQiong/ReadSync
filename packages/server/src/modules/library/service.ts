@@ -34,6 +34,7 @@ import {
 import { getModuleLogger } from '../../logger.js';
 import { getSiteSettings } from '../../lib/settings.js';
 import { koreaderDocumentIdFromFile } from '../../lib/document-id.js';
+import { listDocumentIds } from './documents.js';
 import { getAdapterForStorage, getDefaultAdapter } from '../storage/service.js';
 import { assertSafeKey, buildBookKey, type StorageAdapter } from '../storage/types.js';
 
@@ -149,6 +150,11 @@ function baseBookQuery() {
     .leftJoin(storages, eq(books.storageId, storages.id));
 }
 
+/** 取原始行；documents.ts 需要直接读 documentId 列 */
+export function getOwnedBookRow(userId: number, bookId: number): BookRow {
+  return getOwnedBook(userId, bookId).book;
+}
+
 function getOwnedBook(userId: number, bookId: number): BookWithStorage {
   const row = baseBookQuery()
     .where(and(eq(books.id, bookId), eq(books.ownerId, userId)))
@@ -249,7 +255,11 @@ export function listBookVersions(userId: number, bookId: number): BookVersion[] 
 
 export function getBookDetail(userId: number, bookId: number): BookDetail {
   const row = getOwnedBook(userId, bookId);
-  return { ...toBookSummary(row), versions: listBookVersions(userId, bookId) };
+  return {
+    ...toBookSummary(row),
+    versions: listBookVersions(userId, bookId),
+    documents: listDocumentIds(bookId),
+  };
 }
 
 export function checkBookExists(userId: number, md5: string): CheckBookExistsResult {

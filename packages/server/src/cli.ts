@@ -25,6 +25,11 @@ import {
 } from './crypto/password.js';
 import { closeDatabase, getDb, openDatabase } from './db/index.js';
 import { koreaderDocumentIdFromStorage } from './lib/document-id.js';
+import {
+  addDocumentId,
+  listDocumentIds,
+  removeDocumentId,
+} from './modules/library/documents.js';
 import { getAdapterForStorage } from './modules/storage/service.js';
 import {
   auditLogs,
@@ -956,6 +961,84 @@ program
       if (skipped > 0) {
         console.log(c(color.dim, '跳过的一般是文件已从存储上删除或读取失败；不影响其它书。'));
       }
+    }),
+  );
+
+/**
+ * 取书并带出它的 ownerId。
+ *
+ * CLI 是管理员上下文，不像 Web 接口那样从登录态拿 userId；但回填历史数据
+ * （认领进度与会话）必须按书的实际归属去查，所以这里显式取出来。
+ */
+function requireBook(bookId: number) {
+  const row = getDb().select().from(books).where(eq(books.id, bookId)).get();
+  if (!row) {
+    console.error(c(color.red, `找不到 ID 为 ${bookId} 的书籍`));
+    process.exit(1);
+  }
+  return row;
+}
+
+program
+  .command('book:documents <图书ID>')
+  .description('列出某本书的文档标识（阅读器用它关联进度）')
+  .action(
+    withDb((rawId: string) => {
+      const book = requireBook(Number(rawId));
+      const ids = listDocumentIds(book.id);
+
+      table([
+        {
+          标识: ids.primary ?? '—',
+          说明: ids.primary ? '服务端从文件算出（主标识）' : '没有可算的文件，需手工补充',
+        },
+        ...ids.aliases.map((a) => ({
+          标识: a.documentId,
+          说明: `${a.label ?? '手工补充'} · ${a.createdAt.slice(0, 10)}`,
+        })),
+      ]);
+
+      console.log(c(color.dim, `
+《${book.title}》`));
+      console.log(c(color.dim, '阅读器上报的标识与上面任一条一致，进度就会挂到这本书上。'));
+      console.log(c(color.dim, `补充：readsync book:add-document-id ${book.id} <标识>`));
+    }),
+  );
+
+program
+  .command('book:add-document-id <图书ID> <文档标识>')
+  .description('给一本书补一个文档标识，并认领该标识下已有的进度与会话')
+  .option('-l, --label <备注>', '备注，例如「Kindle 上的那份」')
+  .action(
+    withDb((rawId: string, documentId: string, opts: { label?: string }) => {
+      /*
+       * 用途：同一本书在不同平台各下一份时，内容采样算出的标识往往不同，
+       * 但它们确实是同一本书。把各平台的标识都补到同一本书上，
+       * 那些设备上报的进度就都能挂过来。
+       */
+      const book = requireBook(Number(rawId));
+      const result = addDocumentId(book.ownerId, book.id, documentId, opts.label);
+
+      console.log(c(color.green, `✓ 已给《${book.title}》补上标识 ${result.alias.documentId}`));
+      const { syncEntries, sessions } = result.relinked;
+      if (syncEntries > 0 || sessions > 0) {
+        console.log(
+          c(color.dim, `  认领回 ${syncEntries} 条进度记录、${sessions} 条阅读会话（进度与时长已重算）`),
+        );
+      } else {
+        console.log(c(color.dim, '  这个标识下暂时没有历史数据；设备下次上报时会自动挂上'));
+      }
+    }),
+  );
+
+program
+  .command('book:remove-document-id <图书ID> <别名ID>')
+  .description('移除一个补充的文档标识（用 book:documents 查看别名 ID）')
+  .action(
+    withDb((rawId: string, aliasId: string) => {
+      const book = requireBook(Number(rawId));
+      removeDocumentId(book.ownerId, book.id, Number(aliasId));
+      console.log(c(color.green, '✓ 已移除'));
     }),
   );
 
