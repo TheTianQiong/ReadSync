@@ -185,6 +185,22 @@ export const addBookDocumentSchema = z.object({
 });
 export type AddBookDocumentInput = z.infer<typeof addBookDocumentSchema>;
 
+/**
+ * 设置主标识（传 null 表示清空）。
+ *
+ * 主标识是服务端从存储里的文件算出来的，而那份文件未必与阅读器上的副本一致；
+ * 算出来的值对不上任何设备时就是个碍事的噪音，所以允许改、也允许清掉。
+ */
+export const setPrimaryDocumentSchema = z.object({
+  documentId: z
+    .string()
+    .trim()
+    .regex(/^[a-fA-F0-9]{32}$/, '文档标识必须是 32 位十六进制（阅读器里显示的那个值）')
+    .transform((v) => v.toLowerCase())
+    .nullable(),
+});
+export type SetPrimaryDocumentInput = z.infer<typeof setPrimaryDocumentSchema>;
+
 /** 书籍详情，附带版本历史与已知的文档标识 */
 export interface BookDetail extends BookSummary {
   versions: BookVersion[];

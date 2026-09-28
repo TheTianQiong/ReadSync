@@ -10,7 +10,7 @@
  */
 import { createHash, publicEncrypt, constants, randomUUID } from 'node:crypto';
 import { OTP } from 'otplib';
-import { rmSync } from 'node:fs';
+import { mkdirSync, rmSync } from 'node:fs';
 import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../app.js';
 import { loadConfig } from '../config.js';
@@ -111,7 +111,27 @@ async function main(): Promise<void> {
    */
   process.env.READSYNC_RATE_LIMIT_FACTOR = '50';
 
-  console.log(`端到端测试，数据目录：${config.dataDir}`);
+  /*
+   * 清空数据目录。
+   *
+   * 第 1 节断言的是「全新站点」（bootstrap 返回 initialized:false），残留数据
+   * 会让它一开始就不成立 —— 而失败现象看起来像「初始化接口坏了」，实际只是
+   * 上一次跑剩下的。上面那道护栏已经拦掉了不像测试目录的路径。
+   *
+   * 不能省这一步：本脚本还会创建 admin、往书库里塞书，靠的就是空库。
+   */
+  rmSync(config.dataDir, { recursive: true, force: true });
+
+  /*
+   * 删完得把目录补回来 —— loadConfig() 在上一步就顺手建好了这些目录，
+   * 现在整个数据目录连同它们一起没了。tmp 少了不会报「目录不存在」，
+   * 而是等到第一次上传才炸出一个 ENOENT，看着像上传功能坏了。
+   */
+  for (const dir of [config.dataDir, config.tmpDir, config.localStorageDir, config.pluginDir]) {
+    mkdirSync(dir, { recursive: true, mode: 0o700 });
+  }
+
+  console.log(`端到端测试，数据目录：${config.dataDir}（已清空）`);
 
   ensureKeyPair();
   openDatabase();
@@ -1027,6 +1047,104 @@ async function main(): Promise<void> {
       });
       check('可移除别名', removed.statusCode === 200 && removed.json().data?.aliases?.length === 1, removed.body);
 
+      /*
+       * 主标识可以替换、也可以清空。
+       *
+       * 主标识是服务端从「存储里那份文件」算出来的，而设备上的副本往往算出
+       * 另一个值 —— 摆着一个对不上的主标识纯粹是噪音。所以允许改成设备上
+       * 真实的值，或者干脆清掉，全改用别名。
+       */
+      const setPrimary = await api({
+        method: 'PUT',
+        url: `/api/books/${multiId}/documents/primary`,
+        headers: mAuth,
+        payload: { documentId: docC },
+      });
+      check('主标识可替换成设备上的标识', setPrimary.statusCode === 200, setPrimary.body);
+      // 断言的是「同一个值不会在主标识和别名里各存一份」，不是别名剩几条 ——
+      // 别名按创建时间倒序返回，而这里只能确定 A 平台的标识还在
+      check(
+        '替换后主标识变了，原别名上移、不再重复登记',
+        setPrimary.json().data?.documentId === docC &&
+          setPrimary.json().data?.documents?.primary === docC &&
+          !setPrimary.json().data?.documents?.aliases?.some((a: { documentId: string }) => a.documentId === docC),
+        setPrimary.json().data,
+      );
+
+      // 冲突校验必须拿「正被占着」的标识去撞 —— 拿已经空出来的值撞，撞不出东西
+      const clashPrimary = await api({
+        method: 'PUT',
+        url: `/api/books/${other.json().data?.id}/documents/primary`,
+        headers: mAuth,
+        payload: { documentId: docC },
+      });
+      check('主标识被别的书占用时拒绝', clashPrimary.statusCode === 409, clashPrimary.body);
+      check(
+        '拒绝信息指出是哪一本',
+        clashPrimary.json().error?.message?.includes('多平台同一本书'),
+        clashPrimary.json().error?.message,
+      );
+
+      // 清空主标识：别名与已经认领的数据都不受影响
+      const cleared = await api({
+        method: 'PUT',
+        url: `/api/books/${multiId}/documents/primary`,
+        headers: mAuth,
+        payload: { documentId: null },
+      });
+      check('主标识可清空', cleared.statusCode === 200 && cleared.json().data?.documentId === null, cleared.body);
+
+      const afterClear = await api({ method: 'GET', url: `/api/books/${multiId}`, headers: mAuth });
+      check('清空后 primary 为 null', afterClear.json().data?.documents?.primary === null, afterClear.json().data?.documents);
+      check(
+        '清空主标识不丢已认领的时长（1260 秒）',
+        afterClear.json().data?.totalReadingSeconds === 1260,
+        afterClear.json().data?.totalReadingSeconds,
+      );
+
+      /*
+       * 核心诉求：主标识去掉之后，阅读器用**别的标识**照样能同步。
+       *
+       * 这里用一个从未出现过的标识（docB）补成别名再上报 —— 如此才能证明
+       * 进度是靠别名匹配上的，而不是靠那条 sync_entries 早就存在的旧归属
+       * （归属一旦建立就是粘性的，拿老标识测会假过）。
+       */
+      const docB = createHash('md5').update('platform-b-doc').digest('hex');
+      const addB = await api({
+        method: 'POST',
+        url: `/api/books/${multiId}/documents`,
+        headers: mAuth,
+        payload: { documentId: docB, label: 'B 平台' },
+      });
+      check('主标识为 null 时仍可补充别名', addB.statusCode === 200, addB.body);
+
+      const pushB = await api({
+        method: 'PUT',
+        url: '/api/sync/progress',
+        headers: mAuth,
+        payload: {
+          document: docB,
+          progress: '/body/3',
+          percentage: 0.9,
+          device: 'platform-b',
+          device_id: 'platform-b',
+          readingSeconds: 30,
+        },
+      });
+      check('无主标识时按别名上报成功', pushB.statusCode === 200, pushB.body);
+
+      const afterB = await api({ method: 'GET', url: `/api/books/${multiId}`, headers: mAuth });
+      check(
+        '无主标识时进度靠别名挂上了（90%）',
+        Math.round(afterB.json().data?.progressPercent ?? -1) === 90,
+        afterB.json().data?.progressPercent,
+      );
+      check(
+        '无主标识时时长也归到这本书（1290 秒）',
+        afterB.json().data?.totalReadingSeconds === 1290,
+        afterB.json().data?.totalReadingSeconds,
+      );
+
       await api({ method: 'DELETE', url: `/api/books/${multiId}`, headers: mAuth });
       await api({ method: 'DELETE', url: `/api/books/${other.json().data?.id}`, headers: mAuth });
     }
@@ -1648,5 +1766,3 @@ main().catch((err) => {
   console.error('\n测试执行出错：', err);
   process.exit(1);
 });
-
-void rmSync;

@@ -9,6 +9,8 @@ build/
 
 # 运行时数据（数据库、密钥、上传缓存、插件）
 data/
+# 测试脚本自己造的数据目录（data-e2e / data-mig / data-smoke ...）
+data-*/
 *.db
 *.db-journal
 *.db-wal

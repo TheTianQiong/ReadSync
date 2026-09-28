@@ -29,6 +29,7 @@ import {
   addDocumentId,
   listDocumentIds,
   removeDocumentId,
+  setPrimaryDocumentId,
 } from './modules/library/documents.js';
 import { getAdapterForStorage } from './modules/storage/service.js';
 import {
@@ -1027,6 +1028,37 @@ program
         );
       } else {
         console.log(c(color.dim, '  这个标识下暂时没有历史数据；设备下次上报时会自动挂上'));
+      }
+    }),
+  );
+
+program
+  .command('book:set-primary-document-id <图书ID> <标识|none>')
+  .description('设置或清空主标识（传 none 清空）')
+  .action(
+    withDb((rawId: string, value: string) => {
+      /*
+       * 主标识是服务端从存储里的文件算出来的，而那份文件未必与阅读器上的
+       * 副本一致。算出来对不上任何设备时，清掉它（或改成设备实际用的值），
+       * 让这本书只靠补充的标识匹配，界面上也就不再有个误导人的值。
+       */
+      const book = requireBook(Number(rawId));
+      const next = value === 'none' ? null : value;
+      const result = setPrimaryDocumentId(book.ownerId, book.id, next);
+
+      if (result.documentId === null) {
+        console.log(c(color.green, '✓ 已清空主标识'));
+        console.log(c(color.dim, '  这本书仍会通过补充的标识接收进度；重跑 backfill 会再算出来'));
+      } else {
+        console.log(c(color.green, `✓ 主标识已设为 ${result.documentId}`));
+        if (result.relinked && (result.relinked.syncEntries > 0 || result.relinked.sessions > 0)) {
+          console.log(
+            c(
+              color.dim,
+              `  认领回 ${result.relinked.syncEntries} 条进度记录、${result.relinked.sessions} 条阅读会话`,
+            ),
+          );
+        }
       }
     }),
   );

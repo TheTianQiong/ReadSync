@@ -6,6 +6,7 @@ import {
   createBookSchema,
   presignCompleteSchema,
   presignUploadSchema,
+  setPrimaryDocumentSchema,
   listBooksQuerySchema,
   updateBookSchema,
   type ApiSuccess,
@@ -25,7 +26,12 @@ import { forbidden } from '../../errors.js';
 import { getSiteSettings } from '../../lib/settings.js';
 import { currentUser, requireAuth } from '../../middleware/auth.js';
 import { completeSession, createSession, discardSession, writeChunk } from './chunked.js';
-import { addDocumentId, listDocumentIds, removeDocumentId } from './documents.js';
+import {
+  addDocumentId,
+  listDocumentIds,
+  removeDocumentId,
+  setPrimaryDocumentId,
+} from './documents.js';
 import { completePresignedUpload, presignUpload } from './presign.js';
 import {
   checkBookExists,
@@ -232,7 +238,32 @@ export async function registerLibraryRoutes(app: FastifyInstance): Promise<void>
     } satisfies ApiSuccess<typeof result & { documents: BookDocumentIds }>;
   });
 
-  /** 移除一个补充的标识（主标识不在此列，它由文件算出来） */
+  /**
+   * 设置或清空主标识（传 null 清空）。
+   *
+   * 主标识是服务端从存储里的文件算出来的，而那份文件未必与阅读器上的副本一致。
+   * 算出来对不上任何设备时，留着一个不参与匹配的值只会让人误以为「已经配好了」，
+   * 所以允许改、也允许清掉 —— 清掉后这本书只靠补充的标识匹配。
+   */
+  app.put('/api/books/:id/documents/primary', auth, async (req) => {
+    const user = currentUser(req);
+    const bookId = parseIdParam(req.params);
+    const input = parseOrThrow(() => setPrimaryDocumentSchema.parse(req.body));
+
+    const result = setPrimaryDocumentId(user.id, bookId, input.documentId);
+
+    recordAudit('book.update', auditContextFrom(req, user), {
+      target: String(bookId),
+      meta: { action: input.documentId ? 'set-primary-document-id' : 'clear-primary-document-id' },
+    });
+
+    return {
+      ok: true,
+      data: { ...result, documents: listDocumentIds(bookId) },
+    } satisfies ApiSuccess<typeof result & { documents: BookDocumentIds }>;
+  });
+
+  /** 移除一个补充的标识（主标识用上面的接口清空） */
   app.delete<{ Params: { id: string; aliasId: string } }>(
     '/api/books/:id/documents/:aliasId',
     auth,

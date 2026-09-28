@@ -189,6 +189,25 @@ GET /api/storages/:id/browse?prefix=books/1/
 | GET | `/api/books/:id/download` | 下载（S3 直连预签名 URL，其余走服务端中转） |
 | GET / POST | `/api/books/:id/versions` | 版本历史 / 上传新版本 |
 | POST | `/api/books/:id/versions/:versionId/restore` | 回滚到历史版本 |
+| GET / POST | `/api/books/:id/documents` | 该书已知的文档标识 / 补充一个标识 |
+| PUT | `/api/books/:id/documents/primary` | 改主标识（`{"documentId": null}` 即清空） |
+| DELETE | `/api/books/:id/documents/:aliasId` | 移除一个补充标识 |
+
+**文档标识（documentId）是阅读进度挂到书上的唯一钥匙。** 它不等于整文件 MD5：
+KOReader 算的是**采样 MD5**（12 个固定偏移各读 1KB，见 `KOREADER_SAMPLE_OFFSETS`），
+对几 MB 的书也是瞬间得出。服务端在上传时按同一算法从文件算出并存为该书的**主标识**；
+预签名直传时文件不经过服务端，由浏览器算好带上；只登记书目时只能由用户填。
+
+上报的 `document` 按 **主标识/补充标识 → `books.md5` → 书名** 三档依次匹配，
+前两档精确，书名那档只作第三方客户端的兜底。
+
+- **同一账号内标识不可重复**：被别的书占用时返回 `409`，错误信息里指出是哪一本。
+- **补充或改主标识会认领历史数据**：把该标识下 `book_id` 为空的历史进度与会话
+  归到这本书上，响应里的 `relinked` 给出条数，并据此重算进度与累计时长。
+- **归属是粘性的**：已经归到某本书的进度记录不会被另一本书抢走，即使标识后来
+  被摘掉，那台设备再上报仍算在原书名下（避免误删标识就丢历史进度）。
+- `documents.primary` 可以为 `null`（只登记书目、或用户清空了它），此时靠补充
+  标识与整文件 MD5 匹配，同步照常工作。
 
 ### 3.5 统计 `/api/stats`
 

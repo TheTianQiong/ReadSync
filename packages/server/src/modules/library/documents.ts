@@ -135,6 +135,57 @@ export function addDocumentId(
   };
 }
 
+/**
+ * 设置或清空**主标识**。
+ *
+ * 为什么要能改／能删：主标识是服务端从存储里的文件算出来的，而那份文件未必
+ * 与阅读器上的副本一致（不同平台各下一份就会不同）。算出来的值对不上任何
+ * 设备时，它就是个碍事的噪音 —— 留着既不参与匹配，又让人以为「标识已经有了」。
+ *
+ * 传 null 表示清空：此后这本书只靠补充的标识匹配。已有的进度不会因此丢失，
+ * 它们已经认领到这本书上了。
+ *
+ * 注意：清空后再跑 `book:backfill-document-id` 会重新算出来填回。
+ */
+export function setPrimaryDocumentId(
+  userId: number,
+  bookId: number,
+  rawDocumentId: string | null,
+): { documentId: string | null; relinked: { syncEntries: number; sessions: number } | null } {
+  // getOwnedBookRow 已按 owner 校验，越权一律 404
+  getOwnedBookRow(userId, bookId);
+
+  if (rawDocumentId === null) {
+    getDb().update(books).set({ documentId: null, updatedAt: new Date() }).where(eq(books.id, bookId)).run();
+    log.info({ userId, bookId }, '清空主标识');
+    return { documentId: null, relinked: null };
+  }
+
+  const documentId = normalizeDocumentId(rawDocumentId);
+
+  // 先校验再改库：顺序反了的话，冲突时那条别名已经被删掉了，白丢一条记录
+  const occupiedBy = findOccupyingBook(userId, documentId, bookId);
+  if (occupiedBy !== null) {
+    const other = getDb().select({ title: books.title }).from(books).where(eq(books.id, occupiedBy)).get();
+    throw conflict(`该标识已被《${other?.title ?? occupiedBy}》占用，请先从那边移除`);
+  }
+
+  // 允许把它设成某个补充标识的值：那种情况下把那条别名收掉，
+  // 免得同一个值在主标识和别名里各存一份
+  getDb()
+    .delete(bookDocuments)
+    .where(and(eq(bookDocuments.bookId, bookId), eq(bookDocuments.documentId, documentId)))
+    .run();
+
+  getDb().update(books).set({ documentId, updatedAt: new Date() }).where(eq(books.id, bookId)).run();
+
+  // 换成别的值后，该值名下已有的进度也应当认领过来
+  const relinked = relinkExistingData(userId, documentId, bookId);
+  log.info({ userId, bookId, documentId, ...relinked }, '设置主标识');
+
+  return { documentId, relinked };
+}
+
 export function removeDocumentId(userId: number, bookId: number, aliasId: number): void {
   getOwnedBookRow(userId, bookId);
 

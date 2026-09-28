@@ -56,6 +56,9 @@ export function BookDetail(): ReactNode {
   const [addingDocumentId, setAddingDocumentId] = useState(false);
   const [documentError, setDocumentError] = useState<string | null>(null);
   const [documentNotice, setDocumentNotice] = useState<string | null>(null);
+  const [editingPrimary, setEditingPrimary] = useState(false);
+  const [primaryDraft, setPrimaryDraft] = useState('');
+  const [savingPrimary, setSavingPrimary] = useState(false);
 
   const { data: book, loading, error, reload } = useAsync(
     () => api.get<BookDetailData>(`/books/${bookId}`),
@@ -130,6 +133,44 @@ export function BookDetail(): ReactNode {
       setDocumentError(err instanceof Error ? err.message : '添加失败');
     } finally {
       setAddingDocumentId(false);
+    }
+  };
+
+  /**
+   * 设置或清空主标识（传 null 清空）。
+   *
+   * 主标识是服务端从存储里的文件算出来的，而那份文件未必与阅读器上的副本
+   * 一致。算出来对不上任何设备时，留着它只会让人误以为「已经配好了」。
+   */
+  const handleSavePrimary = async (value?: string | null): Promise<void> => {
+    const next = value === undefined ? primaryDraft.trim() : value;
+    if (next !== null && next !== '' && !/^[a-fA-F0-9]{32}$/.test(next)) {
+      setDocumentError('文档标识是 32 位十六进制，请照抄阅读器里显示的那个值');
+      return;
+    }
+
+    setSavingPrimary(true);
+    setDocumentError(null);
+    setDocumentNotice(null);
+    try {
+      const result = await api.put<{ relinked: { syncEntries: number; sessions: number } | null }>(
+        `/books/${bookId}/documents/primary`,
+        { documentId: next === '' ? null : next },
+      );
+      setEditingPrimary(false);
+      const relinked = result.relinked;
+      setDocumentNotice(
+        next === null || next === ''
+          ? '已清空主标识。这本书仍会通过下面补充的标识接收进度。'
+          : relinked && (relinked.syncEntries > 0 || relinked.sessions > 0)
+            ? `已设为主标识，并认领回 ${relinked.syncEntries} 条进度记录、${relinked.sessions} 条阅读会话`
+            : '已设为主标识',
+      );
+      reload();
+    } catch (err) {
+      setDocumentError(err instanceof Error ? err.message : '保存失败');
+    } finally {
+      setSavingPrimary(false);
     }
   };
 
@@ -277,15 +318,91 @@ export function BookDetail(): ReactNode {
         <CardBody className="flex flex-col gap-3">
           <div className="flex flex-col gap-1.5">
             <div className="flex items-center justify-between gap-2 rounded-sm border border-line bg-surface-2 px-3 py-2">
-              <span className="flex min-w-0 flex-col">
-                <span className="font-sans text-xs text-ink-soft">
-                  {book.documentId ?? '（未知）'}
+              {editingPrimary ? (
+                <span className="flex flex-1 flex-col gap-1.5">
+                  <span className="flex items-center gap-2">
+                    <Input
+                      value={primaryDraft}
+                      onChange={(event) => setPrimaryDraft(event.target.value)}
+                      placeholder="粘贴阅读器里显示的标识，留空则清空"
+                      className="font-mono text-xs"
+                      maxLength={32}
+                    />
+                    <Button
+                      size="sm"
+                      variant="primary"
+                      loading={savingPrimary}
+                      onClick={() => void handleSavePrimary()}
+                    >
+                      保存
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      onClick={() => {
+                        setEditingPrimary(false);
+                        setDocumentError(null);
+                      }}
+                    >
+                      取消
+                    </Button>
+                  </span>
+                  {/*
+                    有些第三方客户端直接把整文件 MD5 当文档标识上报。
+                    与其让人跑去别处查这个值，不如直接给个填入口 ——
+                    服务端本来就拿它当第二档匹配键，填进来只会更稳。
+                  */}
+                  <span className="flex items-center gap-2 font-sans text-[11px] text-muted">
+                    <span className="truncate">本书整文件 MD5：{book.md5}</span>
+                    <Button
+                      size="sm"
+                      variant="quiet"
+                      className="shrink-0 underline"
+                      onClick={() => setPrimaryDraft(book.md5)}
+                    >
+                      填入
+                    </Button>
+                  </span>
                 </span>
-                <span className="font-sans text-[11px] text-muted">
-                  {book.documentId ? '服务端从文件算出' : '这本没有可算的文件，需手工补充'}
-                </span>
-              </span>
-              {book.documentId ? <Badge tone="accent">主标识</Badge> : null}
+              ) : (
+                <>
+                  <span className="flex min-w-0 flex-col">
+                    <span className="truncate font-sans text-xs text-ink-soft">
+                      {book.documentId ?? '（未设置）'}
+                    </span>
+                    <span className="font-sans text-[11px] text-muted">
+                      {book.documentId
+                        ? '服务端从文件算出 · 对不上设备时可改可删'
+                        : '没有可算的文件；这本书只靠下面补充的标识匹配'}
+                    </span>
+                  </span>
+                  <span className="flex shrink-0 items-center gap-1">
+                    {book.documentId ? <Badge tone="accent">主标识</Badge> : null}
+                    <Button
+                      size="sm"
+                      variant="quiet"
+                      aria-label="修改主标识"
+                      icon={<Pencil size={13} />}
+                      onClick={() => {
+                        setPrimaryDraft(book.documentId ?? '');
+                        setEditingPrimary(true);
+                        setDocumentError(null);
+                        setDocumentNotice(null);
+                      }}
+                    />
+                    {book.documentId ? (
+                      <Button
+                        size="sm"
+                        variant="quiet"
+                        aria-label="清空主标识"
+                        className="hover:text-danger"
+                        icon={<X size={13} />}
+                        onClick={() => void handleSavePrimary(null)}
+                      />
+                    ) : null}
+                  </span>
+                </>
+              )}
             </div>
 
             {(book.documents?.aliases ?? []).map((alias) => (

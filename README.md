@@ -300,6 +300,8 @@ curl -s http://<你的服务器地址>:3000/healthcheck
 
 同一本书在不同平台各下一份时算出的标识往往不同（内容采样所致）。在**书籍详情页 →「文档标识」**里可以把它们都补到同一本书上，补完会自动认领已有的进度与时长。升级前就有的书可用 `readsync book:backfill-document-id` 一次性补上主标识（只读 12KB，不下载整本）。
 
+主标识（服务端从文件算出的那个）也可以改或删：点铅笔粘贴设备上真实的值，或点叉清空。对不上设备时留着它只会让人误以为配好了 —— 清空后补充的标识照常工作，已经认领的进度与时长不受影响。命令行是 `readsync book:set-primary-document-id <图书ID> <标识|none>`。
+
 注意「文档标识」要填阅读器里显示的那个值 —— 它是 KOReader 的**采样 MD5**（在 12 个固定偏移各读 1KB 算出），**不是文件的完整 MD5**。服务端上传的书会自己算，登记的书只能由你填。详见[只登记书目](docs/metadata-only.md)。
 
 **多人共用一个公网 IP，老是提示「操作过于频繁」**
@@ -607,7 +609,7 @@ READSYNC_DATA_DIR=./data-smoke npx tsx src/scripts/smoke-db.ts
 # 数据库迁移校验（含数据保留与外键完整性），会自建旧版库再升级
 READSYNC_DATA_DIR=./data-mig npx tsx src/scripts/check-migration.ts
 
-# 端到端集成测试（200 项断言：认证 / 2FA / 恢复码 / 上传 / 分片 / 预签名直传 / 只登记书目 / 进度关联 / 多标识 / 跨域 / 同步 / 统计 / KOSync / 权限隔离）
+# 端到端集成测试（211 项断言：认证 / 2FA / 恢复码 / 上传 / 分片 / 预签名直传 / 只登记书目 / 进度关联 / 多标识 / 跨域 / 同步 / 统计 / KOSync / 权限隔离）
 READSYNC_DATA_DIR=./data-e2e npx tsx src/scripts/smoke-e2e.ts
 
 # 真实 socket 的大文件整体上传（冒烟测试走进程内 inject，照不出传输层问题）
