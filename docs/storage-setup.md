@@ -115,5 +115,27 @@ WebDAV 不支持预签名，传大文件时用分片上传。
 | 上传时报「存储『xxx』不支持预签名直传」 | 当前是本地磁盘或 WebDAV。前端会自动回退到分片上传；也可以把「上传方式」改回分片 |
 | 上传成功但下载 404 | 对象前缀在配置前后被改过，老文件的位置与新前缀对不上 |
 | 直传时报「无法连接对象存储」 | 桶的 CORS 没配。见 [storage-cors.md](storage-cors.md) |
+| `You can only specify one non-default checksum at a time` | AWS SDK v3.729+ 的默认完整性保护会额外加一个 crc32 校验和，与上传校验用的 Content-MD5 冲突。本项目已关闭该行为（`requestChecksumCalculation: 'WHEN_REQUIRED'`）；若你自行改过适配器，把这两项加回客户端配置即可 |
+
+### 关于「校验和冲突」这个坑
+
+值得单独说一句，因为它**只在真实对象存储上才会暴露**：
+
+AWS SDK 从 v3.729 起默认给 PutObject 加上 `x-amz-checksum-crc32`。而本项目为了做上传校验，本来就会传 `Content-MD5`。两者都属于「非默认校验和」，真实 S3 / R2 会直接拒绝，报：
+
+```
+You can only specify one non-default checksum at a time.
+```
+
+同一个默认行为还会把校验和**签进预签名 URL**，而浏览器直传时只会带 Content-Type —— 服务端按签名核对校验和，对不上就拒绝。
+
+所以适配器里显式关掉了它：
+
+```ts
+requestChecksumCalculation: 'WHEN_REQUIRED',
+responseChecksumValidation: 'WHEN_REQUIRED',
+```
+
+前者避免多带一个校验和，后者避免各厂商返回的校验和格式与 SDK 预期不一致导致下载莫名失败。**这不影响校验强度** —— 我们自己的 Content-MD5 校验照旧生效。
 
 排查顺序建议：先点 **测试** 看连通性 → 再点 **浏览** 看能不能列出对象 → 最后试传一本小书。这样能把「凭据问题」「路径问题」「上传问题」分开，不用一次猜一堆。

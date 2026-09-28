@@ -16,6 +16,11 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
  *   DELETE /{bucket}/{key}  删除
  *
  * 签名一概不验：本脚本要验的是 ReadSync 的逻辑，不是 AWS 的签名算法。
+ *
+ * 但**校验和的冲突要验**：真实 S3 / R2 在请求同时带两个非默认校验和时会直接
+ * 拒绝（"You can only specify one non-default checksum at a time"），而 AWS SDK
+ * v3.729+ 的默认完整性保护会主动加一个 crc32。若测试用的假 S3 对此照单全收，
+ * 这个组合就能一路通过测试、到用户那里才炸。所以这里复刻真实的拒绝行为。
  */
 
 interface StoredObject {
@@ -28,8 +33,11 @@ export interface MockS3 {
   bucket: string;
   /** 桶里当前的键值，供断言直接检查 */
   objects: Map<string, StoredObject>;
-  /** 收到的请求记录（方法 + 路径），便于确认客户端确实打到了这里 */
-  requests: { method: string; path: string }[];
+  /**
+   * 收到的请求记录。带 headers 是为了排查「校验和冲突」这类问题 ——
+   * 服务端拒的是请求头组合，只看方法+路径根本看不出发生了什么。
+   */
+  requests: { method: string; path: string; headers: Record<string, string | string[] | undefined> }[];
   close: () => Promise<void>;
   /**
    * 开关「让 HEAD 返回与内容不符的 ETag」，用于验证服务端的内容校验确实生效。
@@ -57,13 +65,13 @@ function parsePath(pathname: string, bucket: string): { bucket: string; key: str
 export async function startMockS3(): Promise<MockS3> {
   const bucket = 'test-bucket';
   const objects = new Map<string, StoredObject>();
-  const requests: { method: string; path: string }[] = [];
+  const requests: { method: string; path: string; headers: Record<string, string | string[] | undefined> }[] = [];
   const corrupted = new Set<string>();
 
   const server: Server = createServer((req: IncomingMessage, res: ServerResponse) => {
     void (async () => {
       const url = new URL(req.url ?? '/', 'http://127.0.0.1');
-      requests.push({ method: req.method ?? 'GET', path: url.pathname });
+      requests.push({ method: req.method ?? 'GET', path: url.pathname, headers: req.headers });
 
       const parsed = parsePath(url.pathname, bucket);
       if (!parsed) {
@@ -73,6 +81,30 @@ export async function startMockS3(): Promise<MockS3> {
       const { key } = parsed;
 
       if (req.method === 'PUT') {
+        /*
+         * 复刻真实服务的约束：Content-MD5 与 x-amz-checksum-* 同属「非默认校验和」，
+         * 一次请求里最多只能有一个，否则 400。
+         */
+        const nonDefault = [
+          req.headers['content-md5'],
+          req.headers['x-amz-checksum-crc32'],
+          req.headers['x-amz-checksum-crc32c'],
+          req.headers['x-amz-checksum-sha1'],
+          req.headers['x-amz-checksum-sha256'],
+          req.headers['x-amz-checksum-crc64nvme'],
+        ].filter(Boolean);
+
+        if (nonDefault.length > 1) {
+          const message = 'You can only specify one non-default checksum at a time.';
+          res
+            .writeHead(400, { 'Content-Type': 'application/xml' })
+            .end(
+              `<?xml version="1.0" encoding="UTF-8"?><Error><Code>InvalidRequest</Code>` +
+                `<Message>${message}</Message></Error>`,
+            );
+          return;
+        }
+
         const body = await readBody(req);
         objects.set(key, {
           body,

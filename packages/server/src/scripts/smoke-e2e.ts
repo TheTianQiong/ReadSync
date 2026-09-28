@@ -791,6 +791,19 @@ async function main(): Promise<void> {
         const objectKey = presigned.json().data?.objectKey as string;
         check('预签名：URL 指向配置的 endpoint', signedUrl?.startsWith(s3.endpoint), signedUrl?.slice(0, 80));
         check('预签名：objectKey 由 md5 派生', objectKey?.includes(payloadMd5), objectKey);
+        /*
+         * 签发的 URL 里不能带校验和参数。
+         *
+         * SDK 的默认完整性保护会把 x-amz-checksum-crc32 一并签进查询串，
+         * 而浏览器直传时只会带 Content-Type —— 服务端按签名核对校验和，
+         * 对不上就拒绝。这类问题在只验「URL 能访问」的测试里看不出来。
+         */
+        const signedParams = [...new URL(signedUrl).searchParams.keys()];
+        check(
+          '预签名：URL 未签入校验和参数（否则浏览器直传会签名不符）',
+          signedParams.every((k) => !/checksum/i.test(k)),
+          signedParams.filter((k) => /checksum/i.test(k)),
+        );
 
         // 浏览器拿 URL 直接 PUT —— 这一步完全不经过本服务
         const before = s3.requests.length;
@@ -880,6 +893,43 @@ async function main(): Promise<void> {
         check('预签名：确认入库成功', completed.statusCode === 200, completed.body);
         check('预签名：入库的 md5 正确', completed.json().data?.md5 === payloadMd5, completed.json().data?.md5);
         check('预签名：入库的存储指向对象存储', completed.json().data?.storageId === s3StorageId, completed.json().data?.storageId);
+
+        /*
+         * 经服务端把文件传到对象存储（整体上传路径）。
+         *
+         * 这条路径和直传不同：文件先到服务端，再由适配器的 put() 发往对象存储。
+         * 之前它整个是坏的 —— AWS SDK v3.729+ 的默认完整性保护会自动加
+         * x-amz-checksum-crc32，而适配器同时传了 Content-MD5，真实 S3/R2
+         * 直接拒绝（"You can only specify one non-default checksum at a time"）。
+         * 假 S3 现已复刻该拒绝行为，这里就是那条回归的哨兵。
+         */
+        const viaServerContent = Buffer.from(`via-server ${randomUUID()}`.repeat(40), 'utf8');
+        const viaServerMd5 = createHash('md5').update(viaServerContent).digest('hex');
+        const viaServerMp = buildMultipart(
+          { title: '经服务端传到对象存储', format: 'epub', storageId: String(s3StorageId) },
+          {
+            field: 'file',
+            filename: 'viaserver.epub',
+            content: viaServerContent,
+            contentType: 'application/epub+zip',
+          },
+        );
+        const viaServer = await api({
+          method: 'POST',
+          url: '/api/books/upload',
+          headers: { ...auth, 'content-type': viaServerMp.contentType },
+          payload: viaServerMp.body,
+        });
+        check('经服务端上传到对象存储成功（校验和不冲突）', viaServer.statusCode === 200, viaServer.body);
+        check('经服务端上传的内容正确落桶', viaServer.json().data?.md5 === viaServerMd5, viaServer.json().data?.md5);
+
+        // 顺带验证下载路径也没被 SDK 的响应校验拦下
+        const s3Download = await api({
+          method: 'GET',
+          url: `/api/books/${viaServer.json().data?.id}/download`,
+          headers: auth,
+        });
+        check('对象存储上的书能正常下载', s3Download.statusCode === 302, s3Download.statusCode);
 
         // 秒传：同一份内容再签一次，应当直接返回已有书籍，一个字节都不用传
         const again = await api({

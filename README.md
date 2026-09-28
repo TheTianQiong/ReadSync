@@ -308,6 +308,10 @@ curl -s http://<你的服务器地址>:3000/healthcheck
 READSYNC_RATE_LIMIT_FACTOR=3   # 全部接口配额 ×3
 ```
 
+**上传报 `You can only specify one non-default checksum at a time`**
+
+对象存储服务端拒绝了请求：AWS SDK v3.729+ 会默认额外带一个 crc32 校验和，与上传校验用的 Content-MD5 冲突。当前版本已关闭该默认行为，**升级到最新版即可**。若你改过 S3 适配器，把 `requestChecksumCalculation: 'WHEN_REQUIRED'` 与 `responseChecksumValidation: 'WHEN_REQUIRED'` 加回 `new S3Client({...})`。详见[存储后端配置指南](docs/storage-setup.md#关于校验和冲突这个坑)。
+
 **上传书籍失败，提示「上传失败，网络连接中断」**
 
 网页端走**分片上传**，且分片大小会**自动适应链路**：某一片被中间层拒绝（Cloudflare `524` 源站超时、`504`、Nginx `413`）时，前端会把分片减半、重建会话重来，直到传得动（4 MiB → 2 → 1 → 512 → 256 KiB）。界面上会显示「网络较慢，正在把分片减小到 X 重试…」。
@@ -601,7 +605,7 @@ READSYNC_DATA_DIR=./data-smoke npx tsx src/scripts/smoke-db.ts
 # 数据库迁移校验（含数据保留与外键完整性），会自建旧版库再升级
 READSYNC_DATA_DIR=./data-mig npx tsx src/scripts/check-migration.ts
 
-# 端到端集成测试（168 项断言：认证 / 2FA / 恢复码 / 上传 / 分片 / 预签名直传 / 只登记书目 / 跨域 / 同步 / 统计 / KOSync / 权限隔离）
+# 端到端集成测试（172 项断言：认证 / 2FA / 恢复码 / 上传 / 分片 / 预签名直传 / 只登记书目 / 跨域 / 同步 / 统计 / KOSync / 权限隔离）
 READSYNC_DATA_DIR=./data-e2e npx tsx src/scripts/smoke-e2e.ts
 
 # 真实 socket 的大文件整体上传（冒烟测试走进程内 inject，照不出传输层问题）

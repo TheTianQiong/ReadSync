@@ -112,6 +112,24 @@ export class S3StorageAdapter implements DirectoryAdapter {
         accessKeyId: config.accessKeyId,
         secretAccessKey: config.secretAccessKey,
       },
+
+      /*
+       * 关掉 SDK 的「默认完整性保护」自动加校验和。
+       *
+       * AWS SDK v3.729+ 起，PutObject 会默认自动带上 x-amz-checksum-crc32。
+       * 而我们在 put() 里为了让 S3 做上传校验，本来就传了 Content-MD5 ——
+       * 两者同属「非默认校验和」，真实 S3 / R2 会直接拒绝：
+       *   You can only specify one non-default checksum at a time.
+       * 上传因此全部失败，且报错来自服务端、看起来与我们的代码无关。
+       *
+       * WHEN_REQUIRED 让 SDK 只在操作**必须**带校验和时才加（PutObject 不是），
+       * 于是请求里只剩我们自己的 Content-MD5，校验能力一点没少。
+       *
+       * 响应侧同理：默认会校验收到的校验和，而各 S3 兼容实现返回的格式未必
+       * 与 SDK 预期一致，下载会莫名报校验失败。同样收窄。
+       */
+      requestChecksumCalculation: 'WHEN_REQUIRED',
+      responseChecksumValidation: 'WHEN_REQUIRED',
     });
 
     this.description = `S3 兼容存储（${config.endpoint}/${config.bucket}${this.prefix ? `/${this.prefix}` : ''}）`;
