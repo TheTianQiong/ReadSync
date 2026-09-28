@@ -298,6 +298,8 @@ curl -s http://<你的服务器地址>:3000/healthcheck
 
 不必再跟网络较劲：管理后台「站点设置 → 上传限制 → 允许上传书籍文件」关掉，然后在书库页用「**登记书目**」——填书名与 MD5 即可。**阅读进度同步、阅读时长统计、书库管理全都不依赖文件**，只有下载和版本回滚需要。详见[只登记书目](docs/metadata-only.md)。
 
+升级前就有的书可以用 `readsync book:backfill-document-id` 一次性补上标识（只读 12KB，不下载整本）。
+
 注意「文档标识」要填阅读器里显示的那个值 —— 它是 KOReader 的**采样 MD5**（在 12 个固定偏移各读 1KB 算出），**不是文件的完整 MD5**。服务端上传的书会自己算，登记的书只能由你填。详见[只登记书目](docs/metadata-only.md)。
 
 **多人共用一个公网 IP，老是提示「操作过于频繁」**
@@ -605,7 +607,7 @@ READSYNC_DATA_DIR=./data-smoke npx tsx src/scripts/smoke-db.ts
 # 数据库迁移校验（含数据保留与外键完整性），会自建旧版库再升级
 READSYNC_DATA_DIR=./data-mig npx tsx src/scripts/check-migration.ts
 
-# 端到端集成测试（179 项断言：认证 / 2FA / 恢复码 / 上传 / 分片 / 预签名直传 / 只登记书目 / 进度关联 / 跨域 / 同步 / 统计 / KOSync / 权限隔离）
+# 端到端集成测试（184 项断言：认证 / 2FA / 恢复码 / 上传 / 分片 / 预签名直传 / 只登记书目 / 进度关联 / 跨域 / 同步 / 统计 / KOSync / 权限隔离）
 READSYNC_DATA_DIR=./data-e2e npx tsx src/scripts/smoke-e2e.ts
 
 # 真实 socket 的大文件整体上传（冒烟测试走进程内 inject，照不出传输层问题）

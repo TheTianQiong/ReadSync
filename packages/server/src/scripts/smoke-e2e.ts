@@ -17,6 +17,8 @@ import { loadConfig } from '../config.js';
 import { ensureKeyPair } from '../crypto/keys.js';
 import { closeDatabase, openDatabase } from '../db/index.js';
 import { computeKoreaderDocumentId } from '@readsync/shared';
+import { koreaderDocumentIdFromStorage } from '../lib/document-id.js';
+import { getAdapterForStorage } from '../modules/storage/service.js';
 import { startMockS3 } from './mock-s3.js';
 
 /**
@@ -834,6 +836,52 @@ async function main(): Promise<void> {
 
       await api({ method: 'DELETE', url: `/api/books/${bookId}`, headers: auth });
       await api({ method: 'DELETE', url: `/api/books/${secondId}`, headers: auth });
+    }
+
+    /* ---------- 5b5. 范围读与「给老数据补文档标识」的底层能力 ---------- */
+    section('5b5. 范围读（补文档标识时只读 12KB，不下载整本）');
+    {
+      /*
+       * 修复之前上传的书没有文档标识，需要事后补。补的时候若把整本书拉下来
+       * 就太贵了 —— 算法只要 12 个 1KB 窗口，所以适配器支持范围读；
+       * 这里验证范围读本身正确（含越界语义），以及「从存储算出的值与
+       * 从本地文件算出的一致」。
+       */
+      const adapter = await getAdapterForStorage(storageId, 1);
+      const content = Buffer.from(`range-read ${randomUUID()} `.repeat(400), 'utf8');
+      const key = `probe/${randomUUID()}.bin`;
+      await adapter.put(key, content, { contentType: 'application/octet-stream' });
+
+      const head = await adapter.getRange?.(key, 0, 16);
+      check('范围读：取到正确的头部', head?.equals(content.subarray(0, 16)) === true, head?.toString());
+
+      const mid = await adapter.getRange?.(key, 100, 50);
+      check('范围读：取到正确的中间段', mid?.equals(content.subarray(100, 150)) === true, mid?.length);
+
+      // 起始位置恰好等于大小 → 无数据可读，返回 null（采样循环据此停止）
+      const past = await adapter.getRange?.(key, content.length, 16);
+      check('范围读：起点越过末尾返回 null', past === null, past);
+
+      // 跨过末尾时要截断到实际长度，而不是报错或补零
+      const tail = await adapter.getRange?.(key, content.length - 10, 999);
+      check('范围读：末尾处按实际长度截断', tail?.equals(content.subarray(content.length - 10)) === true, tail?.length);
+
+      // 从存储算出的文档标识，必须与独立计算出的一致 ——
+      // 这是「补文档标识」这条路的正确性判据
+      const fromStorage = await koreaderDocumentIdFromStorage(adapter, key, content.length);
+      const expected = await computeKoreaderDocumentId(
+        () => {
+          const hash = createHash('md5');
+          return { update: (d: Uint8Array) => hash.update(d), digest: () => hash.digest('hex') };
+        },
+        async (offset, length) => {
+          if (offset >= content.length) return null;
+          return content.subarray(offset, Math.min(offset + length, content.length));
+        },
+      );
+      check('从存储算出的文档标识与独立计算一致', fromStorage === expected, { fromStorage, expected });
+
+      await adapter.delete(key).catch(() => undefined);
     }
 
     /* ---------------------- 5c. 预签名直传 ---------------------- */

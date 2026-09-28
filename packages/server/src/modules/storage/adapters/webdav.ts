@@ -144,6 +144,33 @@ export class WebdavStorageAdapter implements DirectoryAdapter {
     return st ?? { key, size: 0, lastModified: new Date().toISOString(), etag: options?.md5 ?? null };
   }
 
+  /**
+   * 只读文件的一段（HTTP Range）。
+   *
+   * 算阅读器的文档标识只需 12 个 1KB 窗口；没有范围读的网盘会退化成整份下载，
+   * 对几百 MB 的书代价很大。
+   */
+  async getRange(key: string, offset: number, length: number): Promise<Buffer | null> {
+    try {
+      // 与 get() 用同一套路径拼接，避免两处各写一份导致不一致
+      const stream = this.client.createReadStream(joinRemote(this.basePath, key), {
+        range: { start: offset, end: offset + length - 1 },
+      });
+      const chunks: Buffer[] = [];
+      for await (const chunk of stream) {
+        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as string));
+      }
+      const buffer = Buffer.concat(chunks);
+      return buffer.length === 0 ? null : buffer;
+    } catch (err) {
+      const status = (err as { status?: number }).status;
+      // 416：起点越过末尾；404：对象不存在
+      if (status === 416) return null;
+      if (status === 404) throw notFound(`WebDAV 上不存在：${key}`);
+      throw storageError(`读取 WebDAV 文件失败：${(err as Error).message}`, err);
+    }
+  }
+
   async get(key: string, options?: GetOptions): Promise<GetResult> {
     const file = await this.remoteStat(key);
     if (!file) throw notFound(`WebDAV 上不存在：${key}`);

@@ -102,6 +102,17 @@ export interface StorageAdapter {
   /** 下载对象；对象不存在时抛 NOT_FOUND */
   get(key: string, options?: GetOptions): Promise<GetResult>;
 
+  /**
+   * 只读对象的一段（远程读，不落盘）。
+   *
+   * 为「算阅读器的文档标识」而加：那个算法只在 12 个固定偏移各读 1KB，
+   * 有范围读就只需取 12KB，没有就得把上百 MB 的整本书拉下来。
+   * 返回 null 表示该位置已越过对象末尾。
+   *
+   * 可选实现：不支持范围读的驱动留空即可，调用方会退化为整份下载。
+   */
+  getRange?(key: string, offset: number, length: number): Promise<Buffer | null>;
+
   /** 对象是否存在（不下载内容） */
   exists(key: string): Promise<boolean>;
 

@@ -188,6 +188,33 @@ export class S3StorageAdapter implements DirectoryAdapter {
     }
   }
 
+  /**
+   * 只读对象的一段（S3 Range 请求）。
+   *
+   * 算阅读器的文档标识只需 12 个 1KB 窗口，用 Range 就只传 12KB，
+   * 而不是把整本书拉下来 —— 对几百 MB 的书差别很大。
+   */
+  async getRange(key: string, offset: number, length: number): Promise<Buffer | null> {
+    try {
+      const result = await this.client.send(
+        new GetObjectCommand({
+          Bucket: this.bucket,
+          Key: this.fullKey(key),
+          Range: `bytes=${offset}-${offset + length - 1}`,
+        }),
+      );
+      if (!result.Body) return null;
+      return await streamToBuffer(result.Body as unknown as NodeJS.ReadableStream);
+    } catch (err) {
+      // 起点越过对象末尾时 S3 回 416，与「读不到」同义，交给调用方停止采样
+      if (httpStatusOf(err) === 416) return null;
+      if (errorName(err) === 'NoSuchKey' || httpStatusOf(err) === 404) {
+        throw notFound(`对象存储上不存在：${key}`);
+      }
+      throw storageError(describeError(err), err);
+    }
+  }
+
   async get(key: string, options?: GetOptions): Promise<GetResult> {
     if (options?.metadataOnly) {
       const st = await this.stat(key);

@@ -1,6 +1,11 @@
-import { createHash } from 'node:crypto';
-import { open, stat } from 'node:fs/promises';
+import { createHash, randomUUID } from 'node:crypto';
+import { createWriteStream } from 'node:fs';
+import { open, rm, stat } from 'node:fs/promises';
+import path from 'node:path';
+import { pipeline } from 'node:stream/promises';
 import { KOREADER_SAMPLE_SIZE, computeKoreaderDocumentId } from '@readsync/shared';
+import { loadConfig } from '../config.js';
+import type { StorageAdapter } from '../modules/storage/types.js';
 import { getModuleLogger } from '../logger.js';
 
 /**
@@ -50,5 +55,50 @@ export async function koreaderDocumentIdFromFile(filePath: string): Promise<stri
     return null;
   } finally {
     await handle?.close().catch(() => undefined);
+  }
+}
+
+/**
+ * 从存储后端算文档标识（用于给「修复之前上传的书」补上这一列）。
+ *
+ * 优先用驱动的范围读：只取 12 个 1KB 窗口，总共 12KB。若驱动不支持
+ * （插件自定义的驱动可能没有实现 getRange），退化为整份下载到临时文件再算 ——
+ * 代价大得多，但总比补不上好。
+ */
+export async function koreaderDocumentIdFromStorage(
+  adapter: StorageAdapter,
+  key: string,
+  size: number,
+): Promise<string | null> {
+  try {
+    if (adapter.getRange) {
+      return await computeKoreaderDocumentId(
+        () => {
+          const hash = createHash('md5');
+          return {
+            update: (data: Uint8Array) => hash.update(data),
+            digest: () => hash.digest('hex'),
+          };
+        },
+        async (offset, length) => {
+          if (offset >= size) return null;
+          return adapter.getRange!(key, offset, length);
+        },
+      );
+    }
+
+    // 退路：整份下载到临时文件
+    const got = await adapter.get(key);
+    if (!got.stream) return null;
+    const tmpPath = path.join(loadConfig().tmpDir, `docid-${randomUUID()}.tmp`);
+    try {
+      await pipeline(got.stream as NodeJS.ReadableStream, createWriteStream(tmpPath));
+      return await koreaderDocumentIdFromFile(tmpPath);
+    } finally {
+      await rm(tmpPath, { force: true }).catch(() => undefined);
+    }
+  } catch (err) {
+    log.warn({ err, key }, '从存储计算文档标识失败');
+    return null;
   }
 }

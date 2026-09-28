@@ -24,6 +24,8 @@ import {
   sha256Hex,
 } from './crypto/password.js';
 import { closeDatabase, getDb, openDatabase } from './db/index.js';
+import { koreaderDocumentIdFromStorage } from './lib/document-id.js';
+import { getAdapterForStorage } from './modules/storage/service.js';
 import {
   auditLogs,
   books,
@@ -35,6 +37,7 @@ import {
   users,
 } from './db/schema.js';
 import { getSiteSettings, patchSiteSettings } from './lib/settings.js';
+import { setLogLevel } from './logger.js';
 import { displayWidth, hLine, padDisplayEnd } from './lib/text.js';
 import { createUser, findUserByLogin, findUserByLoginLoose, toSessionUser } from './lib/users.js';
 
@@ -870,6 +873,93 @@ program
   );
 
 program
+  .command('book:backfill-document-id')
+  .description('给已有书籍补上「文档标识」（让阅读器的进度能关联到这些书）')
+  .option('-u, --user <用户名>', '只处理某用户的书籍')
+  .option('--dry-run', '只显示将要补哪些，不写库')
+  .option('--force', '已有文档标识的书也重新计算')
+  .action(
+    withDb(async (opts: { user?: string; dryRun?: boolean; force?: boolean }) => {
+      /*
+       * 背景：早先版本把「整文件 MD5」当成阅读器的文档标识用，导致上传的书
+       * 一直收不到进度关联。修复后新上传的会自动带上，但**已有数据仍是空的**。
+       *
+       * 这个命令就是给老数据补课：
+       *  - 只登记书目、没有文件的书：它们的 md5 列存的就是用户填的文档标识，
+       *    直接复制过来即可（不发一次网络请求）；
+       *  - 有文件的书：从存储上按范围读算出文档标识，只读 12KB，不下载整本。
+       */
+      const db = getDb();
+      const target = opts.user ? requireUser(opts.user) : null;
+
+      const rows = db
+        .select()
+        .from(books)
+        .where(target ? eq(books.ownerId, target.id) : undefined)
+        .all();
+
+      const todo = opts.force ? rows : rows.filter((r) => !r.documentId);
+      if (todo.length === 0) {
+        console.log(c(color.green, '所有书籍都已带上文档标识，无需处理'));
+        return;
+      }
+
+      console.log(`共 ${todo.length} 本待处理${opts.dryRun ? '（试运行，不写库）' : ''}
+`);
+
+      let fromMeta = 0;
+      let fromStorage = 0;
+      let skipped = 0;
+
+      for (const row of todo) {
+        const label = row.title.length > 28 ? `${row.title.slice(0, 27)}…` : row.title;
+
+        // 没有文件：登记时用户填的就是文档标识，直接搬过来
+        if (row.objectKey === null || row.storageId === null) {
+          if (!opts.dryRun) {
+            db.update(books).set({ documentId: row.md5, updatedAt: new Date() }).where(eq(books.id, row.id)).run();
+          }
+          fromMeta += 1;
+          console.log(`${c(color.green, '✓')} ${label}  ${c(color.dim, '（登记书目，直接采用已有标识）')}`);
+          continue;
+        }
+
+        // 有文件：从存储上算，只读采样窗口
+        try {
+          const adapter = await getAdapterForStorage(row.storageId, row.ownerId);
+          const documentId = await koreaderDocumentIdFromStorage(adapter, row.objectKey, row.size);
+          if (!documentId) {
+            skipped += 1;
+            console.log(`${c(color.yellow, '·')} ${label}  ${c(color.dim, '（算不出来，已跳过）')}`);
+            continue;
+          }
+          if (!opts.dryRun) {
+            db.update(books).set({ documentId, updatedAt: new Date() }).where(eq(books.id, row.id)).run();
+          }
+          fromStorage += 1;
+          console.log(`${c(color.green, '✓')} ${label}  ${c(color.dim, documentId)}`);
+        } catch (err) {
+          skipped += 1;
+          console.log(`${c(color.yellow, '·')} ${label}  ${c(color.dim, `（${(err as Error).message}）`)}`);
+        }
+      }
+
+      console.log(
+        c(
+          color.dim,
+          `
+登记书目 ${fromMeta} 本，从文件算出 ${fromStorage} 本` +
+            (skipped > 0 ? `，跳过 ${skipped} 本` : '') +
+            (opts.dryRun ? '（试运行，未写库）' : ''),
+        ),
+      );
+      if (skipped > 0) {
+        console.log(c(color.dim, '跳过的一般是文件已从存储上删除或读取失败；不影响其它书。'));
+      }
+    }),
+  );
+
+program
   .command('audit')
   .description('查看审计日志')
   .option('-n, --limit <条数>', '显示条数', '30')
@@ -953,6 +1043,8 @@ async function main(): Promise<void> {
    */
   process.env.READSYNC_LOG_LEVEL = process.env.READSYNC_LOG_LEVEL ?? 'warn';
   process.env.READSYNC_LOG_PRETTY = process.env.READSYNC_LOG_PRETTY ?? 'false';
+  // 光是设环境变量没用：模块导入时根 logger 已按默认级别建好了（见 setLogLevel 注释）
+  setLogLevel(process.env.READSYNC_LOG_LEVEL);
 
   try {
     await program.parseAsync(process.argv);

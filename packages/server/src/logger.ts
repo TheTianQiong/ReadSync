@@ -13,6 +13,20 @@ import { hLine, padDisplayEnd, truncateDisplay } from './lib/text.js';
 
 let rootLogger: Logger | null = null;
 
+/**
+ * 运行时调整日志级别。
+ *
+ * 为什么需要：许多模块在**导入时**就 `getModuleLogger(...)`，而 ESM 的导入
+ * 先于任何函数体执行 —— 等 CLI 在 main() 里设好 READSYNC_LOG_LEVEL 时，
+ * 根 logger 早已按默认级别建好了，设置根本不生效。CLI 的输出因此一直被
+ * 「数据库迁移已应用」这类基础设施日志淹没。
+ *
+ * 这里让调用方在导入完成后显式覆盖一次级别，绕开「初始化早于配置」的死结。
+ */
+export function setLogLevel(level: string): void {
+  createLogger().level = level;
+}
+
 export function createLogger(): Logger {
   if (rootLogger) return rootLogger;
 

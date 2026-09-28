@@ -174,6 +174,34 @@ export class LocalStorageAdapter implements DirectoryAdapter {
     };
   }
 
+  /**
+   * 只读文件的一段。
+   *
+   * 本地文件的优势在这里体现得最明显：算阅读器的文档标识只需读 12 个 1KB 窗口，
+   * 而算法要求的偏移最大到 1GB —— 若写成整份读，一本 200MB 的书要白读 200MB。
+   */
+  async getRange(key: string, offset: number, length: number): Promise<Buffer | null> {
+    const full = safeResolve(this.rootDir, key);
+    const st = await fs.stat(full).catch((err) => {
+      if (isErrnoCode(err, 'ENOENT')) throw notFound(`文件不存在：${key}`);
+      throw storageError(`访问本地文件失败：${(err as Error).message}`, err);
+    });
+    // 起点越过末尾：与「读不到」同义，交给调用方停止采样
+    if (offset >= st.size) return null;
+
+    const end = Math.min(offset + length, st.size);
+    const handle = await fs.open(full, 'r');
+    try {
+      const buffer = Buffer.alloc(end - offset);
+      const { bytesRead } = await handle.read(buffer, 0, buffer.length, offset);
+      return bytesRead === 0 ? null : buffer.subarray(0, bytesRead);
+    } catch (err) {
+      throw storageError(`读取本地文件失败：${(err as Error).message}`, err);
+    } finally {
+      await handle.close().catch(() => undefined);
+    }
+  }
+
   async get(key: string, options?: GetOptions): Promise<GetResult> {
     const full = safeResolve(this.rootDir, key);
     const st = await fs.stat(full).catch((err) => {
