@@ -78,6 +78,8 @@ export const pluginManifestSchema = z.object({
         'fs:storage', // 读写服务器存储目录
         'log', // 输出日志
         'db:plugin', // 使用插件专属数据表
+        'sync:write', // 代某个账号写入阅读进度与阅读会话（外部数据导入用）
+        'books:write', // 代某个账号登记书目、写封面（外部数据导入用）
       ]),
     )
     .default([]),
@@ -192,6 +194,134 @@ export interface PluginContext {
   registerSyncProtocol(protocolId: string, handler: unknown): void;
   /** 注册一个钩子回调 */
   on(hook: PluginHook, handler: (...args: unknown[]) => unknown | Promise<unknown>): void;
+
+  /**
+   * 插件专属的数据表（KV）。
+   *
+   * 用来记住「上次跑到哪了」这类状态。需要 db:plugin 权限。
+   */
+  pluginData: {
+    get<T = unknown>(key: string): Promise<T | undefined>;
+    set(key: string, value: unknown): Promise<void>;
+    delete(key: string): Promise<void>;
+    /** 一次取回全部键值，便于在管理页里整体查看 */
+    all(): Promise<Record<string, unknown>>;
+  };
+
+  /**
+   * 读取存储后端里的文件（**只读**）。
+   *
+   * storageId 必须由管理员在插件配置里指定 —— 插件拿不到账号列表，
+   * 也就无法自己去翻别人的网盘。需要 fs:storage 权限。
+   */
+  storage: {
+    /** 列出一层条目（目录以 / 结尾） */
+    list(storageId: number, prefix?: string): Promise<PluginStorageEntry[]>;
+    /** 读取整个对象。请先用 stat 看大小，别把几 GB 的书读进内存 */
+    get(storageId: number, key: string): Promise<Uint8Array>;
+    stat(storageId: number, key: string): Promise<PluginStorageStat | null>;
+    /** 按字节范围读取（读 zip 中央目录这类场景用） */
+    getRange(
+      storageId: number,
+      key: string,
+      offset: number,
+      length: number,
+    ): Promise<Uint8Array | null>;
+  };
+
+  /**
+   * 外部阅读数据的导入入口。
+   *
+   * 这一组 API 是**写给导入用的**：写入走服务端已有的进度逻辑（冲突判定、
+   * 书目关联、冗余字段回写全都复用），而不是让插件直接改库。需要
+   * sync:write（进度与会话）与 books:write（登记书目、写封面）权限。
+   */
+  sync: {
+    /** 推送一条进度；与 PUT /api/sync/progress 同语义 */
+    pushProgress(input: PluginProgressPush): Promise<{ accepted: boolean }>;
+    /**
+     * 按天替换阅读会话。
+     *
+     * 「替换」而不是「累加」是刻意的：导入会被反复重跑，累加会把时长越滚越多。
+     * 每次导入都把该账号在 platform 下、这些天的旧行删掉再写。
+     */
+    importSessions(input: PluginSessionImport): Promise<{ days: number; inserted: number }>;
+    /** 登记一本没有文件的书（已存在同 md5 或同文档标识时返回既有那本） */
+    ensureBook(input: PluginBookInput): Promise<{ id: number; created: boolean }>;
+    /** 按文档标识查书；查不到返回 null。用于「只导入已有书目」的模式 */
+    findBook(input: { user: string | number; documentId: string }): Promise<{ id: number } | null>;
+    /** 给书籍写封面（base64，图片来自存储里的封面文件） */
+    setCover(input: { book: number; mime: string; dataBase64: string }): Promise<void>;
+  };
+
+  /**
+   * 注册一个周期任务。
+   *
+   * 内核负责在插件停用 / 卸载 / 服务退出时停掉它 —— 插件自己 setInterval
+   * 会在停用后继续跑，等于关不掉的定时器。需要声明 schedule 能力。
+   */
+  schedule(name: string, everyMinutes: number, fn: () => void | Promise<void>): void;
+}
+
+/** 存储条目（插件视角的只读视图） */
+export interface PluginStorageEntry {
+  name: string;
+  path: string;
+  isDir: boolean;
+  size: number | null;
+}
+
+export interface PluginStorageStat {
+  size: number;
+}
+
+/** 插件推送进度时的入参；user 可以是用户名或用户 id */
+export interface PluginProgressPush {
+  user: string | number;
+  document: string;
+  title?: string;
+  progress?: string;
+  /** 0-1 小数 */
+  percentage: number;
+  /** 客户端本地时间（RFC3339）；用于新旧判定 */
+  clientTime?: string;
+  platform?: string;
+  device?: string;
+  deviceId?: string;
+}
+
+/** 导入阅读会话：按天替换 */
+export interface PluginSessionImport {
+  user: string | number;
+  platform: string;
+  device: string;
+  days: Array<{
+    /** YYYY-MM-DD（用户时区下的日期） */
+    day: string;
+    hours: Array<{
+      hour: number;
+      seconds: number;
+      /** 关联到的书目 id（由 ensureBook 返回）；不填则不关联 */
+      bookId?: number | null;
+      document?: string | null;
+    }>;
+  }>;
+}
+
+/** 登记书目（没有文件，只有元数据） */
+export interface PluginBookInput {
+  user: string | number;
+  title: string;
+  author?: string;
+  /** 整文件 MD5 或等价的稳定去重键 */
+  md5: string;
+  /** 阅读器的文档标识；导入的场景里就是外部书库自己的 bookId */
+  documentId?: string;
+  format?: string;
+  size?: number;
+  totalWords?: number;
+  tags?: string[];
+  description?: string;
 }
 
 /** 插件入口模块的约定导出 */

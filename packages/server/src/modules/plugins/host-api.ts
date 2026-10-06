@@ -1,0 +1,383 @@
+import { and, eq } from 'drizzle-orm';
+import type {
+  PluginBookInput,
+  PluginProgressPush,
+  PluginSessionImport,
+  PluginStorageEntry,
+} from '@readsync/shared';
+import { getDb } from '../../db/index.js';
+import { books, pluginData, readingSessions, storages, users } from '../../db/schema.js';
+import { badRequest, notFound } from '../../errors.js';
+import { addDocumentId, findBookByDocumentId, normalizeDocumentId } from '../library/documents.js';
+import { createBook } from '../library/service.js';
+import { saveBookCover } from '../library/cover.js';
+import { browseStorage, getAdapterForStorage } from '../storage/service.js';
+import { upsertProgress } from '../sync/service.js';
+import { getModuleLogger } from '../../logger.js';
+
+/**
+ * 插件需要用到的宿主能力。
+ *
+ * 为什么单独一个模块：`loader.ts` 负责生命周期（加载/卸载/钩子），这里负责
+ * 「插件能对数据做什么」。两者的失败模式完全不同 —— 前者错了插件加载不起来，
+ * 后者错了会写坏用户数据，所以边界要划清楚。
+ *
+ * 设计原则：
+ *  - **插件不碰数据库**。它拿到的是几个语义明确的动作（推一条进度、按天替换
+ *    会话、登记一本书），写入路径与网页端完全共用同一批函数 —— 冲突判定、
+ *    书目关联、冗余字段回写都不会因为「这次是插件写的」而不一致。
+ *  - **权限真的生效**。未声明对应权限时给出的是抛错的桩，而不是静默空实现。
+ */
+
+const log = getModuleLogger('plugins');
+
+/** 会话时长上限：与同步接口的 readingSeconds 约定一致（一天） */
+const MAX_SESSION_SECONDS = 86400;
+
+/** 批量导入时的天数上限，防止插件一次塞进几万天把库撑爆 */
+const MAX_IMPORT_DAYS = 4000;
+
+/**
+ * 把用户名或 id 解析成用户 id。
+ *
+ * 导入类插件面向的是「某个账号的书库」，配置里写用户名比写 id 友好得多
+ * （用户名一眼能认，id 得去数据库里查）。两种都接受。
+ */
+function resolveUserId(user: string | number): number {
+  if (typeof user === 'number' || /^\d+$/.test(String(user))) {
+    const id = Number(user);
+    const row = getDb().select({ id: users.id }).from(users).where(eq(users.id, id)).get();
+    if (!row) throw notFound(`用户 id ${id} 不存在`);
+    return row.id;
+  }
+
+  const name = String(user).trim();
+  // 用户名与邮箱都试一遍：配置里填哪个都能对上
+  const row = getDb()
+    .select({ id: users.id })
+    .from(users)
+    .where(eq(users.username, name))
+    .get();
+  if (row) return row.id;
+
+  const byEmail = getDb().select({ id: users.id }).from(users).where(eq(users.email, name)).get();
+  if (!byEmail) throw notFound(`找不到用户「${name}」（用户名或邮箱都可以填）`);
+  return byEmail.id;
+}
+
+/** `YYYY-MM-DD` → 星期几（0=周日）。日期按 UTC 解析只是取一个不随服务器时区漂移的星期 */
+function weekdayOf(day: string): number {
+  const parsed = new Date(`${day}T00:00:00Z`);
+  if (Number.isNaN(parsed.getTime())) throw badRequest(`日期格式应为 YYYY-MM-DD，收到「${day}」`);
+  return parsed.getUTCDay();
+}
+
+/** `YYYY-MM-DD` + 小时 → 时刻（按 UTC 构造，仅用于会话起止的展示与排序） */
+function hourStart(day: string, hour: number): Date {
+  return new Date(`${day}T${String(Math.max(0, Math.min(23, hour))).padStart(2, '0')}:00:00Z`);
+}
+
+export interface HostApiPermissions {
+  pluginData: boolean;
+  fsStorage: boolean;
+  syncWrite: boolean;
+  booksWrite: boolean;
+}
+
+/** 权限未声明时统一的报错文案：告诉作者去清单里加哪一项 */
+function denied(pluginId: string, permission: string, what: string): Error {
+  return new Error(
+    `插件 ${pluginId} 未声明 ${permission} 权限，禁止${what}（请在 plugin.json 的 permissions 中加入 "${permission}"）`,
+  );
+}
+
+/* ------------------------------ plugin_data ------------------------------ */
+
+export function buildPluginDataApi(pluginId: string, allowed: boolean) {
+  const guard = (): void => {
+    if (!allowed) throw denied(pluginId, 'db:plugin', '读写插件数据');
+  };
+
+  return {
+    async get<T = unknown>(key: string): Promise<T | undefined> {
+      guard();
+      const row = getDb()
+        .select({ value: pluginData.value })
+        .from(pluginData)
+        .where(and(eq(pluginData.pluginId, pluginId), eq(pluginData.key, key)))
+        .get();
+      return row?.value as T | undefined;
+    },
+    async set(key: string, value: unknown): Promise<void> {
+      guard();
+      const now = new Date();
+      getDb()
+        .insert(pluginData)
+        .values({ pluginId, key, value, updatedAt: now })
+        .onConflictDoUpdate({
+          target: [pluginData.pluginId, pluginData.key],
+          set: { value, updatedAt: now },
+        })
+        .run();
+    },
+    async delete(key: string): Promise<void> {
+      guard();
+      getDb()
+        .delete(pluginData)
+        .where(and(eq(pluginData.pluginId, pluginId), eq(pluginData.key, key)))
+        .run();
+    },
+    async all(): Promise<Record<string, unknown>> {
+      guard();
+      const rows = getDb()
+        .select({ key: pluginData.key, value: pluginData.value })
+        .from(pluginData)
+        .where(eq(pluginData.pluginId, pluginId))
+        .all();
+      const out: Record<string, unknown> = {};
+      for (const row of rows) out[row.key] = row.value;
+      return out;
+    },
+  };
+}
+
+/* -------------------------------- storage -------------------------------- */
+
+export function buildStorageApi(pluginId: string, allowed: boolean) {
+  const guard = (): void => {
+    if (!allowed) throw denied(pluginId, 'fs:storage', '读取存储后端');
+  };
+
+  /*
+   * storageId 只能来自插件配置，插件拿不到账号列表 —— 也就是说它翻不到
+   * 别人的网盘，除非管理员在配置里把那个 storage 指给它。归属校验在这里
+   * 只做一次：storage 行自己的 ownerId 就是授权依据。
+   */
+  /** 取存储的属主：storage 行自己的 ownerId 就是授权依据 */
+  const ownerOf = (storageId: number): number => {
+    const row = getDb()
+      .select({ ownerId: storages.userId })
+      .from(storages)
+      .where(eq(storages.id, storageId))
+      .get();
+    if (!row) throw notFound(`存储 #${storageId} 不存在`);
+    return row.ownerId;
+  };
+
+  const adapterFor = (storageId: number) => getAdapterForStorage(storageId, ownerOf(storageId));
+
+  return {
+    async list(storageId: number, prefix = ''): Promise<PluginStorageEntry[]> {
+      guard();
+      const result = await browseStorage(storageId, ownerOf(storageId), { prefix });
+      return result.entries.map((entry) => ({
+        name: entry.name,
+        path: entry.path,
+        isDir: entry.isDir,
+        size: entry.size ?? null,
+      }));
+    },
+    async get(storageId: number, key: string): Promise<Uint8Array> {
+      guard();
+      const adapter = await adapterFor(storageId);
+      const result = await adapter.get(key);
+      if (!result.stream) throw new Error(`读取 ${key} 失败：存储返回了空内容`);
+      // 适配器可能给 Buffer 也可能给 string（带了编码时），两种都要能吃下
+      const chunks: Buffer[] = [];
+      for await (const chunk of result.stream as AsyncIterable<Buffer | string>) {
+        chunks.push(typeof chunk === 'string' ? Buffer.from(chunk, 'utf8') : chunk);
+      }
+      return Buffer.concat(chunks);
+    },
+    async stat(storageId: number, key: string): Promise<{ size: number } | null> {
+      guard();
+      const adapter = await adapterFor(storageId);
+      const object = await adapter.stat(key);
+      return object ? { size: object.size } : null;
+    },
+    async getRange(
+      storageId: number,
+      key: string,
+      offset: number,
+      length: number,
+    ): Promise<Uint8Array | null> {
+      guard();
+      const adapter = await adapterFor(storageId);
+      if (!adapter.getRange) {
+        throw new Error('该存储后端不支持范围读');
+      }
+      return adapter.getRange(key, offset, length);
+    },
+  };
+}
+
+/* --------------------------------- sync ---------------------------------- */
+
+export function buildSyncApi(pluginId: string, syncAllowed: boolean, booksAllowed: boolean) {
+  const guardSync = (): void => {
+    if (!syncAllowed) throw denied(pluginId, 'sync:write', '写入阅读数据');
+  };
+  const guardBooks = (): void => {
+    if (!booksAllowed) throw denied(pluginId, 'books:write', '登记书目');
+  };
+
+  return {
+    async pushProgress(input: PluginProgressPush): Promise<{ accepted: boolean }> {
+      guardSync();
+      if (!/^[a-fA-F0-9]{32}$/.test(input.document)) {
+        throw badRequest(`document 必须是 32 位十六进制，收到「${input.document}」`);
+      }
+
+      const userId = resolveUserId(input.user);
+      // 复用统一同步接口的写入逻辑：冲突判定、书目关联、冗余字段回写全都一致
+      const result = upsertProgress(userId, {
+        document: input.document.toLowerCase(),
+        percentage: input.percentage,
+        progress: input.progress ?? '',
+        platform: input.platform ?? 'import',
+        device: input.device ?? 'import',
+        deviceId: input.deviceId ?? 'import',
+        // 时长走 importSessions，避免同一天的数据被算两遍
+        readingSeconds: 0,
+        ...(input.title ? { title: input.title } : {}),
+        ...(input.clientTime ? { clientTime: input.clientTime } : {}),
+      });
+
+      return { accepted: result.accepted };
+    },
+
+    async importSessions(
+      input: PluginSessionImport,
+    ): Promise<{ days: number; inserted: number }> {
+      guardSync();
+      if (!input.platform) throw badRequest('platform 不能为空');
+      if (input.days.length > MAX_IMPORT_DAYS) {
+        throw badRequest(`一次最多导入 ${MAX_IMPORT_DAYS} 天，收到 ${input.days.length} 天`);
+      }
+
+      const userId = resolveUserId(input.user);
+      const db = getDb();
+      const device = input.device || 'import';
+      let inserted = 0;
+      let days = 0;
+
+      for (const day of input.days) {
+        const weekday = weekdayOf(day.day);
+        /*
+         * 先删后写：导入会被反复重跑（定时任务），累加会把时长越滚越多。
+         * 删的范围严格限定在「这个账号 + 这个 platform + 这一天」，动不到
+         * 用户在网页端或阅读器上报的数据（那些用的是别的 platform）。
+         */
+        db.delete(readingSessions)
+          .where(
+            and(
+              eq(readingSessions.userId, userId),
+              eq(readingSessions.platform, input.platform),
+              eq(readingSessions.day, day.day),
+            ),
+          )
+          .run();
+        days += 1;
+
+        for (const entry of day.hours) {
+          const seconds = Math.max(0, Math.min(Math.round(entry.seconds), MAX_SESSION_SECONDS));
+          if (seconds === 0) continue;
+
+          const at = hourStart(day.day, entry.hour);
+          db.insert(readingSessions)
+            .values({
+              userId,
+              bookId: entry.bookId ?? null,
+              document: entry.document ?? null,
+              platform: input.platform,
+              device,
+              seconds,
+              day: day.day,
+              hour: Math.max(0, Math.min(23, Math.round(entry.hour))),
+              weekday,
+              progressPercent: null,
+              startedAt: at,
+              endedAt: at,
+              createdAt: at,
+            })
+            .run();
+          inserted += 1;
+        }
+      }
+
+      log.info({ pluginId, userId, days, inserted }, '插件导入阅读会话完成');
+      return { days, inserted };
+    },
+
+    async findBook(input: { user: string | number; documentId: string }): Promise<{ id: number } | null> {
+      guardBooks();
+      const userId = resolveUserId(input.user);
+      const documentId = normalizeDocumentId(input.documentId);
+      // 主标识与补充标识都要查：书可能是网页端手工登记的，也可能由导入建的
+      const id = findBookByDocumentId(userId, documentId);
+      return id === null ? null : { id };
+    },
+
+    async ensureBook(input: PluginBookInput): Promise<{ id: number; created: boolean }> {
+      guardBooks();
+      const userId = resolveUserId(input.user);
+      const md5 = input.md5.toLowerCase();
+      if (!/^[a-f0-9]{32}$/.test(md5)) {
+        throw badRequest(`md5 必须是 32 位十六进制，收到「${input.md5}」`);
+      }
+
+      /*
+       * 先按文档标识找。这一步不能省：用户完全可能已经把这本书手工登记进
+       * 书库（标识填的就是外部书库的 bookId），只是 md5 用的是别的值 ——
+       * 那时按 md5 找不到，再去建就会撞上「标识已被占用」而整次导入失败。
+       */
+      if (input.documentId) {
+        const byDocument = findBookByDocumentId(userId, normalizeDocumentId(input.documentId));
+        if (byDocument !== null) return { id: byDocument, created: false };
+      }
+
+      // 再看 md5（同一账号下唯一）
+      const existing = getDb()
+        .select({ id: books.id })
+        .from(books)
+        .where(and(eq(books.ownerId, userId), eq(books.md5, md5)))
+        .get();
+      if (existing) return { id: existing.id, created: false };
+
+      const documentId = input.documentId ? normalizeDocumentId(input.documentId) : undefined;
+      const detail = await createBook(userId, {
+        title: input.title,
+        ...(input.author ? { author: input.author } : {}),
+        format: (input.format ?? 'epub') as never,
+        size: input.size ?? 0,
+        md5,
+        // 只登记书目：不传 objectKey，服务端不会去找文件
+        ...(documentId ? { documentId } : {}),
+        ...(input.totalWords ? { totalWords: input.totalWords } : {}),
+        ...(input.tags ? { tags: input.tags } : {}),
+        ...(input.description ? { description: input.description } : {}),
+      } as never);
+
+      // 外部书库的 bookId 与「主标识」可能是两个值：都把外部 id 挂成补充标识，
+      // 这样设备上报任一个都能对上
+      if (documentId && documentId !== normalizeDocumentId(input.md5)) {
+        try {
+          addDocumentId(userId, detail.id, input.md5, '外部书库');
+        } catch {
+          // 冲突（这个 md5 已属于别的书）不该让整次导入失败
+          log.warn({ pluginId, bookId: detail.id }, '补充标识失败，已跳过');
+        }
+      }
+
+      log.info({ pluginId, userId, bookId: detail.id, title: input.title }, '插件登记书目');
+      return { id: detail.id, created: true };
+    },
+
+    async setCover(input: { book: number; mime: string; dataBase64: string }): Promise<void> {
+      guardBooks();
+      const row = getDb().select({ id: books.id }).from(books).where(eq(books.id, input.book)).get();
+      if (!row) throw notFound(`书籍 #${input.book} 不存在`);
+      saveBookCover(input.book, input.mime, input.dataBase64, new Date());
+    },
+  };
+}

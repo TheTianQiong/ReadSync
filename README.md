@@ -616,6 +616,11 @@ READSYNC_DATA_DIR=./data-e2e npx tsx src/scripts/smoke-e2e.ts
 # KOReader 插件的逻辑测试（25 项：每 N 页 / 每隔 N 分钟 / 仅 Wi-Fi / 菜单文案）
 npm run test:plugin
 
+# Reeden 导入的端到端验证（26 项：书目 / 进度 / 时长 / 封面 / 幂等）
+# REEDEN_SAMPLE 指向一份 Reeden 导出目录（含 metadata、book_progress、covers）
+READSYNC_DATA_DIR=./data-reeden REEDEN_SAMPLE=/path/to/Reeden \
+  npx tsx src/scripts/reeden-import-check.ts
+
 # 真实 socket 的大文件整体上传（冒烟测试走进程内 inject，照不出传输层问题）
 READSYNC_DATA_DIR=./data-repro npx tsx src/scripts/repro-upload.ts 64
 

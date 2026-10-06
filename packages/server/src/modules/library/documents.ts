@@ -22,7 +22,7 @@ const log = getModuleLogger('library');
 /** 标识必须是 32 位十六进制 —— 阅读器发来的就是这个形状 */
 const DOCUMENT_ID_RE = /^[a-f0-9]{32}$/;
 
-function normalizeDocumentId(raw: string): string {
+export function normalizeDocumentId(raw: string): string {
   const value = raw.trim().toLowerCase();
   if (!DOCUMENT_ID_RE.test(value)) {
     throw badRequest('文档标识必须是 32 位十六进制（阅读器里显示的那个值）');

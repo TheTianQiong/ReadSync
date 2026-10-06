@@ -1,0 +1,83 @@
+{
+  "id": "com.readsync.reeden-sync",
+  "name": "Reeden 同步",
+  "version": "1.0.0",
+  "author": "ReadSync",
+  "description": "定时读取 WebDAV / S3 上 Reeden 的阅读数据（进度、时长、书目、封面）并导入本服务器",
+  "license": "MIT",
+  "apiVersion": ">=0.1.0 <0.2.0",
+  "capabilities": ["metadata"],
+  "permissions": ["log", "db:plugin", "fs:storage", "sync:write", "books:write"],
+  "config": [
+    {
+      "key": "storageId",
+      "label": "存储后端 ID",
+      "type": "number",
+      "required": true,
+      "description": "Reeden 根目录所在的存储（在「存储管理」里可以看到 ID）"
+    },
+    {
+      "key": "rootPath",
+      "label": "Reeden 根目录",
+      "type": "string",
+      "default": "",
+      "placeholder": "留空表示存储根目录",
+      "description": "该目录下应当有 metadata、book_progress、covers"
+    },
+    {
+      "key": "username",
+      "label": "导入到哪个账号",
+      "type": "string",
+      "required": true,
+      "description": "填用户名或邮箱；进度与时长都会记在这个账号下"
+    },
+    {
+      "key": "progressDir",
+      "label": "进度目录名",
+      "type": "string",
+      "default": "book_progress",
+      "description": "不同版本的 Reeden 可能是 book_progress 或 bookprogress"
+    },
+    {
+      "key": "utcOffsetHours",
+      "label": "时间戳时区偏移（小时）",
+      "type": "number",
+      "default": 8,
+      "description": "Reeden 的 read_record 里 create_at 是 UTC，按这个偏移换算成本地小时；只有 hourly 文件没覆盖到的早期数据才用到它"
+    },
+    {
+      "key": "intervalMinutes",
+      "label": "自动导入间隔（分钟）",
+      "type": "number",
+      "default": 60,
+      "description": "填 0 表示只在手动触发时导入"
+    },
+    {
+      "key": "dailyAt",
+      "label": "每日固定同步时间",
+      "type": "string",
+      "default": "23:55",
+      "placeholder": "23:55",
+      "description": "当天数据在次日可能被轮转掉，所以每天这个点再补一次；留空关闭"
+    },
+    {
+      "key": "autoRegisterBooks",
+      "label": "自动登记缺失的书目",
+      "type": "boolean",
+      "default": true,
+      "description": "从 Reeden 的 metadata 里读出书名作者建进书库；关闭后只导入已在库中的书"
+    },
+    {
+      "key": "importReadingTime",
+      "label": "导入阅读时长",
+      "type": "boolean",
+      "default": true
+    },
+    {
+      "key": "importCovers",
+      "label": "从 Reeden 的 covers 里取封面",
+      "type": "boolean",
+      "default": true
+    }
+  ]
+}

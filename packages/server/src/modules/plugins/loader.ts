@@ -20,6 +20,7 @@ import { http } from '../../lib/http.js';
 import { getModuleLogger } from '../../logger.js';
 import { assertApiVersionCompatible, isPathInside, safeParseManifest } from './internal.js';
 import { resolvePluginConfig } from './plugin-config.js';
+import { buildPluginDataApi, buildStorageApi, buildSyncApi } from './host-api.js';
 
 /**
  * 插件运行时（加载 / 卸载 / 钩子 / 路由挂载）。
@@ -47,6 +48,10 @@ interface LoadedPlugin {
   hooks: Partial<Record<PluginHook, HookHandler[]>>;
   protocols: Map<string, SyncProtocolHandler>;
   dir: string;
+  /** 插件注册的周期任务（name → 计时器）。停用/卸载时由宿主统一清掉 */
+  timers: Map<string, NodeJS.Timeout>;
+  /** 任务处理器（含只手动触发、没有定时器的那些） */
+  tasks: Map<string, () => void | Promise<void>>;
 }
 
 const log = getModuleLogger('plugins');
@@ -189,7 +194,46 @@ export async function unloadPlugin(pluginId: string): Promise<void> {
     log.error({ err, pluginId }, '插件 unregister 执行失败（已忽略）');
   }
 
+  clearSchedules(loaded);
+
   log.info({ pluginId }, '插件已卸载');
+}
+
+/**
+ * 停掉所有插件的周期任务。
+ *
+ * 服务退出时调用。插件的定时器都 unref 过，不调也不会阻止进程退出，
+ * 但显式停掉能让「退出前正在跑的任务」干净收尾。
+ */
+/**
+ * 立刻执行某个插件注册过的任务（含「仅手动」的任务）。
+ *
+ * 给 CLI 用：配好插件后总得能马上跑一次看看，而不是干等下一个整点。
+ */
+export async function runPluginTask(pluginId: string, name: string): Promise<void> {
+  const loaded = loadedPlugins.get(pluginId);
+  if (!loaded) throw pluginError(`插件 ${pluginId} 未加载（未启用或加载失败）`);
+
+  const task = loaded.tasks.get(name);
+  if (!task) {
+    const known = [...loaded.tasks.keys()];
+    throw pluginError(
+      known.length > 0
+        ? `插件 ${pluginId} 没有名为「${name}」的任务，可用：${known.join('、')}`
+        : `插件 ${pluginId} 没有注册任何任务`,
+    );
+  }
+
+  await task();
+}
+
+/** 列出插件注册过的任务名，供 CLI / 管理页展示 */
+export function listPluginTasks(pluginId: string): string[] {
+  return [...(loadedPlugins.get(pluginId)?.tasks.keys() ?? [])];
+}
+
+export function stopAllSchedules(): void {
+  for (const loaded of loadedPlugins.values()) clearSchedules(loaded);
 }
 
 /** 取插件的运行上下文；未加载时返回 null */
@@ -279,6 +323,8 @@ function createLoadedPlugin(
     dir,
     hooks: {},
     protocols: new Map(),
+    timers: new Map(),
+    tasks: new Map(),
     context: null as unknown as PluginContext,
   };
 
@@ -316,7 +362,14 @@ function createLoadedPlugin(
     on: (hook: PluginHook, handler: HookHandler) => {
       registerHook(loaded, hook, handler);
     },
-  } as PluginContext;
+    // 下面四组由 host-api.ts 提供，权限逐个 gate：未声明时拿到的是抛错的桩
+    pluginData: buildPluginDataApi(pluginId, permissions.has('db:plugin')),
+    storage: buildStorageApi(pluginId, permissions.has('fs:storage')),
+    sync: buildSyncApi(pluginId, permissions.has('sync:write'), permissions.has('books:write')),
+    schedule: (name: string, everyMinutes: number, fn: () => void | Promise<void>) => {
+      registerSchedule(loaded, name, everyMinutes, fn);
+    },
+  } as unknown as PluginContext;
 
   // fs:data 权限：只有声明了才创建并给出数据目录。
   // 用 getter 而不是普通字段，是为了在未授权访问时能留下一条明确的警告日志
@@ -362,6 +415,68 @@ function buildFetch(pluginId: string, allowed: boolean): FetchLike {
   // 走 lib/http.ts 的显式签名，而不是直接返回原生 Response ——
   // 后者的类型在不同 @types/node 版本下不一致，会导致换个环境就编译失败
   return (input, init) => http(input, init);
+}
+
+/**
+ * 注册一个周期任务。
+ *
+ * 宿主代管计时器而不是让插件自己 setInterval：插件停用/卸载时宿主能把它清掉。
+ * 否则「停用了插件但定时任务还在跑」是个很难发现的问题 —— 界面上插件已经灰了，
+ * 它却还在写数据。
+ *
+ * 任务是**旁路**的：抛错只记日志，不会打断下一次执行，也不会影响主流程。
+ */
+function registerSchedule(
+  plugin: LoadedPlugin,
+  name: string,
+  everyMinutes: number,
+  fn: () => void | Promise<void>,
+): void {
+  const minutes = Number(everyMinutes);
+  if (!Number.isFinite(minutes) || minutes < 0) {
+    log.warn({ pluginId: plugin.id, name, everyMinutes }, '周期任务的间隔不能为负，已忽略');
+    return;
+  }
+  if (typeof fn !== 'function') {
+    log.warn({ pluginId: plugin.id, name }, '周期任务的处理器不是函数，已忽略');
+    return;
+  }
+
+  // 无论是否排定时器都要记下来：0 表示「只在手动/CLI 触发时跑」，
+  // 这种任务照样要能被 runPluginTask 找到
+  plugin.tasks.set(name, fn);
+
+  const existing = plugin.timers.get(name);
+  if (existing) clearInterval(existing);
+  plugin.timers.delete(name);
+
+  if (minutes === 0) {
+    log.info({ pluginId: plugin.id, name }, '插件任务已注册（仅手动触发）');
+    return;
+  }
+
+  const timer = setInterval(() => {
+    // runHook 那套错误隔离在这里同样适用：任务失败不能把进程带下去
+    Promise.resolve()
+      .then(fn)
+      .catch((err: unknown) => {
+        log.error({ err, pluginId: plugin.id, name }, '插件周期任务执行失败');
+      });
+  }, Math.round(minutes * 60_000));
+  // Node 默认会因为这个计时器而拒绝退出，明确放行
+  timer.unref?.();
+  plugin.timers.set(name, timer);
+
+  log.info({ pluginId: plugin.id, name, everyMinutes }, '插件周期任务已注册');
+}
+
+/** 清掉某个插件的全部周期任务 */
+function clearSchedules(plugin: LoadedPlugin): void {
+  for (const [name, timer] of plugin.timers) {
+    clearInterval(timer);
+    log.debug({ pluginId: plugin.id, name }, '插件周期任务已停止');
+  }
+  plugin.timers.clear();
 }
 
 function registerHook(plugin: LoadedPlugin, hook: PluginHook, handler: HookHandler): void {

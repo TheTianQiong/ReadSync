@@ -3,7 +3,7 @@ import { ConfigError, loadConfig } from './config.js';
 import { ensureKeyPair, getKeyFingerprint } from './crypto/keys.js';
 import { closeDatabase, openDatabase } from './db/index.js';
 import { closeLogger, getLogger, printStartupBanner } from './logger.js';
-import { loadPlugins } from './modules/plugins/loader.js';
+import { loadPlugins, stopAllSchedules } from './modules/plugins/loader.js';
 
 /**
  * 监听端口，并在配置为 0.0.0.0 时优先采用 IPv6 双栈。
@@ -77,6 +77,8 @@ async function main(): Promise<void> {
     logger.info({ signal }, '收到退出信号，正在关闭服务…');
     try {
       await app.close();
+      // 先停插件的周期任务：它们可能在跑导入，留着会和关库抢资源
+      stopAllSchedules();
       closeDatabase();
       closeLogger();
       logger.info('服务已安全退出');

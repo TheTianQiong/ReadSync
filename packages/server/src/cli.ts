@@ -44,6 +44,12 @@ import {
 } from './db/schema.js';
 import { getSiteSettings, patchSiteSettings } from './lib/settings.js';
 import { setLogLevel } from './logger.js';
+import {
+  listPluginTasks,
+  loadPlugins,
+  runPluginTask,
+  stopAllSchedules,
+} from './modules/plugins/loader.js';
 import { displayWidth, hLine, padDisplayEnd } from './lib/text.js';
 import { createUser, findUserByLogin, findUserByLoginLoose, toSessionUser } from './lib/users.js';
 
@@ -836,6 +842,44 @@ plugin
       db.delete(pluginsTable).where(eq(pluginsTable.pluginId, pluginId)).run();
       ok(`已卸载插件 ${pluginId}`);
       warn('插件文件仍保留在插件目录中，如需彻底清除请手动删除对应文件夹。');
+    }),
+  );
+
+plugin
+  .command('run <插件ID> [任务名]')
+  .description('立刻执行插件注册的任务（例如让导入插件马上跑一次）')
+  .action(
+    withDb(async (pluginId: string, taskName?: string) => {
+      /*
+       * 插件要在本进程里真正加载一遍才能拿到它的任务 —— CLI 是独立进程，
+       * 不会连到正在跑的服务进程上。加载后会注册定时器，所以跑完要停掉
+       * （它们都 unref 过，不停也不阻塞退出，但显式停掉更干净）。
+       */
+      await loadPlugins();
+
+      const tasks = listPluginTasks(pluginId);
+      if (tasks.length === 0) {
+        fail(`插件 ${pluginId} 没有注册任何任务（未启用、加载失败，或它本来就没有任务）。`);
+        process.exit(1);
+      }
+
+      const fallback = tasks.includes('sync') ? 'sync' : (tasks[0] as string);
+      const name = taskName ?? fallback;
+      if (!tasks.includes(name)) {
+        fail(`插件 ${pluginId} 没有名为「${name}」的任务，可用：${tasks.join('、')}`);
+        process.exit(1);
+      }
+
+      info(`正在执行 ${pluginId} 的任务「${name}」…`);
+      try {
+        await runPluginTask(pluginId, name);
+        ok('执行完成');
+      } catch (err) {
+        fail(err instanceof Error ? err.message : String(err));
+        stopAllSchedules();
+        process.exit(1);
+      }
+      stopAllSchedules();
     }),
   );
 

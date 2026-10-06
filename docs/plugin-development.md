@@ -129,9 +129,14 @@ readsync plugin enable com.example.hello
 |---|---|
 | `http` | `ctx.fetch()` 可发起外部 HTTP 请求 |
 | `fs:data` | `ctx.dataDir` 指向插件专属数据目录，可读写 |
-| `fs:storage` | 可读写服务器存储目录 |
+| `fs:storage` | `ctx.storage` 可**只读**读取存储后端（写入请走存储驱动那一节） |
 | `log` | `ctx.log` 输出日志 |
 | `db:plugin` | 可使用 `plugin_data` 表中的专属键值存储 |
+| `sync:write` | `ctx.sync.pushProgress` / `importSessions` 可写阅读进度与时长 |
+| `books:write` | `ctx.sync.ensureBook` / `setCover` 可登记书目、写封面 |
+
+后两项是给「外部数据导入」类插件准备的：它们会代某个账号写数据，所以清单里
+必须显式声明，安装时管理员在确认框里也能看到。
 
 ### config（配置项）
 
@@ -169,8 +174,70 @@ readsync plugin enable com.example.hello
 | `ctx.registerStorageDriver(driverId, factory)` | 注册存储驱动 |
 | `ctx.registerSyncProtocol(protocolId, handler)` | 注册同步协议处理器 |
 | `ctx.on(hook, handler)` | 注册生命周期钩子 |
+| `ctx.pluginData` | 插件专属 KV（需 `db:plugin` 权限） |
+| `ctx.storage` | 读取存储后端（需 `fs:storage` 权限） |
+| `ctx.sync` | 写入进度/会话、登记书目、写封面（需 `sync:write` / `books:write`） |
+| `ctx.schedule(name, minutes, fn)` | 注册周期任务（`minutes` 为 0 表示只手动触发） |
+
+### 4.1 插件专属 KV
+
+```js
+await ctx.pluginData.set('lastRun', { at: new Date().toISOString() });
+const last = await ctx.pluginData.get('lastRun');
+const all = await ctx.pluginData.all();
+await ctx.pluginData.delete('lastRun');
+```
+
+存在 `plugin_data` 表里，按插件 id 隔离，卸载插件时一并清除。
+
+### 4.2 读取存储后端
+
+```js
+const entries = await ctx.storage.list(storageId, 'book_progress/');
+const bytes = await ctx.storage.get(storageId, 'metadata');
+const stat = await ctx.storage.stat(storageId, 'metadata');
+const head = await ctx.storage.getRange(storageId, 'metadata', 0, 1024);
+```
+
+**只读**，而且 `storageId` 只能来自插件配置 —— 插件拿不到账号列表，也就翻不到别人的网盘。
+存储的属主由 storage 行自己决定。用 `stat` 先看大小，别把几 GB 的书读进内存。
+
+### 4.3 写入阅读数据
+
+```js
+await ctx.sync.ensureBook({ user: 'alice', title: '书名', md5: '…', documentId: '…' });
+await ctx.sync.pushProgress({ user: 'alice', document: '…', percentage: 0.42 });
+await ctx.sync.importSessions({ user: 'alice', platform: 'myapp', device: 'X', days: [...] });
+await ctx.sync.setCover({ book: 12, mime: 'image/jpeg', dataBase64: '…' });
+```
+
+这几个动作内部走的是**网页端同一批函数**（`upsertProgress` / `createBook` / …），
+所以冲突判定、书目关联、冗余字段回写不会因为「这次是插件写的」而不一致。
+
+`importSessions` 是**按天替换**（先删该账号 + 该 platform + 该天的旧行再写），
+这是刻意的：导入类插件会被反复重跑，累加会把时长越滚越大。
+
+`user` 可以是用户名、邮箱或用户 id。
+
+### 4.4 周期任务
+
+```js
+ctx.schedule('sync', 60, async () => { /* 每 60 分钟 */ });
+ctx.schedule('manual-only', 0, async () => { /* 只在 plugin:run 时执行 */ });
+```
+
+计时器由宿主代管，插件停用/卸载和服务退出时会一并清掉 —— 插件自己 `setInterval`
+会出现「界面上已停用、定时任务还在写数据」这种很难发现的问题。
+
+任务抛错只记日志，不影响下一次执行。手动触发：
+
+```bash
+readsync plugin:run <插件ID> [任务名]
+```
 
 ---
+
+## 五、生命周期钩子
 
 ## 五、生命周期钩子
 
