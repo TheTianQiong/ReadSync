@@ -40,6 +40,7 @@ coverage/
 tmp/
 temp/
 
-# KOReader 插件打包产物
+# 插件打包产物（KOReader 插件、内置示例插件）
 koreader-plugin/*.zip
 koreader-plugin/*.tar.gz
+packages/server/plugins-samples/*/*.zip
