@@ -41,6 +41,9 @@ local ReadSync = WidgetContainer:extend{
         device_name = "",
         auto_push = true,          -- 关闭书籍时自动推送
         push_on_suspend = true,    -- 休眠时自动推送
+        auto_push_pages = 0,       -- 每读 N 页自动推送一次（0 = 关闭）
+        auto_push_minutes = 0,     -- 每隔 N 分钟自动推送一次（0 = 关闭）
+        wifi_only = false,         -- 自动推送只在 Wi-Fi 打开时进行
         send_reading_time = true,  -- 上报阅读时长（供服务端统计）
     },
 }
@@ -58,6 +61,10 @@ function ReadSync:init()
 
     self.device_id = G_reader_settings:readSetting("device_id")
     self.session_started_at = nil
+    -- 自动推送的运行时状态：翻页计数与上次推送时刻
+    self.pages_since_push = 0
+    self.last_auto_push_at = nil
+    self.minute_timer = nil
 
     if self.ui and self.ui.menu then
         self.ui.menu:registerToMainMenu(self)
@@ -175,6 +182,62 @@ function ReadSync:addToMainMenu(menu_items)
                     keep_menu_open = true,
                     callback = function(touchmenu_instance)
                         self:setSetting("push_on_suspend", not self.settings.push_on_suspend)
+                        if touchmenu_instance then touchmenu_instance:updateItems() end
+                    end,
+                },
+                {
+                    -- 数值项在菜单里直接显示当前值：不进对话框也能一眼看到配的是什么
+                    text = _("每读 N 页自动推送")
+                        .. "（"
+                        .. ((tonumber(self.settings.auto_push_pages) or 0) == 0
+                                and _("关闭")
+                            or tostring(self.settings.auto_push_pages) .. _(" 页"))
+                        .. "）",
+                    help_text = _("填 0 关闭。服务器不稳或走流量时，10～20 页比较合适"),
+                    keep_menu_open = true,
+                    callback = function(touchmenu_instance)
+                        self:showInputDialog(
+                            _("每读多少页推送一次（0 = 关闭）"),
+                            "10",
+                            tostring(self.settings.auto_push_pages),
+                            function(value)
+                                self:setSetting("auto_push_pages", self:parseCount(value))
+                                self.pages_since_push = 0
+                                if touchmenu_instance then touchmenu_instance:updateItems() end
+                            end
+                        )
+                    end,
+                },
+                {
+                    text = _("每隔 N 分钟自动推送")
+                        .. "（"
+                        .. ((tonumber(self.settings.auto_push_minutes) or 0) == 0
+                                and _("关闭")
+                            or tostring(self.settings.auto_push_minutes) .. _(" 分钟"))
+                        .. "）",
+                    help_text = _("填 0 关闭。适合长时间停在某一页、翻页很少的阅读方式"),
+                    keep_menu_open = true,
+                    callback = function(touchmenu_instance)
+                        self:showInputDialog(
+                            _("每隔多少分钟推送一次（0 = 关闭）"),
+                            "10",
+                            tostring(self.settings.auto_push_minutes),
+                            function(value)
+                                self:setSetting("auto_push_minutes", self:parseCount(value))
+                                -- 改完立刻重排定时器，不必退出重进这本书
+                                self:startMinuteTimer()
+                                if touchmenu_instance then touchmenu_instance:updateItems() end
+                            end
+                        )
+                    end,
+                },
+                {
+                    text = _("仅 Wi-Fi 时自动推送"),
+                    help_text = _("关掉后用移动网络也会自动推送（会消耗流量）"),
+                    checked = self.settings.wifi_only,
+                    keep_menu_open = true,
+                    callback = function(touchmenu_instance)
+                        self:setSetting("wifi_only", not self.settings.wifi_only)
                         if touchmenu_instance then touchmenu_instance:updateItems() end
                     end,
                 },
@@ -449,18 +512,118 @@ function ReadSync:applyRemoteProgress(entry)
 end
 
 -- ----------------------------------------------------------------------------
+-- 自动推送
+-- ----------------------------------------------------------------------------
+
+--- 把输入框里的内容解析成「次数」：非数字与负数一律当 0（关闭），并设一个上限
+function ReadSync:parseCount(value)
+    local n = tonumber(value)
+    if not n or n ~= n then return 0 end
+    n = math.floor(n)
+    if n < 0 then return 0 end
+    if n > 10000 then return 10000 end
+    return n
+end
+
+--- Wi-Fi 是否开着（用于「仅 Wi-Fi 时自动推送」）
+local function wifi_is_on()
+    -- 先看专门的 Wi-Fi 开关；老版本没有它时退化成「有没有连上网」——
+    -- 宁可能用（少数情况会走一点流量）也不要让整个功能失效
+    if type(NetworkMgr.isWifiOn) == "function" then
+        return NetworkMgr:isWifiOn() and true or false
+    end
+    if type(NetworkMgr.isConnected) == "function" then
+        return NetworkMgr:isConnected() and true or false
+    end
+    return true
+end
+
+--- 自动推送的公共入口：按需静默推送，成功发起后归零所有计数
+-- 返回是否真的发起了推送（false 表示被跳过，调用方据此保留计数、下次再试）
+function ReadSync:autoPush(reason)
+    if not self:isConfigured() then return false end
+
+    if self.settings.wifi_only and not wifi_is_on() then
+        logger.dbg("ReadSync: 仅 Wi-Fi 模式下跳过自动推送（" .. tostring(reason) .. "）")
+        return false
+    end
+
+    logger.dbg("ReadSync: 自动推送（" .. tostring(reason) .. "）")
+    -- 静默推送：失败也不弹窗，否则每 N 页弹一次会很烦人
+    self:pushProgress(true)
+
+    self.last_auto_push_at = os.time()
+    self.pages_since_push = 0
+    return true
+end
+
+--- 分钟档的判定：只在距上次推送够久时才推
+function ReadSync:autoPushByTime()
+    local minutes = tonumber(self.settings.auto_push_minutes) or 0
+    if minutes <= 0 then return end
+
+    local last = self.last_auto_push_at or 0
+    if os.time() - last < minutes * 60 then return end
+
+    self:autoPush(_("每 ") .. minutes .. _(" 分钟"))
+end
+
+function ReadSync:stopMinuteTimer()
+    if self.minute_timer then
+        UIManager:unschedule(self.minute_timer)
+        self.minute_timer = nil
+    end
+end
+
+--- 启动分钟级定时器
+-- 用 60 秒一跳而不是一次排到目标时刻：设置随时可能被改，每分钟重新看一眼，
+-- 改完立刻生效，不必退出重进这本书（KOReader 的 scheduleIn 是一次性的，
+-- 所以回调里要自己排下一次）。
+function ReadSync:startMinuteTimer()
+    self:stopMinuteTimer()
+    if (tonumber(self.settings.auto_push_minutes) or 0) <= 0 then return end
+
+    self.minute_timer = UIManager:scheduleIn(60, function()
+        self.minute_timer = nil
+        self:startMinuteTimer()
+        self:autoPushByTime()
+    end)
+end
+
+-- ----------------------------------------------------------------------------
 -- 事件钩子
 -- ----------------------------------------------------------------------------
 
 function ReadSync:onReaderReady()
     self.session_started_at = os.time()
+    self.pages_since_push = 0
+    self.last_auto_push_at = os.time()
+    self:startMinuteTimer()
+end
+
+--- 翻页事件。
+-- KOReader 的 ReaderPaging（PDF/CBZ）与 ReaderRolling（EPUB 等可重排格式）
+-- 都会在翻页后发出 PageUpdate，插件作为文档级 widget 收到并派发到这里 ——
+-- 两种格式都能覆盖，不需要分别挂钩。
+function ReadSync:onPageUpdate(page)
+    local threshold = tonumber(self.settings.auto_push_pages) or 0
+    if threshold <= 0 then return end
+
+    self.pages_since_push = (self.pages_since_push or 0) + 1
+    if self.pages_since_push < threshold then return end
+
+    logger.dbg("ReadSync: 已翻 " .. tostring(self.pages_since_push) .. " 页（当前第 " .. tostring(page) .. " 页）")
+    -- 计数归零发生在 autoPush 内部：被跳过（没开 Wi-Fi / 没配置）时保留计数
+    self:autoPush(_("每 ") .. threshold .. _(" 页"))
 end
 
 function ReadSync:onCloseDocument()
     if self.settings.auto_push and self:isConfigured() then
         self:pushProgress(true)
     end
+    self:stopMinuteTimer()
     self.session_started_at = nil
+    self.pages_since_push = 0
 end
 
 function ReadSync:onSuspend()

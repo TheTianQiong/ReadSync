@@ -613,6 +613,9 @@ READSYNC_DATA_DIR=./data-mig npx tsx src/scripts/check-migration.ts
 # 端到端集成测试（258 项断言：认证 / 2FA / 恢复码 / 上传 / 分片 / 预签名直传 / 只登记书目 / 进度关联 / 多标识 / 跨域 / 同步 / 统计 / KOSync / 权限隔离）
 READSYNC_DATA_DIR=./data-e2e npx tsx src/scripts/smoke-e2e.ts
 
+# KOReader 插件的逻辑测试（25 项：每 N 页 / 每隔 N 分钟 / 仅 Wi-Fi / 菜单文案）
+npm run test:plugin
+
 # 真实 socket 的大文件整体上传（冒烟测试走进程内 inject，照不出传输层问题）
 READSYNC_DATA_DIR=./data-repro npx tsx src/scripts/repro-upload.ts 64
 
