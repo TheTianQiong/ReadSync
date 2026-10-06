@@ -283,8 +283,15 @@ function PluginConfigDialog({
     setSaving(true);
     setError(null);
     try {
+      /*
+       * 只提交当前可见的字段。
+       *
+       * 条件字段（例如选了 WebDAV 时那些 S3 的框）若一并提交，会把用户上次
+       * 填过的旧值再写回去 —— 换连接方式后配置里混着两种驱动的参数，
+       * 下次切换回去时看到的就是过期的值。
+       */
       const config: Record<string, unknown> = {};
-      for (const field of plugin.configFields) {
+      for (const field of visibleFields(plugin.configFields, values)) {
         const value = values[field.key];
         // 留空的可选敏感字段不提交，避免把空串写进配置
         if (value === '' && !field.required) continue;
@@ -322,7 +329,7 @@ function PluginConfigDialog({
         <EmptyState title="该插件没有可配置项" />
       ) : (
         <div className="flex flex-col gap-3.5">
-          {plugin.configFields.map((field) => (
+          {visibleFields(plugin.configFields, values).map((field) => (
             <Field
               key={field.key}
               label={field.label}
@@ -342,6 +349,24 @@ function PluginConfigDialog({
       )}
     </Modal>
   );
+}
+
+/**
+ * 按 showWhen 挑出当前该显示的配置项。
+ *
+ * 「连接方式」这类配置必然需要它：选了 WebDAV 就不该看到 S3 的密钥框。
+ * 没有条件显示，一个支持多驱动的插件会甩出十几个字段，大半与当前选择无关。
+ */
+function visibleFields(
+  fields: PluginConfigField[],
+  values: Record<string, string | boolean>,
+): PluginConfigField[] {
+  return fields.filter((field) => {
+    if (!field.showWhen) return true;
+    const current = values[field.showWhen.key];
+    // 比较前统一成字符串：select 的值是字符串，而 showWhen 里可能写成数字或布尔
+    return String(current) === String(field.showWhen.equals);
+  });
 }
 
 function ConfigFieldControl({

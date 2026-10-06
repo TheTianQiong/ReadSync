@@ -25,6 +25,11 @@
  * 时间戳的口径：hourly 里的 date/hour 已经是**本地时间**，而 read_record 的
  * create_at 是 **UTC**。所以读 create_at 时要按 utcOffsetHours 换算，否则整天的
  * 时长会跑到错误的小时上（实测这个偏移是 +8）。
+ *
+ * 数据放在哪：**由本插件自己的配置决定**。Reeden 的同步目录一般和书籍文件存储
+ * 不是同一个地方（不同网盘、不同桶，或者干脆是本地目录），所以这里支持直接填
+ * WebDAV / S3 / 本地路径，不必为了它在「存储管理」里多建一条存储条目；想复用
+ * 已有存储时把 sourceMode 选成 existing 也行。
  */
 
 import { inflateRawSync } from 'node:zlib';
@@ -248,6 +253,78 @@ function positionString(position) {
  * 插件入口
  * ========================================================================== */
 
+/* ========================================================================== *
+ * 数据源连接
+ * ========================================================================== */
+
+/** 把插件配置里的连接信息拼成内核要的 { driver, config } */
+function connectionFromConfig(cfg) {
+  const driver = String(cfg.driver || '').trim();
+
+  if (driver === 'webdav') {
+    if (!cfg.webdavUrl) throw new Error('请填写 WebDAV 地址');
+    return {
+      driver: 'webdav',
+      config: {
+        url: String(cfg.webdavUrl).trim(),
+        username: String(cfg.webdavUsername ?? ''),
+        password: String(cfg.webdavPassword ?? ''),
+        basePath: String(cfg.webdavBasePath || '/'),
+        allowSelfSigned: cfg.webdavAllowSelfSigned === true,
+      },
+    };
+  }
+
+  if (driver === 's3') {
+    if (!cfg.s3Endpoint || !cfg.s3Bucket) throw new Error('请填写 S3 的 Endpoint 与存储桶');
+    const pathStyle = cfg.s3ForcePathStyle !== false;
+    return {
+      driver: 's3',
+      config: {
+        endpoint: String(cfg.s3Endpoint).trim(),
+        region: String(cfg.s3Region || 'us-east-1'),
+        bucket: String(cfg.s3Bucket).trim(),
+        accessKeyId: String(cfg.s3AccessKeyId ?? ''),
+        secretAccessKey: String(cfg.s3SecretAccessKey ?? ''),
+        prefix: String(cfg.s3Prefix ?? ''),
+        forcePathStyle: pathStyle,
+        // 两种寻址方式必须一致，否则会出现「签名用的 host 与实际请求的不一样」
+        addressingStyle: pathStyle ? 'path' : 'virtual-host',
+      },
+    };
+  }
+
+  if (driver === 'local') {
+    return {
+      driver: 'local',
+      config: {
+        // 本地驱动的 path 是**相对**服务器存储目录的，绝对路径会被沙箱拒绝
+        path: String(cfg.localPath || 'reeden').trim() || 'reeden',
+        quotaBytes: 0,
+      },
+    };
+  }
+
+  throw new Error('请选择「连接方式」（WebDAV / S3 / 本地目录），或改用「复用已有存储」');
+}
+
+/**
+ * 按配置打开读取器。
+ *
+ * 每次导入都重新建：管理员在后台改完连接信息就能立刻生效，不必重启服务 ——
+ * 与 ctx.getConfig() 每次回库读取是同一个考虑。
+ */
+async function openSource(ctx, cfg) {
+  if (String(cfg.sourceMode || 'connect') === 'existing') {
+    const storageId = Number(cfg.storageId);
+    if (!Number.isFinite(storageId) || storageId <= 0) {
+      throw new Error('请填写「已有存储的 ID」（或把数据源改成「在这里填连接信息」）');
+    }
+    return ctx.storage.forStorage(storageId);
+  }
+  return ctx.storage.connect(connectionFromConfig(cfg));
+}
+
 export async function register(ctx) {
   /**
    * 跑一次完整导入。
@@ -257,12 +334,11 @@ export async function register(ctx) {
    */
   async function runImport() {
     const cfg = ctx.getConfig();
-    const storageId = Number(cfg.storageId);
-    if (!Number.isFinite(storageId) || storageId <= 0) {
-      throw new Error('请先在插件配置里填写「存储后端 ID」');
-    }
     if (!cfg.username) throw new Error('请先在插件配置里填写「导入到哪个账号」');
 
+    const source = await openSource(ctx, cfg);
+
+    // 连接信息与 Reeden 根目录都在插件配置里 —— 外部数据源的位置本来就该由它自己说
     const root = asPrefix(cfg.rootPath);
     const progressDir = String(cfg.progressDir || 'book_progress').replace(/\/+$/, '');
     const offsetHours = Number.isFinite(Number(cfg.utcOffsetHours)) ? Number(cfg.utcOffsetHours) : 8;
@@ -271,11 +347,11 @@ export async function register(ctx) {
 
     // ---- 1) metadata ----
     const metadataKey = joinKey(root, 'metadata');
-    const metadataStat = await ctx.storage.stat(storageId, metadataKey);
+    const metadataStat = await source.stat(metadataKey);
     if (!metadataStat) {
       throw new Error(`找不到 ${metadataKey} —— 请确认「Reeden 根目录」填对了`);
     }
-    const metadataBuf = Buffer.from(await ctx.storage.get(storageId, metadataKey));
+    const metadataBuf = Buffer.from(await source.get(metadataKey));
     const metadataDir = readZipDirectory(metadataBuf);
 
     const bookList = readZipJson(metadataBuf, metadataDir, 'book.json') ?? [];
@@ -285,12 +361,12 @@ export async function register(ctx) {
     // ---- 2) 每本书的进度文件 ----
     const progressFiles = new Map();
     try {
-      const entries = await ctx.storage.list(storageId, joinKey(root, progressDir));
+      const entries = await source.list(joinKey(root, progressDir));
       for (const entry of entries) {
         if (entry.isDir || !entry.name.endsWith('.json')) continue;
         const bookId = entry.name.slice(0, -'.json'.length).toLowerCase();
         try {
-          const raw = Buffer.from(await ctx.storage.get(storageId, entry.path));
+          const raw = Buffer.from(await source.get(entry.path));
           progressFiles.set(bookId, JSON.parse(raw.toString('utf8')));
         } catch (err) {
           // 单个坏文件不该让整次导入失败
@@ -415,7 +491,7 @@ export async function register(ctx) {
     if (coverJobs.length > 0) {
       const coversKey = joinKey(root, 'covers');
       try {
-        const coversBuf = Buffer.from(await ctx.storage.get(storageId, coversKey));
+        const coversBuf = Buffer.from(await source.get(coversKey));
         const coversDir = readZipDirectory(coversBuf);
         for (const job of coverJobs) {
           // book.json 里的 cover_thumb 是 covers zip 里的条目名（形如 <hash>.thumb）

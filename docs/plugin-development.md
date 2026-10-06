@@ -149,7 +149,8 @@ readsync plugin enable com.example.hello
   "default": "https://example.com",
   "placeholder": "https://...",
   "description": "帮助文本，显示在输入框下方",
-  "options": []
+  "options": [],
+  "showWhen": { "key": "mode", "equals": "webdav" }
 }
 ```
 
@@ -157,6 +158,10 @@ readsync plugin enable com.example.hello
 
 - `password` 类型的值会**加密存储**，接口返回时脱敏为 `••••••••`
 - `select` 类型需要提供 `options`：`[{ "value": "a", "label": "选项 A" }]`
+- `showWhen` 让这一项**只在另一个配置项取到某个值时才显示**。支持多驱动/多模式的
+  插件必备：选了 WebDAV 就不该看到 S3 的密钥框，否则一个插件会甩出十几个字段，
+  大半与当前选择无关。表单保存时也只提交当前可见的字段，不会把上一个选项的旧值
+  一起写回去。
 
 ---
 
@@ -175,7 +180,7 @@ readsync plugin enable com.example.hello
 | `ctx.registerSyncProtocol(protocolId, handler)` | 注册同步协议处理器 |
 | `ctx.on(hook, handler)` | 注册生命周期钩子 |
 | `ctx.pluginData` | 插件专属 KV（需 `db:plugin` 权限） |
-| `ctx.storage` | 读取存储后端（需 `fs:storage` 权限） |
+| `ctx.storage` | 读取存储后端：`connect()` 用插件自己的连接 / `forStorage()` 复用已有存储（需 `fs:storage` 权限） |
 | `ctx.sync` | 写入进度/会话、登记书目、写封面（需 `sync:write` / `books:write`） |
 | `ctx.schedule(name, minutes, fn)` | 注册周期任务（`minutes` 为 0 表示只手动触发） |
 
@@ -192,15 +197,32 @@ await ctx.pluginData.delete('lastRun');
 
 ### 4.2 读取存储后端
 
+两种取法，都返回一个绑定好位置的只读读取器：
+
 ```js
-const entries = await ctx.storage.list(storageId, 'book_progress/');
-const bytes = await ctx.storage.get(storageId, 'metadata');
-const stat = await ctx.storage.stat(storageId, 'metadata');
-const head = await ctx.storage.getRange(storageId, 'metadata', 0, 1024);
+// 1) 用插件自己的连接信息（外部数据源用这个）
+const src = await ctx.storage.connect({
+  driver: 'webdav', // 'webdav' | 's3' | 'local' | 插件提供的驱动
+  config: { url: '…', username: '…', password: '…', basePath: '/' },
+});
+await src.list('book_progress/');
+await src.get('metadata');
+await src.stat('metadata');
+await src.getRange('metadata', 0, 1024);
+
+// 2) 复用「存储管理」里已配好的存储
+const existing = await ctx.storage.forStorage(12);
 ```
 
-**只读**，而且 `storageId` 只能来自插件配置 —— 插件拿不到账号列表，也就翻不到别人的网盘。
-存储的属主由 storage 行自己决定。用 `stat` 先看大小，别把几 GB 的书读进内存。
+`connect()` 的 `config` 字段与「存储管理」里那套**完全相同**，由内核用同一批 schema
+校验 —— 插件不必自己解析连接参数，也不会因为漏校验而打开目录穿越（本地驱动）或
+错配密钥的口子。`connect()` 会先做一次连通性测试，连不上直接报错，而不是等到读第一个
+文件才失败。
+
+**只读**：插件拿不到账号列表或存储列表，两种取法都只能指向「管理员在插件配置里
+填的那个位置」，翻不到别人的网盘。用 `stat` 先看大小，别把几 GB 的书读进内存。
+
+连接的凭据要写在插件清单的 `config` 里并声明为 `password` 类型，这样才会加密落库。
 
 ### 4.3 写入阅读数据
 

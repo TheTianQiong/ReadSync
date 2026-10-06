@@ -12,7 +12,7 @@
  * 换成自己的数据用 REEDEN_SAMPLE=/path/to/你的/Reeden。
  * 该目录**只读**：导入器不会改动它，这也是设计约束之一。
  */
-import { cpSync, existsSync, mkdirSync, rmSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import AdmZip from 'adm-zip';
@@ -24,6 +24,7 @@ import { books, pluginData, plugins, readingSessions, storages } from '../db/sch
 import { listPluginTasks, loadPlugins, runPluginTask, stopAllSchedules } from '../modules/plugins/loader.js';
 import { installPlugin, updatePluginConfig } from '../modules/plugins/service.js';
 import { createUser } from '../lib/users.js';
+import { startMockS3 } from './mock-s3.js';
 import { setLogLevel } from '../logger.js';
 
 let passed = 0;
@@ -111,6 +112,13 @@ async function main(): Promise<void> {
   const db = getDb();
 
   /* -------------------- 1. 准备账号与存储 -------------------- */
+  /*
+   * 三种数据源（自带本地连接 / 复用已有存储 / 自带 S3 连接）**各用一个独立账号**。
+   *
+   * 一开始三者共用同一个账号，断言写的是「跑完后数量不变」—— 那是**假通过**：
+   * 前面的运行已经把数据都导进去了，后面那次就算一个字节都没读到，数量也「不变」。
+   * 独立账号下必须从 0 涨到期望值，才能真正证明那次导入读到了数据。
+   */
   const user = await createUser({
     username: 'reedenuser',
     email: 'reeden@example.com',
@@ -118,6 +126,18 @@ async function main(): Promise<void> {
     displayName: 'Reeden',
   });
   check('创建导入目标账号', user.id > 0, user.id);
+
+  const storageUser = await createUser({
+    username: 'reedenbystorage',
+    email: 'reeden-storage@example.com',
+    plainPassword: 'ReedenPass123',
+  });
+  const s3User = await createUser({
+    username: 'reedenbys3',
+    email: 'reeden-s3@example.com',
+    plainPassword: 'ReedenPass123',
+  });
+  check('为「复用已有存储」与「S3」各准备一个独立账号', storageUser.id > 0 && s3User.id > 0);
 
   /*
    * 把样本复制到本地存储目录下。
@@ -151,8 +171,17 @@ async function main(): Promise<void> {
   const installed = await installPlugin(zip.toBuffer(), user.id);
   check('插件安装成功（清单校验通过）', installed.id === PLUGIN_ID, installed);
 
+  /*
+   * 用插件**自己的连接信息**导入（默认模式）。
+   *
+   * 这是主要用法：Reeden 的同步目录通常在另一个网盘或另一个桶里，不该逼用户
+   * 为它在「存储管理」里建条目。本地驱动要求相对路径，插件会把 localPath 交给
+   * 内核用与「存储管理」相同的 schema 校验。
+   */
   updatePluginConfig(PLUGIN_ID, {
-    storageId: String(storage.id),
+    sourceMode: 'connect',
+    driver: 'local',
+    localPath: 'reeden-sample',
     username: user.username,
     rootPath: '',
     progressDir: 'book_progress',
@@ -181,17 +210,25 @@ async function main(): Promise<void> {
   /* -------------------- 3. 跑导入 -------------------- */
   await runPluginTask(PLUGIN_ID, 'sync');
 
-  const count = (table: 'books' | 'sessions'): number => {
+  const count = (table: 'books' | 'sessions', userId: number = user.id): number => {
     const row =
       table === 'books'
-        ? db.select({ n: sql<number>`count(*)` }).from(books).where(eq(books.ownerId, user.id)).get()
+        ? db.select({ n: sql<number>`count(*)` }).from(books).where(eq(books.ownerId, userId)).get()
         : db
             .select({ n: sql<number>`count(*)` })
             .from(readingSessions)
-            .where(eq(readingSessions.userId, user.id))
+            .where(eq(readingSessions.userId, userId))
             .get();
     return row?.n ?? 0;
   };
+
+  /** 某个账号的总时长 */
+  const totalSecondsOf = (userId: number): number =>
+    db
+      .select({ total: sql<number>`coalesce(sum(${readingSessions.seconds}), 0)` })
+      .from(readingSessions)
+      .where(eq(readingSessions.userId, userId))
+      .get()?.total ?? 0;
 
   if (count('books') === 0) {
     // 快速失败：没有书就别再往下查了，后面的断言只会掩盖真正的原因
@@ -299,7 +336,133 @@ async function main(): Promise<void> {
     sampleAfter?.totalReadingSeconds,
   );
 
-  /* -------------------- 5. 运行记录 -------------------- */
+  /* -------------------- 5. 复用已有存储的模式 -------------------- */
+  /*
+   * 两条取数据的路都必须能走通：自带连接（上面那几段）与复用「存储管理」里的
+   * 存储。两者读的是同一份数据，所以跑完总数不该有任何变化 —— 这一步同时
+   * 验证了「换了数据源但内容相同」不会把时长再算一遍。
+   */
+  updatePluginConfig(PLUGIN_ID, {
+    sourceMode: 'existing',
+    storageId: String(storage.id),
+    username: storageUser.username,
+    rootPath: '',
+    progressDir: 'book_progress',
+    utcOffsetHours: '8',
+    intervalMinutes: '0',
+    dailyAt: '',
+    autoRegisterBooks: 'true',
+    importReadingTime: 'true',
+    importCovers: 'true',
+  });
+  await runPluginTask(PLUGIN_ID, 'sync');
+
+  check(
+    '「复用已有存储」模式：书目数从 0 涨到期望值',
+    count('books', storageUser.id) === EXPECTED.bookCount,
+    count('books', storageUser.id),
+  );
+  check(
+    '「复用已有存储」模式：会话行数从 0 涨到期望值',
+    count('sessions', storageUser.id) === EXPECTED.sessionRows,
+    count('sessions', storageUser.id),
+  );
+  check(
+    '「复用已有存储」模式：总时长与自带连接一致',
+    totalSecondsOf(storageUser.id) === EXPECTED.totalSeconds,
+    totalSecondsOf(storageUser.id),
+  );
+
+  /* -------------------- 6. 插件自带 S3 连接（假 S3） -------------------- */
+  {
+    /*
+     * 用户最需要的其实是这条：Reeden 的数据常在另一个对象存储上。
+     * 用假 S3 走一遍真实 HTTP，顺带验证前缀拼接与「列目录」—— plugin 只给到桶与
+     * 前缀，剩下的路径由插件自己拼，拼错就会读不到文件。
+     */
+    const s3 = await startMockS3();
+    try {
+      const samplePrefix = 'reeden';
+      const objects: Array<[string, Buffer]> = [
+        ['metadata', readFileSync(path.join(sampleCopy, 'metadata'))],
+        ['covers', readFileSync(path.join(sampleCopy, 'covers'))],
+        [
+          `book_progress/${EXPECTED.sampleBookId.toUpperCase()}.json`,
+          readFileSync(path.join(sampleCopy, 'book_progress', `${EXPECTED.sampleBookId.toUpperCase()}.json`)),
+        ],
+      ];
+
+      for (const [key, body] of objects) {
+        const res = await fetch(`${s3.endpoint}/${s3.bucket}/${samplePrefix}/${key}`, {
+          method: 'PUT',
+          body,
+        });
+        if (!res.ok) throw new Error(`往假 S3 放 ${key} 失败：HTTP ${res.status}`);
+      }
+      check('样本已放进假 S3（前缀 reeden/）', true);
+
+      updatePluginConfig(PLUGIN_ID, {
+        sourceMode: 'connect',
+        driver: 's3',
+        s3Endpoint: s3.endpoint,
+        s3Region: 'us-east-1',
+        s3Bucket: s3.bucket,
+        s3AccessKeyId: 'test-key',
+        s3SecretAccessKey: 'test-secret',
+        s3Prefix: samplePrefix,
+        s3ForcePathStyle: 'true',
+        username: s3User.username,
+        rootPath: '',
+        progressDir: 'book_progress',
+        utcOffsetHours: '8',
+        intervalMinutes: '0',
+        dailyAt: '',
+        autoRegisterBooks: 'true',
+        importReadingTime: 'true',
+        importCovers: 'true',
+      });
+
+      await runPluginTask(PLUGIN_ID, 'sync');
+
+      check(
+        'S3 数据源：书目数从 0 涨到期望值',
+        count('books', s3User.id) === EXPECTED.bookCount,
+        count('books', s3User.id),
+      );
+      check(
+        'S3 数据源：会话行数从 0 涨到期望值',
+        count('sessions', s3User.id) === EXPECTED.sessionRows,
+        count('sessions', s3User.id),
+      );
+      check(
+        'S3 数据源：总时长与本地一致',
+        totalSecondsOf(s3User.id) === EXPECTED.totalSeconds,
+        totalSecondsOf(s3User.id),
+      );
+
+      /*
+       * 进度是从 book_progress/ 里**列目录**发现的（而不是写死的文件名），
+       * 所以这条能过就说明「桶 + 前缀 + 目录」三层路径拼对了。前缀丢了、
+       * 或列目录没实现对，这条都会红。
+       */
+      const bookViaS3 = db
+        .select({ progressPercent: books.progressPercent })
+        .from(books)
+        .where(
+          sql`${books.ownerId} = ${s3User.id} and ${books.documentId} = ${EXPECTED.sampleBookId}`,
+        )
+        .get();
+      check(
+        'S3 数据源：进度为 86%（前缀与列目录都对）',
+        Math.round(bookViaS3?.progressPercent ?? -1) === EXPECTED.sampleProgressPercent,
+        bookViaS3?.progressPercent,
+      );
+    } finally {
+      await s3.close();
+    }
+  }
+
+  /* -------------------- 7. 运行记录 -------------------- */
   const lastRun = (await getPluginData()) ?? {};
   check('插件记录了上次运行结果', typeof lastRun.at === 'string', lastRun.at);
   check('运行记录里有导入计数', Number(lastRun.books) === EXPECTED.bookCount, lastRun);

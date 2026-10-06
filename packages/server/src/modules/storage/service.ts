@@ -312,7 +312,13 @@ export async function testStorage(id: number, userId: number): Promise<StorageTe
  * 是几千个文件量级，一次扫完没有压力；这个上限只是防止有人把存储根指向一个
  * 巨型桶时把内存和上游配额打爆。
  */
-const BROWSE_SCAN_LIMIT = 5000;
+/**
+ * 浏览目录时一次最多扫描多少个对象。
+ *
+ * 导出是因为插件宿主也要用它来把扁平的对象列表收敛成一层目录 ——
+ * 两边用同一个上限，插件看到的目录才不会因为实现不同而截断得不一样。
+ */
+export const BROWSE_SCAN_LIMIT = 5000;
 
 /**
  * 浏览目录（「存储管理」页面用）。

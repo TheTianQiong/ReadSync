@@ -55,6 +55,14 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
   });
 }
 
+/** XML 文本转义：对象键里可能有 & < > 这些字符 */
+function escapeXml(value: string): string {
+  return value
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
 /** 从 /{bucket}/{key...} 里剥出 bucket 与 key */
 function parsePath(pathname: string, bucket: string): { bucket: string; key: string } | null {
   const clean = decodeURIComponent(pathname).replace(/^\/+/, '');
@@ -72,6 +80,44 @@ export async function startMockS3(): Promise<MockS3> {
     void (async () => {
       const url = new URL(req.url ?? '/', 'http://127.0.0.1');
       requests.push({ method: req.method ?? 'GET', path: url.pathname, headers: req.headers });
+
+      /*
+       * 列桶（ListObjectsV2）：GET /{bucket}?list-type=2&prefix=…
+       * 没有 key，得在 parsePath 之前拦下来 —— 否则会被当成「bucket 下没有这个对象」而 404。
+       *
+       * 插件宿主读外部数据源时要靠列目录发现文件（例如 Reeden 的 book_progress/
+       * 下每个 <bookId>.json），所以这条路径必须能测。
+       */
+      const bucketRoot = decodeURIComponent(url.pathname).replace(/^\/+/, '').replace(/\/+$/, '');
+      if (bucketRoot === bucket && req.method === 'GET' && url.searchParams.get('list-type') === '2') {
+        const prefix = url.searchParams.get('prefix') ?? '';
+        const matched = [...objects.entries()]
+          .filter(([k]) => k.startsWith(prefix))
+          .sort(([a], [b]) => (a < b ? -1 : 1));
+
+        const contents = matched
+          .map(
+            ([k, obj]) =>
+              `<Contents><Key>${escapeXml(k)}</Key>` +
+              `<LastModified>${new Date(0).toISOString()}</LastModified>` +
+              `<ETag>"${createHash('md5').update(obj.body).digest('hex')}"</ETag>` +
+              `<Size>${obj.body.length}</Size><StorageClass>STANDARD</StorageClass></Contents>`,
+          )
+          .join('');
+
+        const xml =
+          '<?xml version="1.0" encoding="UTF-8"?>' +
+          '<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">' +
+          `<Name>${bucket}</Name><Prefix>${escapeXml(prefix)}</Prefix>` +
+          `<KeyCount>${matched.length}</KeyCount><MaxKeys>1000</MaxKeys>` +
+          // IsTruncated=false 是让 SDK 停下的信号；少了它适配器会一直翻页
+          '<IsTruncated>false</IsTruncated>' +
+          contents +
+          '</ListBucketResult>';
+
+        res.writeHead(200, { 'Content-Type': 'application/xml' }).end(xml);
+        return;
+      }
 
       const parsed = parsePath(url.pathname, bucket);
       if (!parsed) {

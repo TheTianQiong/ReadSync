@@ -30,6 +30,18 @@ export const pluginConfigFieldSchema = z.object({
   options: z
     .array(z.object({ value: z.string(), label: z.string() }))
     .optional(),
+  /**
+   * 只在另一个配置项取到某个值时才显示这一项。
+   *
+   * 「连接方式」这类配置必然如此：选了 WebDAV 就不该看到 S3 的密钥框。
+   * 没有它，一个支持多驱动的插件会甩出十几个字段，其中大半与当前选择无关。
+   */
+  showWhen: z
+    .object({
+      key: z.string().min(1),
+      equals: z.union([z.string(), z.number(), z.boolean()]),
+    })
+    .optional(),
 });
 
 export type PluginConfigField = z.infer<typeof pluginConfigFieldSchema>;
@@ -209,24 +221,20 @@ export interface PluginContext {
   };
 
   /**
-   * 读取存储后端里的文件（**只读**）。
+   * 读取存储后端里的文件（**只读**）。需要 fs:storage 权限。
    *
-   * storageId 必须由管理员在插件配置里指定 —— 插件拿不到账号列表，
-   * 也就无法自己去翻别人的网盘。需要 fs:storage 权限。
+   * 两种取法，都返回一个绑定了目标位置的读取器：
+   *  - `connect()`：用插件自己声明的连接参数。**外部数据源用这个** ——
+   *    Reeden 的同步目录、别的阅读器的数据目录，往往与「书籍文件存储」
+   *    根本不是同一个位置，不该逼着用户为它建一条存储条目。
+   *  - `forStorage()`：复用「存储管理」里已配好的某条存储。
+   *
+   * 参数里的连接信息由管理员在插件配置里填写（plugin.json 声明成 password
+   * 类型即可加密落库），插件自己拿不到账号列表，也就翻不到别人的网盘。
    */
   storage: {
-    /** 列出一层条目（目录以 / 结尾） */
-    list(storageId: number, prefix?: string): Promise<PluginStorageEntry[]>;
-    /** 读取整个对象。请先用 stat 看大小，别把几 GB 的书读进内存 */
-    get(storageId: number, key: string): Promise<Uint8Array>;
-    stat(storageId: number, key: string): Promise<PluginStorageStat | null>;
-    /** 按字节范围读取（读 zip 中央目录这类场景用） */
-    getRange(
-      storageId: number,
-      key: string,
-      offset: number,
-      length: number,
-    ): Promise<Uint8Array | null>;
+    connect(connection: PluginStorageConnection): Promise<PluginStorageReader>;
+    forStorage(storageId: number): Promise<PluginStorageReader>;
   };
 
   /**
@@ -261,6 +269,29 @@ export interface PluginContext {
    * 会在停用后继续跑，等于关不掉的定时器。需要声明 schedule 能力。
    */
   schedule(name: string, everyMinutes: number, fn: () => void | Promise<void>): void;
+}
+
+/**
+ * 插件自己声明的存储连接。
+ *
+ * `driver` 与 `config` 的字段与「存储管理」里那套完全一致（local / webdav / s3），
+ * 由内核用同一批 schema 校验 —— 插件不必自己解析，也不会因为校验漏项而打开
+ * 目录穿越之类的口子。
+ */
+export interface PluginStorageConnection {
+  driver: 'local' | 'webdav' | 's3' | string;
+  config: Record<string, unknown>;
+}
+
+/** 绑定到某个位置之后的只读读取器 */
+export interface PluginStorageReader {
+  /** 列出一层条目（目录以 / 结尾） */
+  list(prefix?: string): Promise<PluginStorageEntry[]>;
+  /** 读取整个对象。请先用 stat 看大小，别把几 GB 的书读进内存 */
+  get(key: string): Promise<Uint8Array>;
+  stat(key: string): Promise<PluginStorageStat | null>;
+  /** 按字节范围读取（读 zip 中央目录这类场景用） */
+  getRange(key: string, offset: number, length: number): Promise<Uint8Array | null>;
 }
 
 /** 存储条目（插件视角的只读视图） */

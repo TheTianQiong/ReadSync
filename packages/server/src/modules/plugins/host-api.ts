@@ -1,9 +1,13 @@
 import { and, eq } from 'drizzle-orm';
-import type {
-  PluginBookInput,
-  PluginProgressPush,
-  PluginSessionImport,
-  PluginStorageEntry,
+import {
+  localStorageConfigSchema,
+  s3ConfigSchema,
+  webdavConfigSchema,
+  type PluginBookInput,
+  type PluginProgressPush,
+  type PluginSessionImport,
+  type PluginStorageConnection,
+  type PluginStorageEntry,
 } from '@readsync/shared';
 import { getDb } from '../../db/index.js';
 import { books, pluginData, readingSessions, storages, users } from '../../db/schema.js';
@@ -11,7 +15,9 @@ import { badRequest, notFound } from '../../errors.js';
 import { addDocumentId, findBookByDocumentId, normalizeDocumentId } from '../library/documents.js';
 import { createBook } from '../library/service.js';
 import { saveBookCover } from '../library/cover.js';
-import { browseStorage, getAdapterForStorage } from '../storage/service.js';
+import { BROWSE_SCAN_LIMIT, browseStorage, getAdapterForStorage } from '../storage/service.js';
+import { createAdapter } from '../storage/adapters/registry.js';
+import type { StorageAdapter } from '../storage/types.js';
 import { upsertProgress } from '../sync/service.js';
 import { getModuleLogger } from '../../logger.js';
 
@@ -143,17 +149,95 @@ export function buildPluginDataApi(pluginId: string, allowed: boolean) {
 
 /* -------------------------------- storage -------------------------------- */
 
+/**
+ * 把适配器包成「绑定好位置」的只读读取器。
+ *
+ * 列目录有两条路：绑定到已有存储时用 browseStorage（它能把扁平的对象列表收敛成
+ * 一层目录）；自带连接时没有存储行可用，就地做同样的收敛。
+ */
+function bindReader(adapter: StorageAdapter, browse?: () => Promise<PluginStorageEntry[]>) {
+  return {
+    async list(prefix = ''): Promise<PluginStorageEntry[]> {
+      if (browse) return browse();
+
+      /*
+       * 适配器的 list 是扁平的（S3 风格，没有目录概念），这里收敛成一层：
+       * 只保留 prefix 之下、再往下一级为止的条目，目录以 / 结尾 ——
+       * 与「存储管理」里看到的样子保持一致。
+       */
+      const listed = await adapter.list({ prefix, limit: BROWSE_SCAN_LIMIT });
+      const byName = new Map<string, PluginStorageEntry>();
+      for (const object of listed.objects) {
+        const rest = object.key.slice(prefix.length);
+        if (!rest) continue;
+        const slash = rest.indexOf('/');
+        if (slash === -1) {
+          byName.set(rest, { name: rest, path: object.key, isDir: false, size: object.size ?? null });
+        } else {
+          const dir = rest.slice(0, slash + 1);
+          byName.set(dir, { name: dir, path: `${prefix}${dir}`, isDir: true, size: null });
+        }
+      }
+      return [...byName.values()];
+    },
+
+    async get(key: string): Promise<Uint8Array> {
+      const result = await adapter.get(key);
+      if (!result.stream) throw new Error(`读取 ${key} 失败：存储返回了空内容`);
+      // 适配器可能给 Buffer 也可能给 string（带了编码时），两种都要能吃下
+      const chunks: Buffer[] = [];
+      for await (const chunk of result.stream as AsyncIterable<Buffer | string>) {
+        chunks.push(typeof chunk === 'string' ? Buffer.from(chunk, 'utf8') : chunk);
+      }
+      return Buffer.concat(chunks);
+    },
+
+    async stat(key: string): Promise<{ size: number } | null> {
+      const object = await adapter.stat(key);
+      return object ? { size: object.size } : null;
+    },
+
+    async getRange(key: string, offset: number, length: number): Promise<Uint8Array | null> {
+      if (!adapter.getRange) throw new Error('该存储后端不支持范围读');
+      return adapter.getRange(key, offset, length);
+    },
+  };
+}
+
+/**
+ * 用插件自己声明的连接参数建适配器。
+ *
+ * 校验交给 shared 里那套与「存储管理」完全相同的 schema —— 插件不该自己解析
+ * 连接参数：漏掉一项校验就等于开了目录穿越（本地驱动）或错配密钥的口子。
+ */
+function adapterFromConnection(connection: PluginStorageConnection): StorageAdapter {
+  const driver = String(connection.driver ?? '').trim();
+  if (!driver) throw badRequest('存储连接缺少 driver');
+
+  const config = connection.config ?? {};
+  if (driver === 'local') {
+    return createAdapter('local', localStorageConfigSchema.parse(config) as Record<string, unknown>);
+  }
+  if (driver === 'webdav') {
+    return createAdapter('webdav', webdavConfigSchema.parse(config) as Record<string, unknown>);
+  }
+  if (driver === 's3') {
+    return createAdapter('s3', s3ConfigSchema.parse(config) as Record<string, unknown>);
+  }
+  // 插件自己提供的驱动：配置由那个插件负责校验
+  return createAdapter(driver, config);
+}
+
 export function buildStorageApi(pluginId: string, allowed: boolean) {
   const guard = (): void => {
     if (!allowed) throw denied(pluginId, 'fs:storage', '读取存储后端');
   };
 
   /*
-   * storageId 只能来自插件配置，插件拿不到账号列表 —— 也就是说它翻不到
-   * 别人的网盘，除非管理员在配置里把那个 storage 指给它。归属校验在这里
-   * 只做一次：storage 行自己的 ownerId 就是授权依据。
+   * 两种取法都不接受「随便传个 storageId」：一个是插件配置里的连接参数，
+   * 另一个是管理员在「存储管理」里已经配好的存储行（归属以该行自己的
+   * ownerId 为准）。插件拿不到账号列表，也就翻不到别人的网盘。
    */
-  /** 取存储的属主：storage 行自己的 ownerId 就是授权依据 */
   const ownerOf = (storageId: number): number => {
     const row = getDb()
       .select({ ownerId: storages.userId })
@@ -164,49 +248,40 @@ export function buildStorageApi(pluginId: string, allowed: boolean) {
     return row.ownerId;
   };
 
-  const adapterFor = (storageId: number) => getAdapterForStorage(storageId, ownerOf(storageId));
-
   return {
-    async list(storageId: number, prefix = ''): Promise<PluginStorageEntry[]> {
+    /**
+     * 用插件自己的连接参数连过去。
+     *
+     * 这是给「外部数据源」用的：Reeden 的同步目录、别的阅读器的数据目录，
+     * 通常与书籍文件存储不是同一个地方，不该逼用户为它在「存储管理」里建条目。
+     */
+    async connect(connection: PluginStorageConnection) {
       guard();
-      const result = await browseStorage(storageId, ownerOf(storageId), { prefix });
-      return result.entries.map((entry) => ({
-        name: entry.name,
-        path: entry.path,
-        isDir: entry.isDir,
-        size: entry.size ?? null,
-      }));
-    },
-    async get(storageId: number, key: string): Promise<Uint8Array> {
-      guard();
-      const adapter = await adapterFor(storageId);
-      const result = await adapter.get(key);
-      if (!result.stream) throw new Error(`读取 ${key} 失败：存储返回了空内容`);
-      // 适配器可能给 Buffer 也可能给 string（带了编码时），两种都要能吃下
-      const chunks: Buffer[] = [];
-      for await (const chunk of result.stream as AsyncIterable<Buffer | string>) {
-        chunks.push(typeof chunk === 'string' ? Buffer.from(chunk, 'utf8') : chunk);
+      if (!connection || typeof connection !== 'object') {
+        throw badRequest('connect() 需要一个 { driver, config } 对象');
       }
-      return Buffer.concat(chunks);
+
+      const adapter = adapterFromConnection(connection);
+      // 连不上时立刻报出来，而不是等到读第一个文件才失败
+      const probe = await adapter.test();
+      if (!probe.ok) throw badRequest(`存储连接不可用：${probe.message}`);
+      return bindReader(adapter);
     },
-    async stat(storageId: number, key: string): Promise<{ size: number } | null> {
+
+    /** 复用「存储管理」里已配好的某条存储 */
+    async forStorage(storageId: number) {
       guard();
-      const adapter = await adapterFor(storageId);
-      const object = await adapter.stat(key);
-      return object ? { size: object.size } : null;
-    },
-    async getRange(
-      storageId: number,
-      key: string,
-      offset: number,
-      length: number,
-    ): Promise<Uint8Array | null> {
-      guard();
-      const adapter = await adapterFor(storageId);
-      if (!adapter.getRange) {
-        throw new Error('该存储后端不支持范围读');
-      }
-      return adapter.getRange(key, offset, length);
+      const ownerId = ownerOf(storageId);
+      const adapter = await getAdapterForStorage(storageId, ownerId);
+      return bindReader(adapter, async () => {
+        const result = await browseStorage(storageId, ownerId, { prefix: '' });
+        return result.entries.map((entry) => ({
+          name: entry.name,
+          path: entry.path,
+          isDir: entry.isDir,
+          size: entry.size ?? null,
+        }));
+      });
     },
   };
 }

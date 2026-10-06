@@ -1,7 +1,7 @@
 {
   "id": "com.readsync.reeden-sync",
   "name": "Reeden 同步",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "ReadSync",
   "description": "定时读取 WebDAV / S3 上 Reeden 的阅读数据（进度、时长、书目、封面）并导入本服务器",
   "license": "MIT",
@@ -10,26 +10,141 @@
   "permissions": ["log", "db:plugin", "fs:storage", "sync:write", "books:write"],
   "config": [
     {
-      "key": "storageId",
-      "label": "存储后端 ID",
-      "type": "number",
-      "required": true,
-      "description": "Reeden 根目录所在的存储（在「存储管理」里可以看到 ID）"
+      "key": "sourceMode",
+      "label": "Reeden 数据放在哪",
+      "type": "select",
+      "default": "connect",
+      "options": [
+        { "value": "connect", "label": "在这里填连接信息（推荐）" },
+        { "value": "existing", "label": "复用「存储管理」里已有的存储" }
+      ],
+      "description": "Reeden 的同步目录通常与书籍文件存储不是同一个地方，所以可以直接在这里填它自己的地址"
     },
+    {
+      "key": "storageId",
+      "label": "已有存储的 ID",
+      "type": "number",
+      "showWhen": { "key": "sourceMode", "equals": "existing" },
+      "description": "在「存储管理」里能看到 ID；该存储必须已经是可用的"
+    },
+
+    {
+      "key": "driver",
+      "label": "连接方式",
+      "type": "select",
+      "default": "webdav",
+      "showWhen": { "key": "sourceMode", "equals": "connect" },
+      "options": [
+        { "value": "webdav", "label": "WebDAV（坚果云 / Nextcloud / Alist…）" },
+        { "value": "s3", "label": "S3 兼容对象存储（R2 / OSS / COS / MinIO）" },
+        { "value": "local", "label": "服务器本地目录" }
+      ]
+    },
+
+    {
+      "key": "webdavUrl",
+      "label": "WebDAV 地址",
+      "type": "url",
+      "placeholder": "https://dav.jianguoyun.com/dav/",
+      "showWhen": { "key": "driver", "equals": "webdav" },
+      "description": "要填到能直接列目录的那一层"
+    },
+    {
+      "key": "webdavUsername",
+      "label": "WebDAV 用户名",
+      "type": "string",
+      "showWhen": { "key": "driver", "equals": "webdav" }
+    },
+    {
+      "key": "webdavPassword",
+      "label": "WebDAV 密码 / 应用授权码",
+      "type": "password",
+      "showWhen": { "key": "driver", "equals": "webdav" },
+      "description": "加密存储；坚果云这类服务要用「应用密码」而不是登录密码"
+    },
+    {
+      "key": "webdavBasePath",
+      "label": "WebDAV 根目录",
+      "type": "string",
+      "default": "/",
+      "showWhen": { "key": "driver", "equals": "webdav" },
+      "description": "留空或 / 表示账号根目录"
+    },
+    {
+      "key": "webdavAllowSelfSigned",
+      "label": "允许自签名证书",
+      "type": "boolean",
+      "default": false,
+      "showWhen": { "key": "driver", "equals": "webdav" },
+      "description": "自建 Nextcloud / Alist 常见"
+    },
+
+    {
+      "key": "s3Endpoint",
+      "label": "S3 Endpoint",
+      "type": "url",
+      "placeholder": "https://s3.example.com",
+      "showWhen": { "key": "driver", "equals": "s3" }
+    },
+    {
+      "key": "s3Bucket",
+      "label": "S3 存储桶",
+      "type": "string",
+      "showWhen": { "key": "driver", "equals": "s3" }
+    },
+    {
+      "key": "s3Region",
+      "label": "S3 区域",
+      "type": "string",
+      "default": "us-east-1",
+      "showWhen": { "key": "driver", "equals": "s3" }
+    },
+    {
+      "key": "s3AccessKeyId",
+      "label": "S3 Access Key",
+      "type": "password",
+      "showWhen": { "key": "driver", "equals": "s3" }
+    },
+    {
+      "key": "s3SecretAccessKey",
+      "label": "S3 Secret Key",
+      "type": "password",
+      "showWhen": { "key": "driver", "equals": "s3" },
+      "description": "与 Access Key 一样加密存储"
+    },
+    {
+      "key": "s3Prefix",
+      "label": "S3 对象前缀",
+      "type": "string",
+      "default": "",
+      "showWhen": { "key": "driver", "equals": "s3" },
+      "description": "Reeden 根目录在桶里的位置；留空表示桶根目录"
+    },
+    {
+      "key": "s3ForcePathStyle",
+      "label": "使用 path 风格寻址",
+      "type": "boolean",
+      "default": true,
+      "showWhen": { "key": "driver", "equals": "s3" },
+      "description": "阿里云 OSS / MinIO 需要打开；Cloudflare R2 关掉即可"
+    },
+
+    {
+      "key": "localPath",
+      "label": "本地目录",
+      "type": "string",
+      "default": "reeden",
+      "showWhen": { "key": "driver", "equals": "local" },
+      "description": "相对服务器数据目录下的 storage 目录；例如 reeden 表示 <数据目录>/storage/reeden"
+    },
+
     {
       "key": "rootPath",
       "label": "Reeden 根目录",
       "type": "string",
       "default": "",
-      "placeholder": "留空表示存储根目录",
-      "description": "该目录下应当有 metadata、book_progress、covers"
-    },
-    {
-      "key": "username",
-      "label": "导入到哪个账号",
-      "type": "string",
-      "required": true,
-      "description": "填用户名或邮箱；进度与时长都会记在这个账号下"
+      "placeholder": "留空表示上面那个位置的根",
+      "description": "该目录下应当有 metadata、book_progress、covers 这三样"
     },
     {
       "key": "progressDir",
@@ -43,7 +158,14 @@
       "label": "时间戳时区偏移（小时）",
       "type": "number",
       "default": 8,
-      "description": "Reeden 的 read_record 里 create_at 是 UTC，按这个偏移换算成本地小时；只有 hourly 文件没覆盖到的早期数据才用到它"
+      "description": "read_record 里 create_at 是 UTC，按这个偏移换算成本地小时；只有 hourly 没覆盖到的早期数据才用得上"
+    },
+    {
+      "key": "username",
+      "label": "导入到哪个账号",
+      "type": "string",
+      "required": true,
+      "description": "填用户名或邮箱；进度与时长都会记在这个账号下"
     },
     {
       "key": "intervalMinutes",
