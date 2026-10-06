@@ -33,7 +33,7 @@ my-plugin.zip
   "version": "1.0.0",
   "author": "你的名字",
   "description": "一个演示插件",
-  "apiVersion": ">=0.1.0 <0.2.0",
+  "apiVersion": ">=0.2.0 <0.3.0",
   "capabilities": ["notification"],
   "main": "index.js",
   "permissions": ["log"],
@@ -100,7 +100,7 @@ readsync plugin enable com.example.hello
 | `id` | string | ✅ | 唯一标识，小写字母/数字/`.`/`_`/`-`，建议反向域名风格 |
 | `name` | string | ✅ | 显示名称 |
 | `version` | string | ✅ | 语义化版本，如 `1.0.0` |
-| `apiVersion` | string | ✅ | 兼容的内核版本范围，如 `">=0.1.0 <0.2.0"`。不匹配时内核拒绝加载 |
+| `apiVersion` | string | ✅ | 兼容的内核版本范围，如 `">=0.2.0 <0.3.0"`。不匹配时内核拒绝加载 |
 | `capabilities` | string[] | ✅ | 声明能力，见下节 |
 | `main` | string | | 入口文件，默认 `index.js` |
 | `runtime` | string | | 目前只支持 `node` |

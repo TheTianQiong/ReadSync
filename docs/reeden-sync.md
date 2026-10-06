@@ -122,20 +122,20 @@ readsync plugin:list
 
 ## 七、验证
 
-仓库里带一份端到端验证脚本，拿一份**真实的 Reeden 导出**跑完整链路：
+仓库里带一份端到端验证脚本，以及一份**实测过的真实导出**（[examples/reeden-sample](../examples/README.md)）：
 
 ```bash
-READSYNC_DATA_DIR=./data-reeden REEDEN_SAMPLE=/path/to/你的/Reeden \
-  npx tsx src/scripts/reeden-import-check.ts
+cd packages/server
+READSYNC_DATA_DIR=./data-reeden npx tsx src/scripts/reeden-import-check.ts
 ```
-
-`REEDEN_SAMPLE` 指向 Reeden 根目录（里面应有 `metadata`、`book_progress`、`covers`）。
-脚本**只读**它，不会改动你的数据。
 
 它会真的安装插件（走 zip 校验）、真的读 zip、真的写库，然后核对**从样本里独立算出来的**
 数字：书目数、会话行数、总秒数、单日秒数、进度百分比、封面、以及「重跑一遍结果不变」。
 
-注意那些期望值（18 本书、159202 秒、单日 8447 秒…）是**按一份具体样本算出来的**：
+想拿自己的数据跑，用 `REEDEN_SAMPLE=/path/to/你的/Reeden` 覆盖默认样本。
+脚本**只读**它，不会改动你的数据。
+
+注意那些期望值（18 本书、159202 秒、单日 8447 秒…）是**按那份样本算出来的**：
 换一份数据跑时它们要对你的导出重新算过。这个脚本守的是「导入逻辑与样本口径一致」，
 不是「所有导出都长这样」。
 

@@ -6,15 +6,15 @@
  * 里算出来的，不是照着实现反推的。
  *
  * 用法：
- *   READSYNC_DATA_DIR=./data-reeden \
- *   REEDEN_SAMPLE=/path/to/你的/Reeden \
- *   npx tsx src/scripts/reeden-import-check.ts
+ *   READSYNC_DATA_DIR=./data-reeden npx tsx src/scripts/reeden-import-check.ts
  *
- * REEDEN_SAMPLE 指向 Reeden 的根目录（里面应有 metadata / book_progress / covers）。
+ * 默认用仓库里的 examples/reeden-sample（一份实测过的真实导出）；
+ * 换成自己的数据用 REEDEN_SAMPLE=/path/to/你的/Reeden。
  * 该目录**只读**：导入器不会改动它，这也是设计约束之一。
  */
 import { cpSync, existsSync, mkdirSync, rmSync } from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import AdmZip from 'adm-zip';
 import { eq, sql } from 'drizzle-orm';
 import { loadConfig } from '../config.js';
@@ -74,8 +74,21 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  // 必须显式给 REEDEN_SAMPLE：仓库里不带样本（那是用户的真实阅读数据，不该入库）
-  const sampleDir = path.resolve(process.env.REEDEN_SAMPLE ?? '');
+  /*
+   * 默认取仓库里的样本。从脚本自身位置往上找仓库根目录 ——
+   * 用 cwd 拼相对路径的话，在别的目录下跑就会静默找不到样本。
+   */
+  // packages/server/src/scripts → 四级回到仓库根
+  const repoRoot = path.resolve(
+    path.dirname(fileURLToPath(import.meta.url)),
+    '..',
+    '..',
+    '..',
+    '..',
+  );
+  const sampleDir = path.resolve(
+    process.env.REEDEN_SAMPLE ?? path.join(repoRoot, 'examples', 'reeden-sample'),
+  );
   if (!existsSync(path.join(sampleDir, 'metadata'))) {
     console.error(`找不到 Reeden 样本：${sampleDir}`);
     console.error('用 REEDEN_SAMPLE=<你的 Reeden 根目录> 指定；目录里应有 metadata / book_progress / covers。');
@@ -132,7 +145,7 @@ async function main(): Promise<void> {
   check('登记存储（样本已复制进存储目录）', storage.id > 0, storage.id);
 
   /* -------------------- 2. 安装插件（走真实安装路径） -------------------- */
-  const pluginSrcDir = path.join(process.cwd(), 'plugins-samples', 'reeden-sync');
+  const pluginSrcDir = path.join(repoRoot, 'packages', 'server', 'plugins-samples', 'reeden-sync');
   const zip = new AdmZip();
   zip.addLocalFolder(pluginSrcDir);
   const installed = await installPlugin(zip.toBuffer(), user.id);

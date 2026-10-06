@@ -5,7 +5,7 @@
   "author": "ReadSync",
   "description": "定时读取 WebDAV / S3 上 Reeden 的阅读数据（进度、时长、书目、封面）并导入本服务器",
   "license": "MIT",
-  "apiVersion": ">=0.1.0 <0.2.0",
+  "apiVersion": ">=0.2.0 <0.3.0",
   "capabilities": ["metadata"],
   "permissions": ["log", "db:plugin", "fs:storage", "sync:write", "books:write"],
   "config": [

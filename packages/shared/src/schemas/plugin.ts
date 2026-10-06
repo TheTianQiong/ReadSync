@@ -51,7 +51,7 @@ export const pluginManifestSchema = z.object({
   license: z.string().max(32).optional(),
 
   /**
-   * 兼容的 ReadSync 主版本范围（语义化版本 range），例如 ">=0.1.0 <0.2.0"。
+   * 兼容的 ReadSync 主版本范围（语义化版本 range），例如 ">=0.2.0 <0.3.0"。
    * 服务端在安装与加载时都会校验，避免插件与内核 API 不匹配。
    */
   apiVersion: z.string().min(1),
