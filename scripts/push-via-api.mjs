@@ -174,49 +174,103 @@ if (DRY_RUN) {
  * 2) 逐个提交地推
  * -------------------------------------------------------------------------- */
 
-/** 上传一个提交改动过的文件，返回 tree 条目（含 sha: null 的删除项） */
-async function uploadEntries(parent, commit) {
-  const changed = git('diff', '--name-only', `${parent}..${commit}`).split('\n').filter(Boolean);
+/** 上传一个 blob，并核对远端存下来的 SHA 与本地一致 */
+async function uploadBlob(path, blobSha) {
+  const bytes = gitBytes('cat-file', 'blob', blobSha);
+
+  const blob = await api(`/repos/${OWNER}/${REPO}/git/blobs`, {
+    method: 'POST',
+    body: JSON.stringify({ content: bytes.toString('base64'), encoding: 'base64' }),
+  });
+
+  /*
+   * 逐个 blob 对齐 SHA。git 的 SHA 是内容寻址的，所以 SHA 相同就等于字节相同 ——
+   * 这是唯一能挡住「内容在送入 API 的过程中被悄悄改写」的检查。宁可在这里失败，
+   * 也不要把一份被改过的文件推上去（二进制文件尤其看不出来）。
+   */
+  if (blob.sha !== blobSha) {
+    console.error(`\n中止：上传后内容不一致 ${path}`);
+    console.error(`  本地 blob ${blobSha}（${bytes.length} 字节）`);
+    console.error(`  远端 blob ${blob.sha}`);
+    console.error('文件在送入 API 的过程中被改写了；请检查本脚本是否仍按字节读取内容。');
+    process.exit(1);
+  }
+
+  console.log(`    ✓ ${path}`);
+  return blob.sha;
+}
+
+/** `git ls-tree -r <tree>` 的输出 → path → { sha, mode } */
+function listTree(treeish) {
+  const out = new Map();
+  for (const line of git('ls-tree', '-r', treeish).split('\n').filter(Boolean)) {
+    // 形如：100644 blob <sha>\t<path>
+    const [meta, ...rest] = line.split('\t');
+    const path = rest.join('\t');
+    const [mode, , sha] = meta.split(/\s+/);
+    if (path && sha) out.set(path, { sha, mode });
+  }
+  return out;
+}
+
+/**
+ * 算出「把 baseTree 变成 targetTree 需要改哪些文件」。
+ *
+ * **不能只算「这个提交改了什么」**，两者在分叉修正时不是一回事：远端那棵树里可能
+ * 有本地已经没有的文件（例如上一次推坏的副本里那份样本），那些必须显式删除，
+ * 否则拼出来的树会带着它们，与本地永远对不上。
+ *
+ * 返回 tree 条目：改动/新增的上传本地那份，多出来的写 sha: null 删掉。
+ */
+async function entriesBetween(baseTree, targetTree) {
+  const target = listTree(targetTree);
   const entries = [];
+  const handled = new Set();
 
-  for (const path of changed) {
-    let mode = '';
-    try {
-      mode = git('ls-tree', commit, '--', path).split(/\s+/)[0] ?? '';
-    } catch {
-      mode = '';
+  if (gitOk('cat-file', '-e', baseTree)) {
+    // 本地有这个 tree，直接让 git 算差异（--no-renames：改名拆成删+增，少一种情况要处理）
+    const status = git('diff', '--name-status', '--no-renames', baseTree, targetTree)
+      .split('\n')
+      .filter(Boolean);
+
+    for (const line of status) {
+      const [code, ...rest] = line.split('\t');
+      const path = rest.join('\t');
+      if (!path) continue;
+
+      if (code === 'D') {
+        entries.push({ path, mode: '100644', type: 'blob', sha: null });
+        console.log(`    ✗ ${path}  删除`);
+        handled.add(path);
+        continue;
+      }
+
+      const item = target.get(path);
+      if (!item) continue;
+      entries.push({ path, mode: item.mode, type: 'blob', sha: await uploadBlob(path, item.sha) });
+      handled.add(path);
     }
+    return entries;
+  }
 
-    // 该路径在本提交里已被删除：tree 里要写 sha: null 才能删掉它
-    if (!mode) {
-      entries.push({ path, mode: '100644', type: 'blob', sha: null });
-      console.log(`    ✗ ${path}  已删除`);
-      continue;
-    }
+  /*
+   * 兜底：远端那个 tree 在本地没有（例如换了台机器），只能拉它的清单逐路径比对。
+   * 递归列出一层的 blob 即可，多一层 API 调用换「任何情况下都算得对」。
+   */
+  const remoteTree = await api(`/repos/${OWNER}/${REPO}/git/trees/${baseTree}?recursive=1`);
+  const remoteBlobs = new Map(
+    (remoteTree.tree ?? []).filter((e) => e.type === 'blob').map((e) => [e.path, e.sha]),
+  );
 
-    const localBlob = git('rev-parse', `${commit}:${path}`);
-    const bytes = gitBytes('cat-file', 'blob', localBlob);
-
-    const blob = await api(`/repos/${OWNER}/${REPO}/git/blobs`, {
-      method: 'POST',
-      body: JSON.stringify({ content: bytes.toString('base64'), encoding: 'base64' }),
-    });
-
-    /*
-     * 逐个 blob 对齐 SHA。git 的 SHA 是内容寻址的，所以 SHA 相同就等于字节相同 ——
-     * 这是唯一能挡住「内容在送入 API 的过程中被悄悄改写」的检查。宁可在这里失败，
-     * 也不要把一份被改过的文件推上去（二进制文件尤其看不出来）。
-     */
-    if (blob.sha !== localBlob) {
-      console.error(`\n中止：上传后内容不一致 ${path}`);
-      console.error(`  本地 blob ${localBlob}（${bytes.length} 字节）`);
-      console.error(`  远端 blob ${blob.sha}`);
-      console.error('文件在送入 API 的过程中被改写了；请检查本脚本是否仍按字节读取内容。');
-      process.exit(1);
-    }
-
-    entries.push({ path, mode, type: 'blob', sha: blob.sha });
-    console.log(`    ✓ ${path}`);
+  for (const [path, item] of target) {
+    if (remoteBlobs.get(path) === item.sha) continue;
+    entries.push({ path, mode: item.mode, type: 'blob', sha: await uploadBlob(path, item.sha) });
+    handled.add(path);
+  }
+  for (const path of remoteBlobs.keys()) {
+    if (handled.has(path) || target.has(path)) continue;
+    entries.push({ path, mode: '100644', type: 'blob', sha: null });
+    console.log(`    ✗ ${path}  删除`);
   }
 
   return entries;
@@ -236,7 +290,8 @@ let baseTree = await treeOf(remoteTip);
 for (const [index, commit] of backlog.entries()) {
   console.log(`\n[${index + 1}/${backlog.length}] ${short(commit)}  ${git('log', '-1', '--format=%s', commit)}`);
 
-  const entries = await uploadEntries(parent, commit);
+  // 以远端当前那棵树为底，算出「差集」——改动/新增的上传，多出来的删掉
+  const entries = await entriesBetween(baseTree, git('rev-parse', `${commit}^{tree}`));
   const tree = await api(`/repos/${OWNER}/${REPO}/git/trees`, {
     method: 'POST',
     body: JSON.stringify({ base_tree: baseTree, tree: entries }),
