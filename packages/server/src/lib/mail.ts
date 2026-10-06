@@ -232,6 +232,70 @@ export async function sendPasswordResetCode(to: string, code: string, ttlMinutes
   });
 }
 
+/**
+ * 本函数负责的验证码用途。
+ *
+ * 刻意与 auth 模块那个更宽的联合区分开：「忘记密码」有自己的专用模板，
+ * 不走这里。邮件层不该反向依赖业务模块的类型。
+ */
+export type EmailCodeMailPurpose = 'register' | 'change_email' | 'change_password' | 'disable_2fa';
+
+/**
+ * 发送验证码（注册 / 改邮箱 / 改密码 / 关闭两步验证）。
+ *
+ * 每个用途单独一套措辞：收信人一眼就能看出这个码是干什么用的，
+ * 也就更容易发现「我没做过这个操作」。
+ */
+export async function sendEmailCode(
+  to: string,
+  code: string,
+  purpose: EmailCodeMailPurpose,
+  ttlMinutes: number,
+): Promise<MailSendResult> {
+  const siteName = getSiteSettings().siteName;
+
+  const copy: Record<EmailCodeMailPurpose, { title: string; action: string; warn: string }> = {
+    register: {
+      title: '完成注册',
+      action: '注册账号',
+      warn: '如果这不是你本人的操作，忽略本邮件即可，账号不会创建。',
+    },
+    change_email: {
+      title: '确认新的邮箱地址',
+      action: '更换邮箱',
+      warn: '如果这不是你本人的操作，请不要把验证码告诉任何人。',
+    },
+    change_password: {
+      title: '确认修改密码',
+      action: '修改密码',
+      warn: '如果这不是你本人的操作，请立即修改密码并检查登录设备。',
+    },
+    disable_2fa: {
+      title: '确认关闭两步验证',
+      action: '关闭两步验证',
+      warn: '关闭后账号只靠密码保护。如果这不是你本人的操作，请立即修改密码。',
+    },
+  };
+  const { title, action, warn } = copy[purpose];
+
+  return sendMail({
+    to,
+    subject: `【${siteName}】${title}验证码`,
+    html: `
+      <div style="font-family: system-ui, sans-serif; line-height: 1.7; color: #1a1a1a;">
+        <h2 style="margin: 0 0 12px;">${title}</h2>
+        <p>你正在${action}，验证码是：</p>
+        <p style="font-size: 30px; font-weight: 700; letter-spacing: 6px; margin: 16px 0; color: #111;">
+          ${code}
+        </p>
+        <p>验证码 ${ttlMinutes} 分钟内有效，请勿转发给他人。</p>
+        <p style="color: #666; font-size: 13px;">${warn}</p>
+      </div>
+    `,
+    text: `你的 ${siteName} ${title}验证码是 ${code}，${ttlMinutes} 分钟内有效。`,
+  });
+}
+
 /** 发送「密码已变更」通知，让账号被盗时用户能及时察觉 */
 export async function sendPasswordChangedNotice(to: string, ip: string | null): Promise<void> {
   const siteName = getSiteSettings().siteName;

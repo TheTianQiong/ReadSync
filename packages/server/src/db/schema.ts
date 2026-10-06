@@ -21,6 +21,14 @@ export const users = sqliteTable(
     id: integer('id').primaryKey({ autoIncrement: true }),
     username: text('username').notNull(),
     email: text('email').notNull(),
+    /**
+     * 邮箱通过验证码确认过的时间；null 表示未验证。
+     *
+     * 不做成布尔量是因为「什么时候验的」以后可能要用来判断是否过期。
+     * 老账号没有这个值（null）—— 不能因为加了这个功能就把他们卡在
+     * 改密码的门口，因此「改了邮箱就重新计一次、没验过就不要求」。
+     */
+    emailVerifiedAt: integer('email_verified_at', { mode: 'timestamp_ms' }),
     displayName: text('display_name'),
     avatarUrl: text('avatar_url'),
 
@@ -150,7 +158,22 @@ export const emailCodes = sqliteTable(
     email: text('email').notNull(),
     /** 6 位数字码的哈希 */
     codeHash: text('code_hash').notNull(),
-    purpose: text('purpose').$type<'password_reset' | 'email_verify'>().notNull(),
+    /**
+     * 用途。
+     *
+     * 必须按用途隔离：给「改密码」发的码不能拿去「改邮箱」——
+     * 否则一个动机不纯的页面只要骗到任意一个码，就能一路改到底。
+     */
+    purpose: text('purpose')
+      .$type<
+        | 'password_reset'
+        | 'email_verify'
+        | 'register'
+        | 'change_email'
+        | 'change_password'
+        | 'disable_2fa'
+      >()
+      .notNull(),
     expiresAt: integer('expires_at', { mode: 'timestamp_ms' }).notNull(),
     consumedAt: integer('consumed_at', { mode: 'timestamp_ms' }),
     /** 尝试次数，超过上限直接作废，防止暴力猜码 */

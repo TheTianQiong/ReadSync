@@ -28,7 +28,7 @@ import { getDb } from '../../db/index.js';
 import { inviteCodes, users } from '../../db/schema.js';
 import { badRequest, conflict, forbidden, internal, notFound } from '../../errors.js';
 import { auditContextFrom, recordAudit } from '../../lib/audit.js';
-import { resetMailCache, sendTestMail } from '../../lib/mail.js';
+import { isMailConfigured, resetMailCache, sendTestMail } from '../../lib/mail.js';
 import { resolveNewPassword } from '../../lib/password-input.js';
 import {
   getMailSettingsRaw,
@@ -73,6 +73,17 @@ export async function registerAdminRoutes(app: FastifyInstance): Promise<void> {
    */
   app.patch('/api/admin/settings', { preHandler: requireAdmin }, async (req) => {
     const patch = siteSettingsSchema.partial().parse(req.body) as Partial<SiteSettings>;
+
+    /*
+     * 要求邮箱验证码之前，先确认邮件真的发得出去。
+     *
+     * 开着这个开关而邮件没配好，结果是新用户注册时卡在「请填写验证码」——
+     * 他永远收不到那封信，而管理员不会立刻想到是这里的问题。宁可现在就拒绝。
+     */
+    if (patch.emailVerification && patch.emailVerification !== 'off' && !isMailConfigured()) {
+      throw badRequest('请先在「邮件服务」里配置并启用邮件发送，否则用户收不到验证码');
+    }
+
     const updated = patchSiteSettings(patch);
 
     recordAudit('admin.settings_update', auditContextFrom(req), {

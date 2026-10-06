@@ -1,5 +1,5 @@
 import { generateAuthenticationOptions, generateRegistrationOptions, verifyAuthenticationResponse, verifyRegistrationResponse } from '@simplewebauthn/server';
-import { and, desc, eq, isNull, sql } from 'drizzle-orm';
+import { and, desc, eq, sql } from 'drizzle-orm';
 import type { FastifyInstance } from 'fastify';
 import {
   changePasswordSchema,
@@ -11,6 +11,7 @@ import {
   passkeyRegisterVerifySchema,
   passwordSchema,
   refreshTokenSchema,
+  emailCodeRequestSchema,
   registerSchema,
   resetPasswordSchema,
   totpDisableSchema,
@@ -20,28 +21,40 @@ import {
   type PasskeySummary,
   type SessionUser,
   type TotpSetupResult,
+  type VerificationRequirements,
 } from '@readsync/shared';
 import { resolvePassword } from '../../crypto/keys.js';
 import {
-  generateNumericCode,
   generateRecoveryCodes,
   hashPassword,
   md5Hex,
-  safeEqualHex,
-  sha256Hex,
   verifyPassword,
 } from '../../crypto/password.js';
 import { decryptString, encryptString } from '../../crypto/secret-box.js';
 import { getDb } from '../../db/index.js';
-import { emailCodes, passkeys, users, type PasskeyRow } from '../../db/schema.js';
+import { passkeys, users, type PasskeyRow } from '../../db/schema.js';
 import { badRequest, conflict, forbidden, internal, notFound, rateLimited, unauthorized } from '../../errors.js';
 import { auditContextFrom, recordAudit } from '../../lib/audit.js';
-import { assertMailConfigured, sendPasswordChangedNotice, sendPasswordResetCode } from '../../lib/mail.js';
+import {
+  assertMailConfigured,
+  isMailConfigured,
+  sendEmailCode,
+  sendPasswordChangedNotice,
+  sendPasswordResetCode,
+} from '../../lib/mail.js';
 import { resolveNewPassword } from '../../lib/password-input.js';
 import { getSiteSettings } from '../../lib/settings.js';
 import { createUser, findUserByLogin, toSessionUser } from '../../lib/users.js';
 import { getModuleLogger } from '../../logger.js';
 import { currentUser, requireAuth } from '../../middleware/auth.js';
+import {
+  EMAIL_CODE_TTL_MS,
+  consumeEmailCode,
+  issueEmailCode,
+  maskEmail,
+  verifyEmailCode,
+} from './email-code.js';
+import { verificationRequirements } from './email-verification.js';
 import {
   bumpTokenVersion,
   buildTotpUri,
@@ -77,11 +90,6 @@ import {
  *    落库永远只存 Argon2id 单向哈希；
  *  - refresh token 只存 SHA-256，并实现轮换 + 重放检测，见 service.ts。
  */
-
-/** 密码重置验证码有效期：太短用户来不及收信，太长则给暴力猜码留出窗口 */
-const RESET_CODE_TTL_MS = 10 * 60 * 1000;
-/** 同一验证码允许的最大尝试次数，超过直接作废 */
-const RESET_CODE_MAX_ATTEMPTS = 5;
 
 /** 需要二次验证但本次未提交验证码时的返回体（此时不签发任何令牌） */
 interface TwoFactorChallenge {
@@ -149,6 +157,16 @@ export async function registerAuthRoutes(app: FastifyInstance): Promise<void> {
       inviteConsumed = true;
     }
 
+    /*
+     * 邮箱验证码。校验放在邀请码之后、建号之前：先做那些「不改变状态」的检查，
+     * 最后才动验证码。真正核销要等账号建好 —— 用户名撞车这类失败不该烧掉一个码。
+     */
+    let commitEmailCode: (() => void) | null = null;
+    if (verificationRequirements({ emailVerifiedAt: null }).registration) {
+      if (!input.emailCode) throw badRequest('请填写邮箱收到的验证码');
+      commitEmailCode = verifyEmailCode(input.email, 'register', input.emailCode);
+    }
+
     let user;
     try {
       user = await createUser({
@@ -163,13 +181,130 @@ export async function registerAuthRoutes(app: FastifyInstance): Promise<void> {
       throw err;
     }
 
+    // 账号真的建好了才核销验证码
+    commitEmailCode?.();
+    if (commitEmailCode) {
+      getDb()
+        .update(users)
+        .set({ emailVerifiedAt: new Date() })
+        .where(eq(users.id, user.id))
+        .run();
+      user.emailVerifiedAt = new Date();
+    }
+
     recordAudit('user.register', auditContextFrom(req, { id: user.id, username: user.username }), {
       target: user.username,
-      meta: { email: user.email },
+      meta: { email: user.email, emailVerified: commitEmailCode !== null },
     });
 
     return { ok: true, data: { user: toSessionUser(user) } } satisfies ApiSuccess<{ user: SessionUser }>;
   });
+
+  /**
+   * 注册前请求邮箱验证码（无需登录）。
+   *
+   * 响应文案与「是否需要验证」无关地保持一致，且对已注册的邮箱同样返回成功 ——
+   * 否则这个接口就成了「这个邮箱注册过没有」的查询器。
+   */
+  app.post(
+    '/api/auth/register/code',
+    { config: { rateLimit: limited(5, '15 minutes') } },
+    async (req) => {
+      const settings = getSiteSettings();
+      if (!settings.registrationEnabled) throw forbidden('本站点已关闭注册');
+      if (!verificationRequirements({ emailVerifiedAt: null }).registration) {
+        throw badRequest('本站点注册不需要邮箱验证码');
+      }
+
+      const input = emailCodeRequestSchema.parse({ ...(req.body as object), purpose: 'register' });
+      if (!input.email) throw badRequest('请填写邮箱');
+
+      // 邮箱已被占用就不发了（注册那一步会给出明确冲突提示）
+      const taken = findUserByLogin(input.email);
+      if (!taken) {
+        const code = issueEmailCode(input.email, 'register', req.ip ?? null);
+        const sent = await sendEmailCode(input.email, code, 'register', EMAIL_CODE_TTL_MS / 60000);
+        if (!sent.ok) log.error({ reason: sent.message }, '注册验证码发送失败');
+      }
+
+      return {
+        ok: true,
+        data: { message: '验证码已发送（若该邮箱可用），请查收' },
+      } satisfies ApiSuccess<{ message: string }>;
+    },
+  );
+
+  /**
+   * 当前账号有哪些动作需要邮箱验证码。
+   *
+   * 前端据此决定显不显示验证码输入框 —— 判定逻辑与路由里的拦截共用
+   * verificationRequirements，不会出现「界面没要、服务端却要」的错位。
+   */
+  app.get('/api/auth/verification-requirements', { preHandler: requireAuth }, async (req) => {
+    const me = currentUser(req);
+    const row = getDb()
+      .select({ emailVerifiedAt: users.emailVerifiedAt })
+      .from(users)
+      .where(eq(users.id, me.id))
+      .get();
+
+    return {
+      ok: true,
+      data: verificationRequirements({ emailVerifiedAt: row?.emailVerifiedAt ?? null }),
+    } satisfies ApiSuccess<VerificationRequirements>;
+  });
+
+  /**
+   * 已登录用户请求验证码（改邮箱 / 改密码 / 关闭两步验证）。
+   *
+   * 收件地址只信服务端自己查出来的那个，唯一例外是「改邮箱」——新地址还没写进
+   * 账号，只能由请求带上来，因此单独校验它没被别的账号占用。
+   */
+  app.post(
+    '/api/auth/verification-code',
+    { preHandler: requireAuth, config: { rateLimit: limited(5, '15 minutes') } },
+    async (req) => {
+      const me = currentUser(req);
+      const input = emailCodeRequestSchema.parse(req.body);
+
+      const row = getDb()
+        .select({ email: users.email, emailVerifiedAt: users.emailVerifiedAt })
+        .from(users)
+        .where(eq(users.id, me.id))
+        .get();
+      if (!row) throw notFound('用户不存在');
+
+      const needs = verificationRequirements({ emailVerifiedAt: row.emailVerifiedAt });
+      const required =
+        input.purpose === 'change_email'
+          ? needs.changeEmail
+          : input.purpose === 'change_password'
+            ? needs.changePassword
+            : needs.disableTwoFactor;
+      if (!required) throw badRequest('当前站点未对该操作要求邮箱验证码');
+
+      let target = row.email;
+      if (input.purpose === 'change_email') {
+        if (!input.email) throw badRequest('请填写新的邮箱地址');
+        // 提前告知冲突，免得用户收完信、填完码才被拒
+        const taken = findUserByLogin(input.email);
+        if (taken && taken.id !== me.id) throw conflict('该邮箱已被其他账号使用');
+        target = input.email;
+      }
+
+      const code = issueEmailCode(target, input.purpose, req.ip ?? null);
+      const sent = await sendEmailCode(target, code, input.purpose, EMAIL_CODE_TTL_MS / 60000);
+      if (!sent.ok) {
+        log.error({ reason: sent.message, purpose: input.purpose }, '验证码发送失败');
+        throw internal('验证码发送失败，请联系管理员检查邮件配置');
+      }
+
+      return {
+        ok: true,
+        data: { message: `验证码已发送至 ${maskEmail(target)}`, email: maskEmail(target) },
+      } satisfies ApiSuccess<{ message: string; email: string }>;
+    },
+  );
 
   /* ------------------------------- 登录 ------------------------------- */
 
@@ -354,6 +489,19 @@ export async function registerAuthRoutes(app: FastifyInstance): Promise<void> {
       }
 
       const newPlain = resolveNewPassword(input.newPassword, '新密码');
+
+      /*
+       * 邮箱验证码（站点开启、且该账号邮箱验证过时才要求）。
+       *
+       * 顺序：旧密码 → 新密码强度 → 才轮到验证码。前面两步都是纯校验，
+       * 不该因为「新密码太短」白烧掉一个验证码。
+       */
+      let commitEmailCode: (() => void) | null = null;
+      if (verificationRequirements({ emailVerifiedAt: row.emailVerifiedAt }).changePassword) {
+        if (!input.emailCode) throw badRequest('请填写邮箱收到的验证码');
+        commitEmailCode = verifyEmailCode(row.email, 'change_password', input.emailCode);
+      }
+
       const passwordHash = await hashPassword(newPlain);
       const updated = db
         .update(users)
@@ -368,6 +516,9 @@ export async function registerAuthRoutes(app: FastifyInstance): Promise<void> {
         .returning()
         .get();
       if (!updated) throw internal('密码更新失败');
+
+      // 密码真的换掉了才核销验证码
+      commitEmailCode?.();
 
       // 改密前的 refresh token 必须全部作废，否则账号被盗后攻击者的会话能活到过期
       revokeAllSessions(row.id);
@@ -400,38 +551,12 @@ export async function registerAuthRoutes(app: FastifyInstance): Promise<void> {
       // 邮件未配置是站点级问题，与邮箱是否注册无关，因此不构成用户枚举
       assertMailConfigured();
 
-      const db = getDb();
       const user = findUserByLogin(input.email);
       if (user && user.status === 'active') {
-        const code = generateNumericCode(6);
+        // 旧码由 issueEmailCode 负责作废，并只把哈希落库
+        const code = issueEmailCode(user.email, 'password_reset', req.ip ?? null);
 
-        // 旧码立即作废：多次请求会留下多个可用验证码，等于人为放大猜码空间
-        db.update(emailCodes)
-          .set({ consumedAt: new Date() })
-          .where(
-            and(
-              eq(emailCodes.email, user.email),
-              eq(emailCodes.purpose, 'password_reset'),
-              isNull(emailCodes.consumedAt),
-            ),
-          )
-          .run();
-
-        db.insert(emailCodes)
-          .values({
-            email: user.email,
-            // 只存哈希：邮件内容泄漏或库被读走都不能直接得到验证码
-            codeHash: sha256Hex(code),
-            purpose: 'password_reset',
-            expiresAt: new Date(Date.now() + RESET_CODE_TTL_MS),
-            consumedAt: null,
-            attempts: 0,
-            ip: req.ip ?? null,
-            createdAt: new Date(),
-          })
-          .run();
-
-        const sent = await sendPasswordResetCode(user.email, code, RESET_CODE_TTL_MS / 60000);
+        const sent = await sendPasswordResetCode(user.email, code, EMAIL_CODE_TTL_MS / 60000);
         if (!sent.ok) {
           log.error({ reason: sent.message }, '密码重置验证码发送失败');
         }
@@ -452,40 +577,20 @@ export async function registerAuthRoutes(app: FastifyInstance): Promise<void> {
       const input = resetPasswordSchema.parse(req.body);
       const db = getDb();
 
-      const record = db
-        .select()
-        .from(emailCodes)
-        .where(
-          and(
-            eq(emailCodes.email, input.email),
-            eq(emailCodes.purpose, 'password_reset'),
-            isNull(emailCodes.consumedAt),
-          ),
-        )
-        .orderBy(desc(emailCodes.createdAt))
-        .get();
-
-      if (!record) throw badRequest('验证码无效或已过期，请重新获取');
-      if (record.expiresAt.getTime() <= Date.now()) throw badRequest('验证码已过期，请重新获取');
-      if (record.attempts >= RESET_CODE_MAX_ATTEMPTS) throw badRequest('验证码尝试次数过多，请重新获取');
-
-      if (!safeEqualHex(sha256Hex(input.code), record.codeHash)) {
-        const attempts = record.attempts + 1;
-        db.update(emailCodes)
-          .set({
-            attempts,
-            // 达到上限直接作废，避免攻击者靠「每次只错一点」无限试探
-            ...(attempts >= RESET_CODE_MAX_ATTEMPTS ? { consumedAt: new Date() } : {}),
-          })
-          .where(eq(emailCodes.id, record.id))
-          .run();
-        throw badRequest('验证码不正确');
-      }
-
       const user = findUserByLogin(input.email);
       if (!user) throw badRequest('验证码无效或已过期，请重新获取');
 
+      /*
+       * 先验密码、最后才核销验证码。
+       *
+       * 反过来的话，用户填了个太短的密码就会白白烧掉一个验证码，
+       * 还得再去邮箱翻一次新的 —— 校验失败不该产生副作用。
+       */
       const newPlain = resolveNewPassword(input.newPassword, '新密码');
+
+      // 校验、尝试次数与作废都在 consumeEmailCode 里，与其他验证码场景同一套规则
+      consumeEmailCode(input.email, 'password_reset', input.code);
+
       const passwordHash = await hashPassword(newPlain);
       const updated = db
         .update(users)
@@ -499,8 +604,6 @@ export async function registerAuthRoutes(app: FastifyInstance): Promise<void> {
         .returning()
         .get();
       if (!updated) throw internal('密码重置失败');
-
-      db.update(emailCodes).set({ consumedAt: new Date() }).where(eq(emailCodes.id, record.id)).run();
 
       // 走「忘记密码」通常意味着账号可能已被他人控制，必须把所有设备踢下线
       revokeAllSessions(user.id);
@@ -612,6 +715,13 @@ export async function registerAuthRoutes(app: FastifyInstance): Promise<void> {
       const check = await checkTotp(secret, input.code, null);
       if (!check.valid) throw badRequest('验证码不正确');
 
+      // 邮箱验证码（站点开启、且该账号邮箱验证过时才要求）。密码与 TOTP 都过了才查它
+      let commitEmailCode: (() => void) | null = null;
+      if (verificationRequirements({ emailVerifiedAt: row.emailVerifiedAt }).disableTwoFactor) {
+        if (!input.emailCode) throw badRequest('请填写邮箱收到的验证码');
+        commitEmailCode = verifyEmailCode(row.email, 'disable_2fa', input.emailCode);
+      }
+
       const updated = db
         .update(users)
         .set({ totpEnabled: false, totpSecretEncrypted: null, totpLastTimeStep: null, updatedAt: new Date() })
@@ -619,6 +729,8 @@ export async function registerAuthRoutes(app: FastifyInstance): Promise<void> {
         .returning()
         .get();
       if (!updated) throw internal('关闭两步验证失败');
+
+      commitEmailCode?.();
 
       // 恢复码与密钥绑定，密钥清空后必须一并删除，否则会留下无用但有效的凭据
       clearRecoveryCodes(row.id);

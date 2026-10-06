@@ -65,8 +65,47 @@ export const registerSchema = z.object({
   inviteCode: z.string().trim().min(1).max(64).optional(),
   /** 显示名称，可选 */
   displayName: z.string().trim().max(64).optional(),
+  /** 邮箱验证码；站点开启「注册需邮箱验证」时必填 */
+  emailCode: z.string().regex(/^[0-9]{6}$/, '验证码为 6 位数字').optional(),
 });
 export type RegisterInput = z.infer<typeof registerSchema>;
+
+/* ---------------------------- 邮箱验证码 ---------------------------- */
+
+/**
+ * 可以要求邮箱验证码的动作。
+ *
+ * 用途必须在请求里显式写明，服务端据此选发信地址、也据此隔离验证码 ——
+ * 给「改密码」发的码不能拿去「改邮箱」。
+ */
+export const EMAIL_CODE_PURPOSES = [
+  'register',
+  'change_email',
+  'change_password',
+  'disable_2fa',
+] as const;
+export const emailCodePurposeSchema = z.enum(EMAIL_CODE_PURPOSES);
+export type EmailCodePurpose = z.infer<typeof emailCodePurposeSchema>;
+
+/** 请求发送验证码 */
+export const emailCodeRequestSchema = z.object({
+  purpose: emailCodePurposeSchema,
+  /**
+   * 目标邮箱。只有「改邮箱」需要传（新地址还没写进账号里），
+   * 其余用途一律发给账号当前邮箱 —— 只信服务端自己查出来的地址，
+   * 免得有人借这个接口给任意邮箱发信。
+   */
+  email: z.email('邮箱格式不正确').optional(),
+});
+export type EmailCodeRequestInput = z.infer<typeof emailCodeRequestSchema>;
+
+/** 当前账号有哪些动作需要邮箱验证码（前端据此决定要不要显示验证码输入框） */
+export interface VerificationRequirements {
+  registration: boolean;
+  changeEmail: boolean;
+  changePassword: boolean;
+  disableTwoFactor: boolean;
+}
 
 /**
  * 两步验证凭据：6 位 TOTP 验证码，或一次性恢复码。
@@ -122,6 +161,8 @@ export const resetPasswordSchema = z.object({
 export const changePasswordSchema = z.object({
   oldPassword: passwordPayloadSchema,
   newPassword: passwordPayloadSchema,
+  /** 站点要求时为「发给当前邮箱」的验证码 */
+  emailCode: z.string().regex(/^[0-9]{6}$/, '验证码为 6 位数字').optional(),
 });
 
 /** 当前登录用户信息 */
@@ -171,6 +212,8 @@ export const totpVerifySchema = z.object({
 export const totpDisableSchema = z.object({
   code: z.string().regex(/^[0-9]{6}$/, '验证码为 6 位数字'),
   password: passwordPayloadSchema,
+  /** 站点要求时为「发给当前邮箱」的验证码 */
+  emailCode: z.string().regex(/^[0-9]{6}$/, '验证码为 6 位数字').optional(),
 });
 
 /** 开启 2FA 时返回的绑定信息 */

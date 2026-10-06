@@ -134,6 +134,25 @@ export function SiteSettings(): ReactNode {
             label="允许邮件找回密码"
             description="需要先在下方配置可用的邮件服务"
           />
+          {/*
+            用下拉而不是开关：这里有三档语义（不用 / 只在注册时用 / 连账号安全
+            操作也用）。一个「邮箱验证」的开关说不清第二档与第三档的区别。
+          */}
+          <Field
+            label="邮箱验证码"
+            hint="开启后需要先在上方配置可用的邮件服务，否则用户收不到验证码"
+          >
+            <Select
+              value={form.emailVerification}
+              onChange={(event) =>
+                patch({ emailVerification: event.target.value as 'off' | 'register' | 'all' })
+              }
+            >
+              <option value="off">不需要</option>
+              <option value="register">注册时验证邮箱（改邮箱也需验证）</option>
+              <option value="all">注册 + 改密码 / 关两步验证都要验证</option>
+            </Select>
+          </Field>
           <Switch
             checked={form.allowUserStorage}
             onChange={(next) => patch({ allowUserStorage: next })}

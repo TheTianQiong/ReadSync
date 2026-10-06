@@ -62,6 +62,17 @@ export const siteSettingsSchema = z.object({
   /** 是否允许通过邮件找回密码 */
   passwordResetEnabled: z.boolean().default(true),
   /**
+   * 邮箱验证码的使用范围。
+   *
+   *  - `off`      ：都不用（默认，保持既有行为 —— 让既有部署升级后不受影响）
+   *  - `register` ：注册时必须填邮箱验证码
+   *  - `all`      ：注册 + 改邮箱 / 改密码 / 关闭两步验证都要验证码
+   *
+   * 默认关，是因为开着它而邮件服务没配好，会把新用户全挡在注册门外。
+   * 后台在邮件未配置时不允许开启（见 /api/admin/settings）。
+   */
+  emailVerification: z.enum(['off', 'register', 'all']).default('off'),
+  /**
    * 是否允许上传书籍文件。
    *
    * 关掉之后前端不再显示上传入口，所有上传端点一律拒绝；但**登记书目**
@@ -105,6 +116,8 @@ export interface PublicSettings {
   registrationEnabled: boolean;
   inviteRequired: boolean;
   passwordResetEnabled: boolean;
+  /** 注册是否需要邮箱验证码（注册页据此决定显不显示验证码输入框） */
+  emailVerification: 'off' | 'register' | 'all';
   defaultTheme: 'light' | 'dark' | 'system';
   footerText: string;
   version: string;

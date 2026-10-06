@@ -8,7 +8,7 @@ import { Card, CardBody } from '../components/ui/Card';
 import { Checkbox, Field, Input } from '../components/ui/Input';
 import { Segmented } from '../components/ui/Segmented';
 import { useAuth } from '../contexts/AuthContext';
-import { ApiError } from '../lib/api';
+import { ApiError, api } from '../lib/api';
 import { isEncryptionAvailable } from '../lib/crypto';
 import {
   checkPasswordStrength,
@@ -42,6 +42,9 @@ export function Login(): ReactNode {
   const [confirm, setConfirm] = useState('');
   const [displayName, setDisplayName] = useState('');
   const [inviteCode, setInviteCode] = useState('');
+  const [emailCode, setEmailCode] = useState('');
+  const [sendingCode, setSendingCode] = useState(false);
+  const [codeNotice, setCodeNotice] = useState<string | null>(null);
   const [totpCode, setTotpCode] = useState('');
   const [remember, setRemember] = useState(true);
   const [showPassword, setShowPassword] = useState(false);
@@ -56,6 +59,8 @@ export function Login(): ReactNode {
   const redirectTo = (location.state as { from?: string } | null)?.from ?? '/';
   const registrationEnabled = settings?.registrationEnabled ?? true;
   const inviteRequired = settings?.inviteRequired ?? false;
+  // 站点开启邮箱验证时，注册必须先收验证码才能建号
+  const emailCodeRequired = (settings?.emailVerification ?? 'off') !== 'off';
   const passwordResetEnabled = settings?.passwordResetEnabled ?? true;
   const encryptionReady = isEncryptionAvailable();
 
@@ -124,6 +129,29 @@ export function Login(): ReactNode {
     }
   };
 
+  /** 注册前请求邮箱验证码 */
+  const handleSendCode = async (): Promise<void> => {
+    if (!email.trim()) {
+      setError('请先填写邮箱');
+      return;
+    }
+    setSendingCode(true);
+    setError(null);
+    setCodeNotice(null);
+    try {
+      const result = await api.post<{ message: string }>(
+        '/auth/register/code',
+        { email: email.trim(), purpose: 'register' },
+        { auth: false, skipAuthRedirect: true },
+      );
+      setCodeNotice(result.message ?? '验证码已发送，请查收邮件');
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : '验证码发送失败，请稍后重试');
+    } finally {
+      setSendingCode(false);
+    }
+  };
+
   const handleRegister = async (event: FormEvent<HTMLFormElement>): Promise<void> => {
     event.preventDefault();
     setError(null);
@@ -146,6 +174,10 @@ export function Login(): ReactNode {
       setError('本站开启了邀请码注册，请填写邀请码');
       return;
     }
+    if (emailCodeRequired && !/^[0-9]{6}$/.test(emailCode.trim())) {
+      setError('请填写邮箱收到的 6 位验证码（点「发送验证码」获取）');
+      return;
+    }
 
     setSubmitting(true);
     try {
@@ -155,6 +187,7 @@ export function Login(): ReactNode {
         password,
         inviteCode: inviteCode.trim() || undefined,
         displayName: displayName.trim() || undefined,
+        emailCode: emailCode.trim() || undefined,
       });
       navigate('/', { replace: true });
     } catch (err) {
@@ -266,6 +299,34 @@ export function Login(): ReactNode {
                     </Link>
                   ) : null}
                 </div>
+
+                {emailCodeRequired ? (
+                  <Field label="邮箱验证码" required hint="本站要求先验证邮箱，验证码有效 10 分钟">
+                    <div className="flex items-center gap-2">
+                      <Input
+                        value={emailCode}
+                        onChange={(event) => setEmailCode(event.target.value.replace(/\D/g, ''))}
+                        inputMode="numeric"
+                        placeholder="6 位数字"
+                        maxLength={6}
+                        className="font-mono"
+                        required
+                      />
+                      <Button
+                        type="button"
+                        variant="secondary"
+                        size="md"
+                        loading={sendingCode}
+                        onClick={() => void handleSendCode()}
+                        className="shrink-0 whitespace-nowrap"
+                      >
+                        发送验证码
+                      </Button>
+                    </div>
+                  </Field>
+                ) : null}
+
+                {codeNotice ? <Alert tone="info">{codeNotice}</Alert> : null}
 
                 {error ? <Alert tone="danger">{error}</Alert> : null}
 

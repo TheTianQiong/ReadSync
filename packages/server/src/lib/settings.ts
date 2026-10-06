@@ -64,6 +64,8 @@ export function getPublicSettings(): PublicSettings {
     registrationEnabled: s.registrationEnabled,
     inviteRequired: s.inviteRequired,
     passwordResetEnabled: s.passwordResetEnabled,
+    // 注册页据此决定要不要显示「邮箱验证码」那一栏
+    emailVerification: s.emailVerification,
     defaultTheme: s.defaultTheme,
     footerText: s.footerText,
     version: VERSION,

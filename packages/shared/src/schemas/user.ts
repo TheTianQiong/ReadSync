@@ -8,6 +8,13 @@ export const updateProfileSchema = z.object({
   displayName: z.string().trim().max(64).optional(),
   email: z.email('邮箱格式不正确').optional(),
   avatarUrl: z.string().max(2048).optional(),
+  /**
+   * 改邮箱时的验证码 —— 发给**新邮箱**。
+   *
+   * 这里必须验：改邮箱是个能直接夺走账号的动作（改完就能用「忘记密码」
+   * 接管），而它原先只要求登录态。
+   */
+  emailCode: z.string().regex(/^[0-9]{6}$/, '验证码为 6 位数字').optional(),
 });
 
 export const updatePreferencesSchema = z.object({

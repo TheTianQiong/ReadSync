@@ -1,4 +1,4 @@
-import type { SessionUser, UserPreferences } from '@readsync/shared';
+import type { SessionUser, UserPreferences, VerificationRequirements } from '@readsync/shared';
 import { Save, Upload } from 'lucide-react';
 import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { Alert } from '../../components/ui/Alert';
@@ -39,11 +39,27 @@ export function Profile(): ReactNode {
   const avatarInputRef = useRef<HTMLInputElement>(null);
 
   const preferences = useAsync(() => api.get<UserPreferences>('/users/me/preferences'), []);
+  /*
+   * 哪些操作要验证码由服务端说了算（同一份判定逻辑也用在路由拦截上），
+   * 前端不自己猜 —— 猜错就会出现「界面没要、提交却被拒」的死胡同。
+   */
+  const requirements = useAsync(
+    () => api.get<VerificationRequirements>('/auth/verification-requirements'),
+    [],
+  );
+  const needsEmailCode = requirements.data?.changeEmail ?? false;
 
   const [displayName, setDisplayName] = useState('');
   const [email, setEmail] = useState('');
   const [savingProfile, setSavingProfile] = useState(false);
   const [profileError, setProfileError] = useState<string | null>(null);
+  /*
+   * 改邮箱要验证码 —— 发给**新**邮箱。这个动作能直接夺走账号（改完就能用
+   * 「忘记密码」接管），所以站点开启验证时必须先证明新邮箱是自己的。
+   */
+  const [emailCode, setEmailCode] = useState('');
+  const [codeSentTo, setCodeSentTo] = useState<string | null>(null);
+  const [sendingCode, setSendingCode] = useState(false);
 
   const [pageSize, setPageSize] = useState('20');
   const [timezone, setTimezone] = useState('Asia/Shanghai');
@@ -69,6 +85,30 @@ export function Profile(): ReactNode {
     setEmailNotifications(prefs.emailNotifications ?? true);
   }, [preferences.data]);
 
+  /** 只有真的动了邮箱才需要验证码 —— 改个显示名不该被要求去收信 */
+  const emailChanged = email.trim().length > 0 && email.trim() !== (user?.email ?? '');
+
+  const handleSendEmailCode = async (): Promise<void> => {
+    const target = email.trim();
+    if (!target) {
+      setProfileError('请先填写新邮箱');
+      return;
+    }
+    setSendingCode(true);
+    setProfileError(null);
+    try {
+      const result = await api.post<{ message: string }>('/auth/verification-code', {
+        purpose: 'change_email',
+        email: target,
+      });
+      setCodeSentTo(result.message ?? `验证码已发送至 ${target}`);
+    } catch (err) {
+      setProfileError(err instanceof Error ? err.message : '验证码发送失败');
+    } finally {
+      setSendingCode(false);
+    }
+  };
+
   const handleSaveProfile = async (): Promise<void> => {
     setSavingProfile(true);
     setProfileError(null);
@@ -76,6 +116,8 @@ export function Profile(): ReactNode {
       const updated = await api.patch<SessionUser>('/users/me', {
         displayName: displayName.trim(),
         email: email.trim(),
+        // 只有确实改了邮箱才带上验证码，免得改个显示名也要去收信
+        ...(emailChanged && emailCode.trim() ? { emailCode: emailCode.trim() } : {}),
       });
       // 后端可能只返回部分字段，兜底用本地值合并
       patchUser({ displayName: updated?.displayName ?? displayName.trim(), email: updated?.email ?? email.trim() });
@@ -181,6 +223,32 @@ export function Profile(): ReactNode {
               />
             </Field>
 
+            {needsEmailCode && emailChanged ? (
+              <Field label="邮箱验证码" required hint="发给上面这个新地址，验证码有效 10 分钟">
+                <div className="flex items-center gap-2">
+                  <Input
+                    value={emailCode}
+                    onChange={(event) => setEmailCode(event.target.value.replace(/\D/g, ''))}
+                    inputMode="numeric"
+                    placeholder="6 位数字"
+                    maxLength={6}
+                    className="font-mono"
+                  />
+                  <Button
+                    type="button"
+                    variant="secondary"
+                    size="md"
+                    loading={sendingCode}
+                    onClick={() => void handleSendEmailCode()}
+                    className="shrink-0 whitespace-nowrap"
+                  >
+                    发送验证码
+                  </Button>
+                </div>
+              </Field>
+            ) : null}
+
+            {codeSentTo ? <Alert tone="info">{codeSentTo}</Alert> : null}
             {profileError ? <Alert tone="danger">{profileError}</Alert> : null}
           </div>
         </CardBody>

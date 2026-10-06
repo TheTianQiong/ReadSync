@@ -46,6 +46,7 @@
 
 - 密码 **RSA-OAEP 加密传输**（明文不出浏览器）+ **Argon2id 单向哈希存储**
 - 两步验证：TOTP 验证器（含一次性恢复码）+ 通行密钥（WebAuthn / Passkey）
+- **邮箱验证码**：注册验证邮箱、改邮箱 / 改密码 / 关闭两步验证二次确认；三档可调，默认关闭（见[接口参考](docs/api-reference.md#邮箱验证码)）
 - Refresh token 轮换与重放检测，支持「登出所有设备」与登录设备管理
 - 第三方凭据（WebDAV 密码、S3 SecretKey）以 AES-256-GCM 加密落库，接口返回一律脱敏
 
@@ -609,7 +610,7 @@ READSYNC_DATA_DIR=./data-smoke npx tsx src/scripts/smoke-db.ts
 # 数据库迁移校验（含数据保留与外键完整性），会自建旧版库再升级
 READSYNC_DATA_DIR=./data-mig npx tsx src/scripts/check-migration.ts
 
-# 端到端集成测试（230 项断言：认证 / 2FA / 恢复码 / 上传 / 分片 / 预签名直传 / 只登记书目 / 进度关联 / 多标识 / 跨域 / 同步 / 统计 / KOSync / 权限隔离）
+# 端到端集成测试（258 项断言：认证 / 2FA / 恢复码 / 上传 / 分片 / 预签名直传 / 只登记书目 / 进度关联 / 多标识 / 跨域 / 同步 / 统计 / KOSync / 权限隔离）
 READSYNC_DATA_DIR=./data-e2e npx tsx src/scripts/smoke-e2e.ts
 
 # 真实 socket 的大文件整体上传（冒烟测试走进程内 inject，照不出传输层问题）

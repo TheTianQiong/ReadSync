@@ -9,13 +9,16 @@
  * 该脚本会清空并重建指定的数据目录，**不要指向生产数据目录**。
  */
 import { createHash, publicEncrypt, constants, randomUUID } from 'node:crypto';
+import { and, eq } from 'drizzle-orm';
 import { OTP } from 'otplib';
 import { mkdirSync, rmSync } from 'node:fs';
 import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../app.js';
 import { loadConfig } from '../config.js';
 import { ensureKeyPair } from '../crypto/keys.js';
-import { closeDatabase, openDatabase } from '../db/index.js';
+import { closeDatabase, getDb, openDatabase } from '../db/index.js';
+import { emailCodes, users } from '../db/schema.js';
+import { sha256Hex } from '../crypto/password.js';
 import { computeKoreaderDocumentId } from '@readsync/shared';
 import { koreaderDocumentIdFromStorage } from '../lib/document-id.js';
 import { getAdapterForStorage } from '../modules/storage/service.js';
@@ -267,6 +270,301 @@ async function main(): Promise<void> {
     const browseEmpty = await api({ method: 'GET', url: `/api/storages/${storageId}/browse`, headers: auth });
     check('浏览空存储返回 entries 数组', Array.isArray(browseEmpty.json().data?.entries), browseEmpty.body);
     check('浏览结果回显 prefix', browseEmpty.json().data?.prefix === '', browseEmpty.json().data);
+
+    /* ------------------- 4b. 邮箱验证码（注册与账号安全） ------------------- */
+    section('4b. 邮箱验证码');
+    {
+      /*
+       * 邮件没配好就不许开验证 —— 开了的结果是新用户卡在「请填验证码」，
+       * 而他永远收不到那封信。先验证这道闸门。
+       */
+      const tooEarly = await api({
+        method: 'PATCH',
+        url: '/api/admin/settings',
+        headers: auth,
+        payload: { emailVerification: 'register' },
+      });
+      check('邮件未配置时拒绝开启邮箱验证（400）', tooEarly.statusCode === 400, tooEarly.body);
+
+      // console 提供方：不外发，只把内容打到日志，正好用来跑通流程
+      const mail = await api({
+        method: 'PUT',
+        url: '/api/admin/mail',
+        headers: auth,
+        payload: { enabled: true, provider: 'console', from: 'noreply@example.com' },
+      });
+      check('配置邮件服务（console）成功', mail.statusCode === 200, mail.body);
+
+      const enabled = await api({
+        method: 'PATCH',
+        url: '/api/admin/settings',
+        headers: auth,
+        payload: { emailVerification: 'all' },
+      });
+      check(
+        '配好邮件后可开启「注册 + 安全操作」都要验证码',
+        enabled.statusCode === 200 && enabled.json().data?.emailVerification === 'all',
+        enabled.body,
+      );
+
+      const publicSettings = await api({ method: 'GET', url: '/api/system/settings' });
+      check(
+        '公开设置下发 emailVerification（注册页据此显示验证码栏）',
+        publicSettings.json().data?.emailVerification === 'all',
+        publicSettings.json().data?.emailVerification,
+      );
+
+      const newEmail = `codeuser-${randomUUID().slice(0, 8)}@example.com`;
+      const send = await api({ method: 'POST', url: '/api/auth/register/code', payload: { email: newEmail } });
+      check('注册发码接口返回成功', send.statusCode === 200, send.body);
+
+      /*
+       * 码只以哈希入库，测试拿不到明文 —— 于是自己把那一行的哈希换成已知值的
+       * 明文对应的哈希，模拟「用户收到了这封信」。这样测的是真实的校验路径，
+       * 不需要在产品代码里留任何测试后门。
+       */
+      const db = getDb();
+      const codeRow = db
+        .select()
+        .from(emailCodes)
+        .where(and(eq(emailCodes.email, newEmail), eq(emailCodes.purpose, 'register')))
+        .get();
+      check('验证码已落库', codeRow !== undefined, codeRow === undefined ? 'no row' : 'ok');
+      check(
+        '库里存的是哈希而不是 6 位明文',
+        typeof codeRow?.codeHash === 'string' && /^[a-f0-9]{64}$/.test(codeRow.codeHash),
+        codeRow?.codeHash,
+      );
+
+      const knownCode = '246813';
+      db.update(emailCodes)
+        .set({ codeHash: sha256Hex(knownCode), attempts: 0 })
+        .where(eq(emailCodes.id, codeRow!.id))
+        .run();
+
+      const buildRegister = (emailCode?: string) =>
+        api({
+          method: 'POST',
+          url: '/api/auth/register',
+          payload: {
+            username: `codeuser${randomUUID().slice(0, 8)}`,
+            email: newEmail,
+            password: { ciphertext: encryptPassword('CodeUserPass123', publicKey), encrypted: true },
+            ...(emailCode ? { emailCode } : {}),
+          },
+        });
+
+      const noCode = await buildRegister();
+      check('缺验证码时注册被拒（400）', noCode.statusCode === 400, noCode.body);
+
+      const wrongCode = await buildRegister('111111');
+      check('验证码错误时注册被拒（400）', wrongCode.statusCode === 400, wrongCode.body);
+
+      const goodCode = await buildRegister(knownCode);
+      check('验证码正确时注册成功', goodCode.statusCode === 200, goodCode.body);
+
+      const reused = await buildRegister(knownCode);
+      check('同一个验证码不能用第二次（400）', reused.statusCode === 400, reused.body);
+
+      // 注册时验证过的邮箱要记下来 —— 后续「改密码要验证码」正依赖这个标记
+      const codeUserId = goodCode.json().data?.user?.id as number;
+      const codeUserRow = db.select().from(users).where(eq(users.id, codeUserId)).get();
+      check('注册后邮箱标记为已验证', codeUserRow?.emailVerifiedAt instanceof Date, codeUserRow?.emailVerifiedAt);
+
+      const codeLogin = await api({
+        method: 'POST',
+        url: '/api/auth/login',
+        payload: {
+          username: codeUserRow!.username,
+          password: { ciphertext: encryptPassword('CodeUserPass123', publicKey), encrypted: true },
+        },
+      });
+      const codeAuth = { authorization: `Bearer ${codeLogin.json().data?.accessToken}` };
+
+      const needs = await api({ method: 'GET', url: '/api/auth/verification-requirements', headers: codeAuth });
+      check(
+        '接口告知哪些操作需要验证码',
+        needs.json().data?.registration === true &&
+          needs.json().data?.changeEmail === true &&
+          needs.json().data?.changePassword === true &&
+          needs.json().data?.disableTwoFactor === true,
+        needs.json().data,
+      );
+
+      /*
+       * 管理员是 bootstrap 建的，邮箱从没验证过 → 不该被要求验证码。
+       * 否则老账号会被锁在「改不了密码」的状态里，而这功能的初衷是保护账号。
+       */
+      const adminNeeds = await api({ method: 'GET', url: '/api/auth/verification-requirements', headers: auth });
+      check(
+        '未验证过邮箱的老账号不被要求验证码（避免锁死）',
+        adminNeeds.json().data?.changePassword === false &&
+          adminNeeds.json().data?.disableTwoFactor === false,
+        adminNeeds.json().data,
+      );
+
+      /* ---- 改密码 ---- */
+      const sendPwd = await api({
+        method: 'POST',
+        url: '/api/auth/verification-code',
+        headers: codeAuth,
+        payload: { purpose: 'change_password' },
+      });
+      check('改密码前可发码', sendPwd.statusCode === 200, sendPwd.body);
+      check('回显的邮箱已打码', String(sendPwd.json().data?.email).includes('***'), sendPwd.json().data?.email);
+
+      const pwdRow = db
+        .select()
+        .from(emailCodes)
+        .where(and(eq(emailCodes.email, newEmail), eq(emailCodes.purpose, 'change_password')))
+        .get();
+      const pwdCode = '135790';
+      db.update(emailCodes).set({ codeHash: sha256Hex(pwdCode), attempts: 0 }).where(eq(emailCodes.id, pwdRow!.id)).run();
+
+      const changeNo = await api({
+        method: 'POST',
+        url: '/api/auth/change-password',
+        headers: codeAuth,
+        payload: {
+          oldPassword: { ciphertext: encryptPassword('CodeUserPass123', publicKey), encrypted: true },
+          newPassword: { ciphertext: encryptPassword('CodeUserPass456', publicKey), encrypted: true },
+        },
+      });
+      check('改密码缺验证码时被拒（400）', changeNo.statusCode === 400, changeNo.body);
+
+      // 密码强度不过关时不该白烧一个验证码：先验证这一点，再用正确的值走完
+      const weakFirst = await api({
+        method: 'POST',
+        url: '/api/auth/change-password',
+        headers: codeAuth,
+        payload: {
+          oldPassword: { ciphertext: encryptPassword('CodeUserPass123', publicKey), encrypted: true },
+          newPassword: { ciphertext: encryptPassword('123456', publicKey), encrypted: true },
+          emailCode: pwdCode,
+        },
+      });
+      check('新密码不合格时被拒（400）', weakFirst.statusCode === 400, weakFirst.body);
+
+      const changeOk = await api({
+        method: 'POST',
+        url: '/api/auth/change-password',
+        headers: codeAuth,
+        payload: {
+          oldPassword: { ciphertext: encryptPassword('CodeUserPass123', publicKey), encrypted: true },
+          newPassword: { ciphertext: encryptPassword('CodeUserPass456', publicKey), encrypted: true },
+          emailCode: pwdCode,
+        },
+      });
+      check(
+        '带正确验证码可改密码（且上一个失败没有烧掉这个码）',
+        changeOk.statusCode === 200,
+        changeOk.body,
+      );
+
+      /*
+       * 改密码会吊销该账号的全部会话（含手上这个 access token）—— 这正是
+       * 它该做的。所以后面的操作必须用新密码重新登录，否则测的就不是功能，
+       * 而是「旧令牌还能不能用」。
+       */
+      const reLogin = await api({
+        method: 'POST',
+        url: '/api/auth/login',
+        payload: {
+          username: codeUserRow!.username,
+          password: { ciphertext: encryptPassword('CodeUserPass456', publicKey), encrypted: true },
+        },
+      });
+      check('改密码后可用新密码登录', reLogin.statusCode === 200, reLogin.body);
+      const codeAuth2 = { authorization: `Bearer ${reLogin.json().data?.accessToken}` };
+
+      /* ---- 改邮箱 ---- */
+      const targetEmail = `moved-${randomUUID().slice(0, 8)}@example.com`;
+      const sendMail2 = await api({
+        method: 'POST',
+        url: '/api/auth/verification-code',
+        headers: codeAuth2,
+        payload: { purpose: 'change_email', email: targetEmail },
+      });
+      check('改邮箱时向新地址发码', sendMail2.statusCode === 200, sendMail2.body);
+
+      const mailRow = db
+        .select()
+        .from(emailCodes)
+        .where(and(eq(emailCodes.email, targetEmail), eq(emailCodes.purpose, 'change_email')))
+        .get();
+      const mailCode = '112233';
+      db.update(emailCodes).set({ codeHash: sha256Hex(mailCode), attempts: 0 }).where(eq(emailCodes.id, mailRow!.id)).run();
+
+      const moveNo = await api({
+        method: 'PATCH',
+        url: '/api/users/me',
+        headers: codeAuth2,
+        payload: { email: targetEmail },
+      });
+      check('改邮箱缺验证码时被拒（400）', moveNo.statusCode === 400, moveNo.body);
+
+      const moveOk = await api({
+        method: 'PATCH',
+        url: '/api/users/me',
+        headers: codeAuth2,
+        payload: { email: targetEmail, emailCode: mailCode },
+      });
+      check('带正确验证码可改邮箱', moveOk.statusCode === 200, moveOk.body);
+      check('改完邮箱是新地址', moveOk.json().data?.email === targetEmail, moveOk.json().data?.email);
+
+      /* ---- 用途隔离：给 A 动作发的码不能用去干 B 动作 ---- */
+      const sendForPwd = await api({
+        method: 'POST',
+        url: '/api/auth/verification-code',
+        headers: codeAuth2,
+        payload: { purpose: 'change_password' },
+      });
+      check('可为改密码再次发码', sendForPwd.statusCode === 200, sendForPwd.body);
+
+      const pwdRow2 = db
+        .select()
+        .from(emailCodes)
+        .where(and(eq(emailCodes.email, targetEmail), eq(emailCodes.purpose, 'change_password')))
+        .get();
+      const crossCode = '909090';
+      db.update(emailCodes).set({ codeHash: sha256Hex(crossCode), attempts: 0 }).where(eq(emailCodes.id, pwdRow2!.id)).run();
+
+      const crossUse = await api({
+        method: 'PATCH',
+        url: '/api/users/me',
+        headers: codeAuth2,
+        payload: { email: `cross-${randomUUID().slice(0, 8)}@example.com`, emailCode: crossCode },
+      });
+      check(
+        '给「改密码」发的验证码不能用来改邮箱（用途隔离）',
+        crossUse.statusCode === 400,
+        crossUse.body,
+      );
+
+      /* ---- 收尾：把站点设置改回去，后面几节还有「注册不需要验证码」的断言 ---- */
+      const restored = await api({
+        method: 'PATCH',
+        url: '/api/admin/settings',
+        headers: auth,
+        payload: { emailVerification: 'off' },
+      });
+      check(
+        '可关闭邮箱验证',
+        restored.statusCode === 200 && restored.json().data?.emailVerification === 'off',
+        restored.body,
+      );
+
+      const freeRegister = await api({
+        method: 'POST',
+        url: '/api/auth/register',
+        payload: {
+          username: `freeuser${randomUUID().slice(0, 8)}`,
+          email: `free-${randomUUID().slice(0, 8)}@example.com`,
+          password: { ciphertext: encryptPassword('FreeUserPass123', publicKey), encrypted: true },
+        },
+      });
+      check('关闭后注册无需验证码', freeRegister.statusCode === 200, freeRegister.body);
+    }
 
     /* ---------------------------- 5. 上传书籍 ---------------------------- */
     section('5. 书库与上传');

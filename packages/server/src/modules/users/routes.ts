@@ -41,6 +41,8 @@ import {
 import { auditContextFrom, recordAudit } from '../../lib/audit.js';
 import { toSessionUser } from '../../lib/users.js';
 import { currentUser, requireAuth } from '../../middleware/auth.js';
+import { verifyEmailCode } from '../auth/email-code.js';
+import { verificationRequirements } from '../auth/email-verification.js';
 
 /**
  * 用户个人设置（README 前端要求 8：设置页的「基础设置 / 阅读平台 / 账号安全」）。
@@ -222,7 +224,8 @@ export async function registerUserRoutes(app: FastifyInstance): Promise<void> {
     const row = loadUser(me.id);
 
     // 邮箱同时是找回密码的凭据，必须保持全局唯一
-    if (input.email !== undefined && input.email !== row.email) {
+    const changingEmail = input.email !== undefined && input.email !== row.email;
+    if (changingEmail && input.email) {
       const taken = db
         .select({ id: users.id })
         .from(users)
@@ -231,11 +234,25 @@ export async function registerUserRoutes(app: FastifyInstance): Promise<void> {
       if (taken) throw conflict('该邮箱已被其他账号绑定');
     }
 
+    /*
+     * 改邮箱要邮箱验证码 —— 发给**新地址**。
+     *
+     * 这个动作能直接夺走账号：改完就能用「忘记密码」把密码重置掉。原先它
+     * 只要求登录态，等于拿到一个还活着的会话就能永久接管账号。
+     */
+    let commitEmailCode: (() => void) | null = null;
+    if (changingEmail && input.email && verificationRequirements(row).changeEmail) {
+      if (!input.emailCode) throw badRequest('请填写新邮箱收到的验证码');
+      commitEmailCode = verifyEmailCode(input.email, 'change_email', input.emailCode);
+    }
+
     const updated = db
       .update(users)
       .set({
         ...(input.displayName !== undefined ? { displayName: input.displayName } : {}),
         ...(input.email !== undefined ? { email: input.email } : {}),
+        // 新地址是收到验证码才算改成的，直接记为已验证
+        ...(changingEmail ? { emailVerifiedAt: commitEmailCode ? new Date() : null } : {}),
         // 空串表示清除头像，落库统一存 null
         ...(input.avatarUrl !== undefined ? { avatarUrl: input.avatarUrl.length > 0 ? input.avatarUrl : null } : {}),
         updatedAt: new Date(),
@@ -246,8 +263,10 @@ export async function registerUserRoutes(app: FastifyInstance): Promise<void> {
 
     if (!updated) throw notFound('用户不存在');
 
+    commitEmailCode?.();
+
     // 邮箱变更属于账号安全事件，单独留痕（改密码、2FA 等由 auth 模块负责）
-    if (input.email !== undefined && input.email !== row.email) {
+    if (changingEmail) {
       recordAudit('user.update', auditContextFrom(req), {
         target: updated.username,
         meta: { field: 'email' },

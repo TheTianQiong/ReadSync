@@ -39,6 +39,8 @@ export interface RegisterPayload {
   password: string;
   inviteCode?: string;
   displayName?: string;
+  /** 站点开启邮箱验证时，邮箱收到的 6 位验证码 */
+  emailCode?: string;
 }
 
 interface AuthContextValue {
@@ -161,6 +163,7 @@ export function AuthProvider({ children }: { children: ReactNode }): ReactNode {
         password,
         ...(payload.inviteCode ? { inviteCode: payload.inviteCode } : {}),
         ...(payload.displayName ? { displayName: payload.displayName } : {}),
+        ...(payload.emailCode ? { emailCode: payload.emailCode } : {}),
       },
       { auth: false, skipAuthRedirect: true },
     );

@@ -4,6 +4,7 @@ import {
   type SyncPasswordResetResult,
   type SyncPasswordStatus,
   type TotpSetupResult,
+  type VerificationRequirements,
 } from '@readsync/shared';
 import { Copy, Fingerprint, KeyRound, Plus, ShieldCheck, ShieldOff, Smartphone, Trash2 } from 'lucide-react';
 import { useCallback, useState, type ReactNode } from 'react';
@@ -53,6 +54,39 @@ export function Security(): ReactNode {
   const [confirmPassword, setConfirmPassword] = useState('');
   const [changingPassword, setChangingPassword] = useState(false);
   const [passwordError, setPasswordError] = useState<string | null>(null);
+  /*
+   * 改密码 / 关两步验证都可能要求邮箱验证码（站点开启、且本账号邮箱验证过时）。
+   * 要不要由服务端判定，前端只负责按结果渲染。
+   */
+  const [pwdEmailCode, setPwdEmailCode] = useState('');
+  const [sendingPwdCode, setSendingPwdCode] = useState(false);
+  const [disableEmailCode, setDisableEmailCode] = useState('');
+  const [sendingDisableCode, setSendingDisableCode] = useState(false);
+
+  const requirements = useAsync(
+    () => api.get<VerificationRequirements>('/auth/verification-requirements'),
+    [],
+  );
+  const needsPasswordCode = requirements.data?.changePassword ?? false;
+  const needsDisableCode = requirements.data?.disableTwoFactor ?? false;
+
+  /** 请求验证码；用途决定发给哪个地址（改密码与关 2FA 都发当前邮箱） */
+  const requestCode = async (
+    purpose: 'change_password' | 'disable_2fa',
+    setBusy: (value: boolean) => void,
+    setError: (value: string | null) => void,
+  ): Promise<void> => {
+    setBusy(true);
+    setError(null);
+    try {
+      const result = await api.post<{ message: string }>('/auth/verification-code', { purpose });
+      toast.success(result.message ?? '验证码已发送');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '验证码发送失败');
+    } finally {
+      setBusy(false);
+    }
+  };
 
   /* -------------------------------- 2FA -------------------------------- */
   const [setupResult, setSetupResult] = useState<TotpSetupResult | null>(null);
@@ -140,16 +174,26 @@ export function Security(): ReactNode {
       return;
     }
 
+    if (needsPasswordCode && !/^[0-9]{6}$/.test(pwdEmailCode.trim())) {
+      setPasswordError('请填写邮箱收到的验证码');
+      return;
+    }
+
     setChangingPassword(true);
     try {
       // 旧密码与新密码都以 RSA 密文提交
       const oldPayload = await buildPasswordPayload(oldPassword);
       const newPayload = await buildPasswordPayload(newPassword);
-      await api.post('/auth/change-password', { oldPassword: oldPayload, newPassword: newPayload });
+      await api.post('/auth/change-password', {
+        oldPassword: oldPayload,
+        newPassword: newPayload,
+        ...(needsPasswordCode ? { emailCode: pwdEmailCode.trim() } : {}),
+      });
       toast.success('密码已修改，其它设备已退出登录');
       setOldPassword('');
       setNewPassword('');
       setConfirmPassword('');
+      setPwdEmailCode('');
     } catch (err) {
       setPasswordError(err instanceof Error ? err.message : '修改失败');
     } finally {
@@ -202,14 +246,24 @@ export function Security(): ReactNode {
       return;
     }
 
+    if (needsDisableCode && !/^[0-9]{6}$/.test(disableEmailCode.trim())) {
+      setTotpError('请填写邮箱收到的验证码');
+      return;
+    }
+
     setTotpBusy(true);
     try {
       const payload = await buildPasswordPayload(disablePassword);
-      await api.post('/auth/2fa/disable', { code: disableCode, password: payload });
+      await api.post('/auth/2fa/disable', {
+        code: disableCode,
+        password: payload,
+        ...(needsDisableCode ? { emailCode: disableEmailCode.trim() } : {}),
+      });
       toast.success('两步验证已关闭');
       setDisableOpen(false);
       setDisableCode('');
       setDisablePassword('');
+      setDisableEmailCode('');
       await refreshUser();
     } catch (err) {
       setTotpError(err instanceof Error ? err.message : '关闭失败');
@@ -322,6 +376,33 @@ export function Security(): ReactNode {
                 autoComplete="new-password"
               />
             </Field>
+
+          {needsPasswordCode ? (
+            <Field label="邮箱验证码" required hint="发到账号当前邮箱，验证码有效 10 分钟">
+              <div className="flex items-center gap-2">
+                <Input
+                  value={pwdEmailCode}
+                  onChange={(event) => setPwdEmailCode(event.target.value.replace(/\D/g, ''))}
+                  inputMode="numeric"
+                  placeholder="6 位数字"
+                  maxLength={6}
+                  className="font-mono"
+                />
+                <Button
+                  type="button"
+                  variant="secondary"
+                  size="md"
+                  loading={sendingPwdCode}
+                  onClick={() =>
+                    void requestCode('change_password', setSendingPwdCode, setPasswordError)
+                  }
+                  className="shrink-0 whitespace-nowrap"
+                >
+                  发送验证码
+                </Button>
+              </div>
+            </Field>
+          ) : null}
           </div>
 
           {passwordError ? <Alert tone="danger">{passwordError}</Alert> : null}
@@ -744,6 +825,34 @@ export function Security(): ReactNode {
               autoComplete="current-password"
             />
           </Field>
+
+          {needsDisableCode ? (
+            <Field label="邮箱验证码" required hint="关闭两步验证会让账号只剩密码一道防线，因此还要邮箱确认">
+              <div className="flex items-center gap-2">
+                <Input
+                  value={disableEmailCode}
+                  onChange={(event) => setDisableEmailCode(event.target.value.replace(/\D/g, ''))}
+                  inputMode="numeric"
+                  placeholder="6 位数字"
+                  maxLength={6}
+                  className="font-mono"
+                />
+                <Button
+                  type="button"
+                  variant="secondary"
+                  size="md"
+                  loading={sendingDisableCode}
+                  onClick={() =>
+                    void requestCode('disable_2fa', setSendingDisableCode, setTotpError)
+                  }
+                  className="shrink-0 whitespace-nowrap"
+                >
+                  发送验证码
+                </Button>
+              </div>
+            </Field>
+          ) : null}
+
           {totpError ? <Alert tone="danger">{totpError}</Alert> : null}
         </div>
       </Modal>
