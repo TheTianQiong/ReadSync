@@ -826,6 +826,52 @@ async function main(): Promise<void> {
         detail.json().data?.progressPercent,
       );
 
+      /*
+       * 阅读状态要跟着进度走。
+       *
+       * 之前 reading_status 只由用户手工 PATCH，同步进度完全不动它 ——
+       * 于是「读了半天，书库里仍显示未读」。
+       */
+      check(
+        '同步后自动从「未读」变为「在读」',
+        detail.json().data?.readingStatus === 'reading',
+        detail.json().data?.readingStatus,
+      );
+
+      // 手工设的状态不能被中间进度覆盖：状态也是人的决定
+      await api({
+        method: 'PATCH',
+        url: `/api/books/${bookId}`,
+        headers: auth,
+        payload: { readingStatus: 'paused' },
+      });
+      await api({
+        method: 'PUT',
+        url: '/api/sync/progress',
+        headers: auth,
+        payload: { document: docId, progress: '/body/9', percentage: 0.5, device: 'Kindle', device_id: 'd1' },
+      });
+      const afterPause = await api({ method: 'GET', url: `/api/books/${bookId}`, headers: auth });
+      check(
+        '手工设的「搁置」不被中间进度覆盖',
+        afterPause.json().data?.readingStatus === 'paused',
+        afterPause.json().data?.readingStatus,
+      );
+
+      // 但读完是硬事实：100% 一定判为已读完
+      await api({
+        method: 'PUT',
+        url: '/api/sync/progress',
+        headers: auth,
+        payload: { document: docId, progress: '/body/10', percentage: 1, device: 'Kindle', device_id: 'd1' },
+      });
+      const afterDone = await api({ method: 'GET', url: `/api/books/${bookId}`, headers: auth });
+      check(
+        '读到 100% 自动变为「已读完」',
+        afterDone.json().data?.readingStatus === 'finished',
+        afterDone.json().data?.readingStatus,
+      );
+
       // 反证：用整文件 MD5 上报也能匹配（第三方客户端可能这么发），
       // 但用文档标识才是 KOReader 的真实行为
       const other = Buffer.from(`another book ${randomUUID()}`.repeat(100), 'utf8');
@@ -902,6 +948,139 @@ async function main(): Promise<void> {
       check('从存储算出的文档标识与独立计算一致', fromStorage === expected, { fromStorage, expected });
 
       await adapter.delete(key).catch(() => undefined);
+    }
+
+    /* ---------- 5b55. 封面上传与读取 ---------- */
+    section('5b55. 封面（上传存库 + 签名地址读取）');
+    {
+      /*
+       * 封面必须能被 <img src> 直接加载 —— 那意味着不能要求 Authorization 头。
+       * 但它也不能像头像那样彻底公开（那等于把书库目录暴露给任何枚举 id 的人），
+       * 所以地址里带 HMAC 签名。这里把两条都测到。
+       */
+      const png = Buffer.concat([
+        Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+        Buffer.from(`cover-${randomUUID()}`.repeat(20), 'utf8'),
+      ]);
+
+      const book = await api({
+        method: 'POST',
+        url: '/api/books',
+        headers: auth,
+        payload: {
+          title: '有封面的书',
+          format: 'epub',
+          md5: createHash('md5').update(png).digest('hex'),
+          documentId: createHash('md5').update(png).digest('hex'),
+          size: 0,
+        },
+      });
+      const coverBookId = book.json().data?.id as number;
+      check('登记一本待传封面的书', book.statusCode === 200, book.body);
+      check('新书没有封面', book.json().data?.hasCover === false && book.json().data?.coverSrc === null, {
+        hasCover: book.json().data?.hasCover,
+        coverSrc: book.json().data?.coverSrc,
+      });
+
+      // 非图片被拒
+      const badMime = buildMultipart(
+        {},
+        { field: 'file', filename: 'a.txt', content: Buffer.from('not an image'), contentType: 'text/plain' },
+      );
+      const rejected = await api({
+        method: 'POST',
+        url: `/api/books/${coverBookId}/cover`,
+        headers: { ...auth, 'content-type': badMime.contentType },
+        payload: badMime.body,
+      });
+      check('非图片格式被拒（415）', rejected.statusCode === 415, rejected.body);
+
+      // 超过上限被拒（1.5MB）
+      const huge = buildMultipart(
+        {},
+        {
+          field: 'file',
+          filename: 'huge.png',
+          content: Buffer.concat([png, Buffer.alloc(1.6 * 1024 * 1024)]),
+          contentType: 'image/png',
+        },
+      );
+      const tooBig = await api({
+        method: 'POST',
+        url: `/api/books/${coverBookId}/cover`,
+        headers: { ...auth, 'content-type': huge.contentType },
+        payload: huge.body,
+      });
+      check('超过 1.5MB 的封面被拒（413）', tooBig.statusCode === 413, tooBig.body);
+
+      // 正常上传
+      const form = buildMultipart(
+        {},
+        { field: 'file', filename: 'cover.png', content: png, contentType: 'image/png' },
+      );
+      const uploaded = await api({
+        method: 'POST',
+        url: `/api/books/${coverBookId}/cover`,
+        headers: { ...auth, 'content-type': form.contentType },
+        payload: form.body,
+      });
+      check('上传封面成功', uploaded.statusCode === 200, uploaded.body);
+      check('上传后返回 hasCover 与可用的封面地址', uploaded.json().data?.hasCover === true && typeof uploaded.json().data?.coverSrc === 'string', uploaded.json().data);
+
+      const src = uploaded.json().data?.coverSrc as string;
+
+      // 关键：不带任何令牌也要能取到（<img> 带不了 Authorization）
+      const fetched = await api({ method: 'GET', url: src });
+      check('封面地址无需登录即可读取', fetched.statusCode === 200, fetched.statusCode);
+      check('返回的正是上传的字节', fetched.rawPayload.equals(png), fetched.rawPayload.length);
+      check(
+        'Content-Type 为图片类型',
+        String(fetched.headers['content-type']).startsWith('image/png'),
+        fetched.headers['content-type'],
+      );
+
+      // 签名不对 / 版本不对都不给
+      const forged = await api({ method: 'GET', url: `${src.slice(0, src.lastIndexOf('t='))}t=0000000000000000` });
+      check('伪造签名的封面地址取不到（404）', forged.statusCode === 404, forged.statusCode);
+      const staleVersion = await api({ method: 'GET', url: src.replace(/v=\d+/, 'v=1') });
+      check('版本号对不上的封面地址取不到（404）', staleVersion.statusCode === 404, staleVersion.statusCode);
+
+      // 详情里应当出现这个地址
+      const detail = await api({ method: 'GET', url: `/api/books/${coverBookId}`, headers: auth });
+      check('详情带上传的封面地址', detail.json().data?.coverSrc === src, detail.json().data?.coverSrc);
+      check('hasCover 为真', detail.json().data?.hasCover === true, detail.json().data?.hasCover);
+
+      // 别的用户拿不到这本书的封面管理权（越权一律 404）
+      const strangerPw = 'CoverStranger123';
+      const strangerPwEnc = { ciphertext: encryptPassword(strangerPw, publicKey), encrypted: true };
+      await api({
+        method: 'POST',
+        url: '/api/admin/users',
+        headers: auth,
+        payload: { username: 'coverstranger', email: 'coverstranger@example.com', password: strangerPwEnc },
+      });
+      const strangerLogin = await api({
+        method: 'POST',
+        url: '/api/auth/login',
+        payload: { username: 'coverstranger', password: strangerPwEnc },
+      });
+      const strangerAuth = { authorization: `Bearer ${strangerLogin.json().data?.accessToken}` };
+
+      const stranger = await api({
+        method: 'POST',
+        url: `/api/books/${coverBookId}/cover`,
+        headers: { ...strangerAuth, 'content-type': form.contentType },
+        payload: form.body,
+      });
+      check('他人无法给他人的书传封面（404）', stranger.statusCode === 404, stranger.statusCode);
+
+      // 删除后旧地址立即失效
+      const removed = await api({ method: 'DELETE', url: `/api/books/${coverBookId}/cover`, headers: auth });
+      check('可删除封面', removed.statusCode === 200 && removed.json().data?.hasCover === false, removed.body);
+      const afterDelete = await api({ method: 'GET', url: src });
+      check('删除后旧地址取不到（404）', afterDelete.statusCode === 404, afterDelete.statusCode);
+
+      await api({ method: 'DELETE', url: `/api/books/${coverBookId}`, headers: auth });
     }
 
     /* ---------- 5b6. 一本书多个文档标识（多平台同一本书） ---------- */

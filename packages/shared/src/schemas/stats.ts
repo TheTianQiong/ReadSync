@@ -81,6 +81,8 @@ export interface ReadingStatusSummary {
     title: string;
     author: string | null;
     coverUrl: string | null;
+    /** 可直接放进 `<img src>` 的封面地址（优先上传的封面，其次是外链） */
+    coverSrc: string | null;
     progressPercent: number;
     lastReadAt: string | null;
     /** 该书累计阅读秒数 */

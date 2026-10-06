@@ -12,7 +12,7 @@ import { BookRegisterDialog } from '../components/BookRegisterDialog';
 import { BookUploadDialog } from '../components/BookUploadDialog';
 import { useAuth } from '../contexts/AuthContext';
 import { Alert } from '../components/ui/Alert';
-import { Badge, StatusBadge } from '../components/ui/Badge';
+import { Badge } from '../components/ui/Badge';
 import { Button } from '../components/ui/Button';
 import { Card, CardBody } from '../components/ui/Card';
 import { EmptyState } from '../components/ui/EmptyState';
@@ -70,6 +70,12 @@ export function Library(): ReactNode {
   const [pendingDelete, setPendingDelete] = useState<BookSummary | null>(null);
   const [deleting, setDeleting] = useState(false);
   const [downloadingId, setDownloadingId] = useState<number | null>(null);
+  const [savingStatusId, setSavingStatusId] = useState<number | null>(null);
+  // 封面加载失败的书 id：记下来，别再反复请求那张坏图
+  const [brokenCovers, setBrokenCovers] = useState<ReadonlySet<number>>(new Set());
+
+  const markCoverBroken = (id: number): void =>
+    setBrokenCovers((prev) => new Set(prev).add(id));
 
   const { data, loading, error, reload } = useAsync(
     () =>
@@ -98,6 +104,26 @@ export function Library(): ReactNode {
       toast.error(err instanceof Error ? err.message : '下载失败');
     } finally {
       setDownloadingId(null);
+    }
+  };
+
+  /**
+   * 直接改阅读状态。
+   *
+   * 列表里是唯一能一眼看到「这本书状态不对」的地方，改它却要进详情页再开编辑
+   * 弹窗就太绕了。同步上报只会把 unread 推进到 reading（见服务端
+   * updateBookProgress），所以「读完了但还是未读」这类情况得由人来定。
+   */
+  const handleStatusChange = async (book: BookSummary, status: string): Promise<void> => {
+    setSavingStatusId(book.id);
+    try {
+      await api.patch(`/books/${book.id}`, { readingStatus: status });
+      toast.success(`《${book.title}》已标为「${STATUS_LABELS[status] ?? status}」`);
+      reload();
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : '修改阅读状态失败');
+    } finally {
+      setSavingStatusId(null);
     }
   };
 
@@ -244,6 +270,7 @@ export function Library(): ReactNode {
           <Table>
             <THead>
               <TR>
+                <TH>{/* 封面缩略图列，表头留空 */}</TH>
                 <TH>书名</TH>
                 <TH>格式</TH>
                 <TH className="text-right">大小</TH>
@@ -256,6 +283,23 @@ export function Library(): ReactNode {
             <TBody>
               {books.map((book) => (
                 <TR key={book.id} onClick={() => navigate(`/library/${book.id}`)}>
+                  <TD className="w-12">
+                    {/* 缩略图。加载失败就退回图标 —— 外链封面被防盗链拦掉是常事，
+                        留一张碎图比没有还难看 */}
+                    {book.coverSrc && !brokenCovers.has(book.id) ? (
+                      <img
+                        src={book.coverSrc}
+                        alt=""
+                        loading="lazy"
+                        className="h-14 w-10 rounded-sm border border-line object-cover"
+                        onError={() => markCoverBroken(book.id)}
+                      />
+                    ) : (
+                      <span className="flex h-14 w-10 items-center justify-center rounded-sm border border-line bg-surface-2">
+                        <BookOpen size={14} className="text-faint" />
+                      </span>
+                    )}
+                  </TD>
                   <TD className="max-w-64">
                     <div className="truncate font-serif text-sm text-ink">{book.title}</div>
                     <div className="truncate font-sans text-xs text-muted">
@@ -268,7 +312,23 @@ export function Library(): ReactNode {
                   </TD>
                   <TD className="text-right whitespace-nowrap">{formatBytes(book.size)}</TD>
                   <TD>
-                    <StatusBadge value={book.readingStatus} />
+                    {/* 就地改状态：同步只会把 unread 推到 reading，剩下的由人定。
+                        包一层 span 阻止冒泡，否则点下拉会跳进详情页 */}
+                    <span onClick={(event) => event.stopPropagation()}>
+                      <Select
+                        value={book.readingStatus}
+                        disabled={savingStatusId === book.id}
+                        aria-label={`修改《${book.title}》的阅读状态`}
+                        className="h-7 w-24 px-2 font-sans text-xs"
+                        onChange={(event) => void handleStatusChange(book, event.target.value)}
+                      >
+                        {READING_STATUSES.map((value) => (
+                          <option key={value} value={value}>
+                            {STATUS_LABELS[value] ?? value}
+                          </option>
+                        ))}
+                      </Select>
+                    </span>
                   </TD>
                   <TD className="text-right whitespace-nowrap">{Math.round(book.progressPercent)}%</TD>
                   <TD className="whitespace-nowrap">{formatRelative(book.lastReadAt)}</TD>

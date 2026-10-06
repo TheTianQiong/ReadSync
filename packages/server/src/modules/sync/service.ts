@@ -321,12 +321,31 @@ function updateBookProgress(
   if (bookId === null) return;
 
   const db = getDb();
+  const progressPercent = Math.round(scaledPercentage / 100);
+
   db.update(books)
     .set({
       // books.progress_percent 是 0-100 的整数，与 sync_entries 的 0-10000 不同
-      progressPercent: Math.round(scaledPercentage / 100),
+      progressPercent,
       lastReadAt: now,
       updatedAt: now,
+      /*
+       * 顺带推进阅读状态。
+       *
+       * 之前这一列只由用户手工 PATCH，于是「读了书却一直显示未读」——
+       * 进度都同步回来了，状态却纹丝不动。
+       *
+       * 两档规则，除此之外原样保留：
+       *   读到 100% → finished。这是硬事实，覆盖一切（在「搁置」的书读完了
+       *   就是读完了，停在搁置反而与实际不符）。
+       *   原先是 unread → reading。有进度就是开始读了。
+       * 中间进度不覆盖 paused / abandoned / finished —— 状态也是人的决定，
+       * 不能让一次同步把「弃读」改回「在读」。
+       */
+      readingStatus: sql`case
+        when ${progressPercent} >= 100 then 'finished'
+        when ${books.readingStatus} = 'unread' then 'reading'
+        else ${books.readingStatus} end`,
       ...(readingSeconds > 0
         ? { totalReadingSeconds: sql`${books.totalReadingSeconds} + ${readingSeconds}` }
         : {}),

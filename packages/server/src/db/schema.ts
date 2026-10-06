@@ -261,6 +261,14 @@ export const books = sqliteTable(
     currentVersion: integer('current_version').notNull().default(1),
 
     coverUrl: text('cover_url'),
+    /**
+     * 上传封面的时间戳；null 表示这本书没有上传过封面。
+     *
+     * 封面图片本身（base64）存在 book_covers 表里，**故意不放在本表**：
+     * 列表/详情/统计都会 select 整行 books，几 MB 的 base64 会被反复读出来。
+     * 这里只留一个「有没有」的标记与刷新令牌要用的版本号。
+     */
+    coverUpdatedAt: integer('cover_updated_at', { mode: 'timestamp_ms' }),
     description: text('description'),
     tags: text('tags', { mode: 'json' }).$type<string[]>().notNull().default(sql`'[]'`),
     language: text('language'),
@@ -328,6 +336,29 @@ export const bookDocuments = sqliteTable(
     index('book_documents_book_idx').on(t.bookId),
   ],
 );
+
+/**
+ * 上传的封面图片（base64 存库）。
+ *
+ * 单独一张表、与 books 一对一，是为了让书籍列表/详情/统计那些
+ * `select()` 整行的查询不必把几 MB 的 base64 一起拖出来 —— 封面只在
+ * 「真的要显示封面」时才按 bookId 取这一行。
+ *
+ * 存成 base64 而不是丢到存储后端，是因为封面属于书目元数据：跟着数据库
+ * 一起备份、换存储后端也不用搬，用户在内网自建时最省心。
+ */
+export const bookCovers = sqliteTable('book_covers', {
+  bookId: integer('book_id')
+    .primaryKey()
+    .references(() => books.id, { onDelete: 'cascade' }),
+  /** 图片 MIME，取回来时原样作为 Content-Type 返回 */
+  mime: text('mime').notNull(),
+  /** 图片字节的 base64（不含 data: 前缀） */
+  data: text('data').notNull(),
+  createdAt: integer('created_at', { mode: 'timestamp_ms' })
+    .notNull()
+    .default(sql`(unixepoch() * 1000)`),
+});
 
 export const bookVersions = sqliteTable(
   'book_versions',

@@ -100,9 +100,9 @@ export function ReadingStatus(): ReactNode {
         <Card>
           <CardBody className="flex flex-col gap-4 sm:flex-row">
             <div className="flex size-24 shrink-0 items-center justify-center overflow-hidden rounded-sm border border-line bg-raised">
-              {current.coverUrl ? (
+              {current.coverSrc ? (
                 <img
-                  src={current.coverUrl}
+                  src={current.coverSrc}
                   alt={`${current.title} 封面`}
                   className="size-full object-cover"
                   loading="lazy"

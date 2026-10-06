@@ -78,7 +78,15 @@ export async function buildApp(options: BuildAppOptions = {}): Promise<FastifyIn
           directives: {
             defaultSrc: ["'self'"],
             styleSrc: ["'self'", "'unsafe-inline'"],
-            imgSrc: ["'self'", 'data:', 'blob:', 'https:'],
+            /*
+             * 封面可以是外链，所以除自身外还放行 https: 与 data:。
+             *
+             * 站点本身跑在 http 时（内网自建很常见）额外放行 http:：此时
+             * 封面外链往往也是 http 的，不放行就会被 CSP 拦成一张碎图。
+             * 站点是 https 时不加 —— 浏览器那关的混合内容拦截先拦住了，
+             * 放行反而只是白白放宽策略。
+             */
+            imgSrc: ["'self'", 'data:', 'blob:', 'https:', ...(publicUrlIsHttps ? [] : ['http:'])],
             scriptSrc: ["'self'"],
             connectSrc: ["'self'"],
             objectSrc: ["'none'"],

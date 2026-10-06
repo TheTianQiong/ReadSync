@@ -20,12 +20,22 @@ import {
   type PresignUploadResult,
   type Paginated,
 } from '@readsync/shared';
-import { badRequest, validationFailed } from '../../errors.js';
+import { badRequest, notFound, payloadTooLarge, validationFailed } from '../../errors.js';
 import { auditContextFrom, recordAudit } from '../../lib/audit.js';
 import { forbidden } from '../../errors.js';
 import { getSiteSettings } from '../../lib/settings.js';
 import { currentUser, requireAuth } from '../../middleware/auth.js';
 import { completeSession, createSession, discardSession, writeChunk } from './chunked.js';
+import {
+  COVER_MAX_BYTES,
+  coverSrc,
+  deleteBookCover,
+  encodeCoverUpload,
+  readBookCover,
+  requireOwnedBookId,
+  saveBookCover,
+  verifyCoverToken,
+} from './cover.js';
 import {
   addDocumentId,
   listDocumentIds,
@@ -124,6 +134,86 @@ export async function registerLibraryRoutes(app: FastifyInstance): Promise<void>
     });
 
     return { ok: true, data: result } satisfies ApiSuccess<typeof result>;
+  });
+
+  /**
+   * 上传封面（multipart，字段名 file）。
+   *
+   * 图片以 base64 存进 book_covers 表；books.coverUpdatedAt 作为版本号，
+   * 每次上传都刷新，旧链接的签名随之失效。
+   */
+  app.post('/api/books/:id/cover', auth, async (req) => {
+    const user = currentUser(req);
+    const bookId = parseIdParam(req.params);
+    requireOwnedBookId(user.id, bookId);
+
+    // 全局 multipart 上限是 2GB（书籍上传要），封面单独收紧
+    const file = await req.file({ limits: { fileSize: COVER_MAX_BYTES, files: 1 } });
+    if (!file) throw badRequest('请选择要上传的封面图片');
+
+    let buffer: Buffer;
+    try {
+      buffer = await file.toBuffer();
+    } catch (err) {
+      if (err instanceof app.multipartErrors.RequestFileTooLargeError) {
+        throw payloadTooLarge(`封面不能超过 ${Math.round(COVER_MAX_BYTES / 1024 / 1024)}MB`);
+      }
+      throw err;
+    }
+
+    const { mime, data } = encodeCoverUpload(file.mimetype, buffer);
+    const now = new Date();
+    saveBookCover(bookId, mime, data, now);
+
+    recordAudit('book.update', auditContextFrom(req), {
+      target: String(bookId),
+      meta: { action: 'set-cover', mime, bytes: buffer.length },
+    });
+
+    return {
+      ok: true,
+      data: { hasCover: true, coverSrc: coverSrc(bookId, now) },
+    } satisfies ApiSuccess<{ hasCover: boolean; coverSrc: string | null }>;
+  });
+
+  /** 删除上传的封面（外链 coverUrl 不受影响） */
+  app.delete('/api/books/:id/cover', auth, async (req) => {
+    const user = currentUser(req);
+    const bookId = parseIdParam(req.params);
+    requireOwnedBookId(user.id, bookId);
+
+    deleteBookCover(bookId, new Date());
+    recordAudit('book.update', auditContextFrom(req), {
+      target: String(bookId),
+      meta: { action: 'clear-cover' },
+    });
+
+    return { ok: true, data: { hasCover: false } } satisfies ApiSuccess<{ hasCover: boolean }>;
+  });
+
+  /**
+   * 读取封面。
+   *
+   * 不套信封、也不需要登录态 —— `<img src>` 既带不了 Authorization 头，
+   * 也不该为了显示一张图去拿令牌。但封面不能像头像那样彻底公开（那等于
+   * 把别人的书库目录暴露给任何枚举 id 的人），所以地址里带一个 HMAC 签名，
+   * 由服务端在书被创建/改封面时生成（见 cover.ts）。
+   */
+  app.get('/api/books/:id/cover', async (req, reply) => {
+    const bookId = parseIdParam(req.params);
+    const query = req.query as { v?: string; t?: string };
+    const version = Number(query.v);
+
+    if (!Number.isFinite(version) || !verifyCoverToken(bookId, version, query.t)) {
+      throw notFound('封面不存在');
+    }
+
+    const cover = readBookCover(bookId);
+    if (!cover) throw notFound('封面不存在');
+
+    // 地址里已经带了版本号，可以放心让浏览器长期缓存
+    reply.header('Cache-Control', 'private, max-age=86400');
+    return reply.type(cover.mime).send(cover.data);
   });
 
   /**

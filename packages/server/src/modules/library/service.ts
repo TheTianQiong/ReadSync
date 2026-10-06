@@ -34,6 +34,7 @@ import {
 import { getModuleLogger } from '../../logger.js';
 import { getSiteSettings } from '../../lib/settings.js';
 import { koreaderDocumentIdFromFile } from '../../lib/document-id.js';
+import { coverSrc } from './cover.js';
 import { listDocumentIds } from './documents.js';
 import { getAdapterForStorage, getDefaultAdapter } from '../storage/service.js';
 import { assertSafeKey, buildBookKey, type StorageAdapter } from '../storage/types.js';
@@ -105,6 +106,9 @@ function toBookSummary(row: BookWithStorage): BookSummary {
     md5: b.md5,
     documentId: b.documentId,
     coverUrl: b.coverUrl,
+    hasCover: b.coverUpdatedAt !== null,
+    // 上传的封面优先；没有才回退到用户填的外链
+    coverSrc: coverSrc(b.id, b.coverUpdatedAt) ?? b.coverUrl,
     description: b.description,
     tags: b.tags ?? [],
     language: b.language,

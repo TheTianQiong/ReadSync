@@ -1,13 +1,15 @@
-import { BOOK_FORMATS, DEFAULT_ALLOWED_EXTENSIONS, type BookSummary, type CheckBookExistsResult, type StorageSummary } from '@readsync/shared';
+import { BOOK_FORMATS, DEFAULT_ALLOWED_EXTENSIONS, type BookDetail, type BookSummary, type CheckBookExistsResult, type StorageSummary } from '@readsync/shared';
 import { FileUp, ScanSearch } from 'lucide-react';
 import { useEffect, useRef, useState, type ReactNode } from 'react';
 import { Link } from 'react-router-dom';
 import { useAuth } from '../contexts/AuthContext';
 import { api } from '../lib/api';
+import { uploadBookCover } from '../lib/cover';
 import { useAsync } from '../lib/hooks';
 import { fileExtension, formatBytes, md5OfFile, parseTags } from '../lib/utils';
 import { Alert } from './ui/Alert';
 import { Button } from './ui/Button';
+import { CoverPicker } from './CoverPicker';
 import { Field, Input, Select, Textarea } from './ui/Input';
 import { Modal } from './ui/Modal';
 import { useToast } from './ui/Toast';
@@ -61,6 +63,9 @@ export function BookUploadDialog({
   const [hashProgress, setHashProgress] = useState(0);
   const [knownMd5, setKnownMd5] = useState<string | null>(null);
   const [duplicate, setDuplicate] = useState<BookSummary | null>(null);
+  // 封面：书上传成功拿到 id 之后才传（接口要 bookId），所以先揣着文件
+  const [coverFile, setCoverFile] = useState<File | null>(null);
+  const [coverPreview, setCoverPreview] = useState<string | null>(null);
 
   // 存储后端列表；接口未就绪时留空，后端会用默认存储
   const storages = useAsync(
@@ -83,8 +88,20 @@ export function BookUploadDialog({
     setNotice(null);
     setKnownMd5(null);
     setDuplicate(null);
+    setCoverFile(null);
     if (fileInputRef.current) fileInputRef.current.value = '';
   }, [open]);
+
+  // 预览用本地 object URL；不 revoke 的话每开一次弹窗漏一个 blob
+  useEffect(() => {
+    if (!coverFile) {
+      setCoverPreview(null);
+      return;
+    }
+    const url = URL.createObjectURL(coverFile);
+    setCoverPreview(url);
+    return () => URL.revokeObjectURL(url);
+  }, [coverFile]);
 
   const handlePickFile = (picked: File | null): void => {
     setFile(picked);
@@ -197,6 +214,8 @@ export function BookUploadDialog({
        * 用户不该因为管理员选错了一个选项就传不了书。
        */
       let done = false;
+      // 三条路都会返回落库后的书 —— 封面要等它建好、拿到 id 才能传
+      let created: BookDetail | null = null;
 
       if (strategy === 'presigned') {
         const result = await api.uploadPresigned(file, fields, target, {
@@ -206,6 +225,7 @@ export function BookUploadDialog({
         });
         // null 表示当前存储不支持直传，落到下面的分片路径
         done = result !== null;
+        created = result;
       }
 
       if (!done && strategy === 'direct') {
@@ -213,19 +233,34 @@ export function BookUploadDialog({
         const form = new FormData();
         form.append('file', file);
         for (const [key, value] of Object.entries(fields)) form.append(key, value);
-        await api.upload(mode === 'create' ? '/books/upload' : `/books/${bookId}/versions`, form, {
-          onProgress: setProgress,
-        });
+        created = await api.upload<BookDetail>(
+          mode === 'create' ? '/books/upload' : `/books/${bookId}/versions`,
+          form,
+          { onProgress: setProgress },
+        );
         done = true;
       }
 
       if (!done) {
-        await api.uploadChunked(file, fields, target, {
+        created = await api.uploadChunked(file, fields, target, {
           onProgress: setProgress,
           // 链路慢而降级重试时得让用户看见，否则进度条归零会像是卡死了
           onNotice: setNotice,
         });
       }
+
+      /*
+       * 传封面。只在新书时有意义（版本上传不改封面），且失败不该让整次上传
+       * 看起来失败 —— 文件已经传完、书已经建好，重来一遍代价太大。
+       */
+      if (mode === 'create' && coverFile && created) {
+        try {
+          await uploadBookCover(created.id, coverFile);
+        } catch (err) {
+          toast.error(`书籍已上传，但封面没传上：${err instanceof Error ? err.message : '未知原因'}`);
+        }
+      }
+
       toast.success(mode === 'create' ? '上传完成' : '新版本已上传');
       onUploaded();
       onClose();
@@ -351,6 +386,15 @@ export function BookUploadDialog({
 
             <Field label="标签" hint="用逗号或空格分隔，最多 20 个">
               <Input value={tags} onChange={(event) => setTags(event.target.value)} placeholder="小说, 已校对" />
+            </Field>
+
+            <Field label="封面">
+              <CoverPicker
+                src={coverPreview}
+                disabled={uploading}
+                onSelect={setCoverFile}
+                hint="可选。PNG / JPEG / WebP / GIF，不超过 1.5MB。书籍上传成功后一并保存。"
+              />
             </Field>
 
             <Field label="简介">

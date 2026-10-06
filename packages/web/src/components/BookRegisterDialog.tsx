@@ -2,9 +2,11 @@ import { BOOK_FORMATS, type BookDetail } from '@readsync/shared';
 import { BookPlus } from 'lucide-react';
 import { useEffect, useState, type ReactNode } from 'react';
 import { api } from '../lib/api';
+import { uploadBookCover } from '../lib/cover';
 import { parseTags } from '../lib/utils';
 import { Alert } from './ui/Alert';
 import { Button } from './ui/Button';
+import { CoverPicker } from './CoverPicker';
 import { Field, Input, Select, Textarea } from './ui/Input';
 import { Modal } from './ui/Modal';
 import { useToast } from './ui/Toast';
@@ -39,6 +41,12 @@ export function BookRegisterDialog({
 
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  /**
+   * 封面只能在书建好之后传（上传接口要 bookId），所以这里先揣着文件；
+   * 预览用本地 object URL，卸载时记得 revoke，否则每开一次弹窗漏一个 blob。
+   */
+  const [coverFile, setCoverFile] = useState<File | null>(null);
+  const [coverPreview, setCoverPreview] = useState<string | null>(null);
 
   useEffect(() => {
     if (!open) return;
@@ -51,7 +59,18 @@ export function BookRegisterDialog({
     setDescription('');
     setTotalPages('');
     setError(null);
+    setCoverFile(null);
   }, [open]);
+
+  useEffect(() => {
+    if (!coverFile) {
+      setCoverPreview(null);
+      return;
+    }
+    const url = URL.createObjectURL(coverFile);
+    setCoverPreview(url);
+    return () => URL.revokeObjectURL(url);
+  }, [coverFile]);
 
   const handleSubmit = async (): Promise<void> => {
     if (!title.trim()) {
@@ -68,7 +87,7 @@ export function BookRegisterDialog({
     setSaving(true);
     setError(null);
     try {
-      await api.post<BookDetail>('/books', {
+      const book = await api.post<BookDetail>('/books', {
         title: title.trim(),
         ...(author.trim() ? { author: author.trim() } : {}),
         format,
@@ -82,6 +101,21 @@ export function BookRegisterDialog({
         ...(description.trim() ? { description: description.trim() } : {}),
         ...(Number(totalPages) > 0 ? { totalPages: Math.round(Number(totalPages)) } : {}),
       });
+
+      /*
+       * 封面要等书建好拿到 id 才能传。传封面失败不该让整次登记看起来失败 ——
+       * 书已经建好了，重开会丢失已填的内容，所以只提示、不抛错。
+       */
+      if (coverFile) {
+        try {
+          await uploadBookCover(book.id, coverFile);
+        } catch (err) {
+          toast.error(
+            `书目已登记，但封面没传上：${err instanceof Error ? err.message : '未知原因'}`,
+          );
+        }
+      }
+
       toast.success('已登记书目');
       onRegistered();
       onClose();
@@ -175,6 +209,15 @@ export function BookRegisterDialog({
             />
           </Field>
         </div>
+
+        <Field label="封面">
+          <CoverPicker
+            src={coverPreview}
+            disabled={saving}
+            onSelect={setCoverFile}
+            hint="可选。PNG / JPEG / WebP / GIF，不超过 1.5MB，图片会存到服务器上。"
+          />
+        </Field>
 
         <Field label="标签" hint="逗号或空格分隔">
           <Input value={tags} onChange={(e) => setTags(e.target.value)} placeholder="科幻 长篇" />

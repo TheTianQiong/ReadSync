@@ -126,6 +126,19 @@ export interface BookSummary {
    */
   documentId: string | null;
   coverUrl: string | null;
+  /**
+   * 是否上传过封面（图片以 base64 存在服务端）。
+   *
+   * 与 coverUrl 是两条路：coverUrl 是用户填的外链，这个是上传的图片。
+   */
+  hasCover: boolean;
+  /**
+   * 能直接放进 `<img src>` 的封面地址。
+   *
+   * 优先用上传的封面（带签名的接口地址），没有则回退到 coverUrl。
+   * 前端只认这一个字段，免得每个页面各写一遍「先看哪个」。
+   */
+  coverSrc: string | null;
   description: string | null;
   tags: string[];
   language: string | null;

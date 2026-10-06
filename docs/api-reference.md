@@ -192,6 +192,24 @@ GET /api/storages/:id/browse?prefix=books/1/
 | GET / POST | `/api/books/:id/documents` | 该书已知的文档标识 / 补充一个标识 |
 | PUT | `/api/books/:id/documents/primary` | 改主标识（`{"documentId": null}` 即清空） |
 | DELETE | `/api/books/:id/documents/:aliasId` | 移除一个补充标识 |
+| POST / DELETE | `/api/books/:id/cover` | 上传封面（multipart，字段 `file`）/ 删除封面 |
+| GET | `/api/books/:id/cover` | 读取封面（**不需要登录**，见下） |
+
+**封面有两条路，对外只用 `coverSrc` 一个字段。**
+
+- `coverUrl`：用户填的外链地址。
+- 上传的封面：图片以 **base64 存在 `book_covers` 表**里（不放开在 `books` 上，
+  免得列表/统计那些整行查询把几 MB 的 base64 一起拖出来）。仅支持
+  PNG / JPEG / WebP / GIF，单张不超过 1.5MB，超限返回 `413`。
+
+`coverSrc` 是「能直接放进 `<img src>` 的那个地址」：有上传封面时是下面这条
+带签名的接口地址，否则回退到 `coverUrl`。前端只认它。
+
+**读取接口不带登录态，但地址里有 HMAC 签名**（`?v=<版本>&t=<签名>`）。
+`<img>` 带不了 Authorization 头，所以不能用登录态；但它也不能像头像那样彻底
+公开 —— 那等于把「这个人有哪些书」暴露给任何枚举数字 id 的人。签名由服务端
+在 `BookSummary`/`BookDetail` 里生成，版本号取封面更新时间，**换了封面（或删除）
+旧地址立刻失效**，同时天然解决浏览器缓存。
 
 **文档标识（documentId）是阅读进度挂到书上的唯一钥匙。** 它不等于整文件 MD5：
 KOReader 算的是**采样 MD5**（12 个固定偏移各读 1KB，见 `KOREADER_SAMPLE_OFFSETS`），
@@ -330,6 +348,17 @@ Authorization: Bearer rs_xxxxxxxx
 | `platform` | 否 | 平台标识，用于统计。内置值见 `BUILTIN_PLATFORMS`，也可自定义 |
 | `readingSeconds` | 否 | 本次新增阅读秒数，服务端累加进统计。单次上限 86400 |
 | `clientTime` | 否 | 客户端本地时间，用于离线补传时判定新旧 |
+
+**写入进度会顺带推进阅读状态**（这两件事以前是脱节的：进度同步回来了，
+书库里却一直显示「未读」）。规则只有两条，其余情况一律不动：
+
+| 情况 | 结果 |
+|---|---|
+| 进度到 100% | → `finished`（硬事实，覆盖一切，「搁置」的书读完了就是读完了） |
+| 原状态是 `unread` | → `reading` |
+| 其它（中间进度 + `paused`/`abandoned`/`finished`） | 保持原样（状态也是人的决定） |
+
+要手工改判，用 `PATCH /api/books/:id`（前端书库列表里那一列就能直接改）。
 
 ### 4.6 其它端点
 

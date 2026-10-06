@@ -609,7 +609,7 @@ READSYNC_DATA_DIR=./data-smoke npx tsx src/scripts/smoke-db.ts
 # 数据库迁移校验（含数据保留与外键完整性），会自建旧版库再升级
 READSYNC_DATA_DIR=./data-mig npx tsx src/scripts/check-migration.ts
 
-# 端到端集成测试（211 项断言：认证 / 2FA / 恢复码 / 上传 / 分片 / 预签名直传 / 只登记书目 / 进度关联 / 多标识 / 跨域 / 同步 / 统计 / KOSync / 权限隔离）
+# 端到端集成测试（230 项断言：认证 / 2FA / 恢复码 / 上传 / 分片 / 预签名直传 / 只登记书目 / 进度关联 / 多标识 / 跨域 / 同步 / 统计 / KOSync / 权限隔离）
 READSYNC_DATA_DIR=./data-e2e npx tsx src/scripts/smoke-e2e.ts
 
 # 真实 socket 的大文件整体上传（冒烟测试走进程内 inject，照不出传输层问题）

@@ -8,6 +8,7 @@ import { ArrowLeft, Download, Fingerprint, History, Pencil, Plus, RotateCcw, Sav
 import { useEffect, useState, type ReactNode } from 'react';
 import { Link, useNavigate, useParams } from 'react-router-dom';
 import { BookUploadDialog } from '../components/BookUploadDialog';
+import { CoverPicker } from '../components/CoverPicker';
 import { Alert } from '../components/ui/Alert';
 import { Badge, StatusBadge } from '../components/ui/Badge';
 import { Button } from '../components/ui/Button';
@@ -19,6 +20,7 @@ import { PageSpinner } from '../components/ui/Spinner';
 import { Table, TBody, TD, TH, THead, TR } from '../components/ui/Table';
 import { useToast } from '../components/ui/Toast';
 import { api } from '../lib/api';
+import { removeBookCover, uploadBookCover } from '../lib/cover';
 import { downloadBookFile } from '../lib/download';
 import { useAsync } from '../lib/hooks';
 import { formatBytes, formatDateTime, formatDuration, parseTags } from '../lib/utils';
@@ -59,12 +61,21 @@ export function BookDetail(): ReactNode {
   const [editingPrimary, setEditingPrimary] = useState(false);
   const [primaryDraft, setPrimaryDraft] = useState('');
   const [savingPrimary, setSavingPrimary] = useState(false);
+  const [savingCover, setSavingCover] = useState(false);
+  // 外链封面可能加载失败（防盗链 / CSP / 404），失败后回落到占位块
+  const [coverBroken, setCoverBroken] = useState(false);
 
   const { data: book, loading, error, reload } = useAsync(
     () => api.get<BookDetailData>(`/books/${bookId}`),
     [bookId],
     { immediate: Number.isFinite(bookId) && bookId > 0 },
   );
+
+  // 换了封面（或 reload 拿到新地址）后要重新给图片一次机会，
+  // 否则上一次「外链加载失败」的判断会一直粘着，新封面也不显示
+  useEffect(() => {
+    setCoverBroken(false);
+  }, [book?.coverSrc]);
 
   if (!Number.isFinite(bookId) || bookId <= 0) {
     return (
@@ -186,6 +197,39 @@ export function BookDetail(): ReactNode {
     }
   };
 
+  /**
+   * 上传封面。
+   *
+   * 图片存在服务端（base64 落库），所以这里只负责把文件送上去、然后 reload ——
+   * 新封面地址带版本号，reload 后浏览器自然会请求新图，不会被旧缓存骗到。
+   */
+  const handleCoverUpload = async (file: File): Promise<void> => {
+    setSavingCover(true);
+    setCoverBroken(false);
+    try {
+      await uploadBookCover(bookId, file);
+      toast.success('封面已更新');
+      reload();
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : '封面上传失败');
+    } finally {
+      setSavingCover(false);
+    }
+  };
+
+  const handleCoverClear = async (): Promise<void> => {
+    setSavingCover(true);
+    try {
+      await removeBookCover(bookId);
+      toast.success('已移除封面');
+      reload();
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : '移除失败');
+    } finally {
+      setSavingCover(false);
+    }
+  };
+
   const handleDownload = async (): Promise<void> => {
     setDownloading(true);
     try {
@@ -257,12 +301,31 @@ export function BookDetail(): ReactNode {
 
       <Card>
         <CardBody className="flex flex-col gap-4 sm:flex-row">
-          <div className="flex h-40 w-28 shrink-0 items-center justify-center overflow-hidden rounded-sm border border-line bg-raised">
-            {book.coverUrl ? (
-              <img src={book.coverUrl} alt={`${book.title} 封面`} className="size-full object-cover" />
-            ) : (
-              <span className="font-serif text-xs text-faint">暂无封面</span>
-            )}
+          <div className="flex shrink-0 flex-col gap-2">
+            <div className="flex h-40 w-28 items-center justify-center overflow-hidden rounded-sm border border-line bg-raised">
+              {/* 图裂了要有兜底：外链封面会被防盗链或 CSP 拦掉，
+                  那时浏览器给的是碎图，用户只会以为「封面功能坏了」 */}
+              {book.coverSrc && !coverBroken ? (
+                <img
+                  src={book.coverSrc}
+                  alt={`${book.title} 封面`}
+                  className="size-full object-cover"
+                  onError={() => setCoverBroken(true)}
+                />
+              ) : (
+                <span className="font-serif text-xs text-faint">暂无封面</span>
+              )}
+            </div>
+
+            <CoverPicker
+              src={null}
+              busy={savingCover}
+              onSelect={(file) => {
+                if (file) void handleCoverUpload(file);
+              }}
+              {...(book.hasCover ? { onClear: () => void handleCoverClear() } : {})}
+              hint={book.coverSrc ? undefined : '也可以填外链地址，见「编辑信息」'}
+            />
           </div>
 
           <div className="flex min-w-0 flex-1 flex-col gap-2">

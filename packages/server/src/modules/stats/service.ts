@@ -21,6 +21,7 @@ import { getDb, getRawDb } from '../../db/index.js';
 import { users } from '../../db/schema.js';
 import { badRequest } from '../../errors.js';
 import { getModuleLogger } from '../../logger.js';
+import { coverSrc } from '../library/cover.js';
 
 /**
  * 阅读统计的聚合查询。
@@ -96,6 +97,7 @@ interface CurrentBookRow {
   title: string;
   author: string | null;
   coverUrl: string | null;
+  coverUpdatedAt: number | null;
   progressPercent: number | null;
   lastReadAt: number | null;
   totalSeconds: number | null;
@@ -614,6 +616,7 @@ function queryCurrentBook(userId: number, onlyReadingStatus: boolean): CurrentBo
               b.title AS title,
               b.author AS author,
               b.cover_url AS coverUrl,
+              b.cover_updated_at AS coverUpdatedAt,
               b.progress_percent AS progressPercent,
               COALESCE((SELECT MAX(s2.started_at) FROM reading_sessions s2
                          WHERE s2.book_id = b.id AND s2.user_id = b.owner_id),
@@ -694,6 +697,10 @@ export function getReadingStatusSummary(
         title: bookRow.title,
         author: bookRow.author,
         coverUrl: bookRow.coverUrl,
+        // 上传的封面优先，与书库列表用同一套推导（cover.ts 负责签名）
+        coverSrc:
+          coverSrc(bookRow.id, bookRow.coverUpdatedAt ? new Date(bookRow.coverUpdatedAt) : null) ??
+          bookRow.coverUrl,
         progressPercent: num(bookRow.progressPercent),
         lastReadAt: bookRow.lastReadAt ? new Date(bookRow.lastReadAt).toISOString() : null,
         totalSeconds: num(bookRow.totalSeconds),
