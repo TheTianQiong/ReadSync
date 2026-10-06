@@ -9,16 +9,19 @@
  * 再创建 commit 并移动分支指针。若本地与 API 的元数据完全一致，得到的 commit
  * SHA 会与本地提交相同，从而保持本地与远端不分叉。
  *
+ * **可以一次推一批。** 积压多个提交时，脚本回到「远端与本地共同的那个祖先」，
+ * 按从早到晚的顺序逐个把提交建出来 —— 因为 GitHub 不接受父提交不存在的提交。
+ *
  * **文件内容必须按字节上传。** 早先这里是 `git show` 取内容再按 utf8 重新编码，
  * 文本文件看不出问题，二进制文件（zip、图片）会被毁掉 —— 表现是远端 blob 的
  * SHA 与本地不同，而脚本当时只比对 commit SHA，还会打一句「内容相同」把人骗过去。
- * 现在每个 blob 上传后都与本地 blob SHA 逐一对齐，而且 tree 或 commit 一旦对不上
- * 就中止，绝不发布。
+ * 现在每个 blob / tree / commit 都逐个对齐 SHA，任何一步对不上就中止，绝不发布。
  *
  * 用法：node scripts/push-via-api.mjs [--dry-run] [--force]
  *
- *   --force  跳过「远端必须等于父提交」的检查并强制移动分支指针。仅用于修正
- *            上一次推坏的提交；它会丢弃远端那个提交（别人若基于它工作会受影响）。
+ *   --dry-run  只检查与列清单，不写任何东西
+ *   --force    允许覆盖与本地分叉的远端提交（例如上一次推坏了东西）：以远端那个
+ *              提交的 tree 为底重新组装，它会变成不可达对象
  */
 import { execFileSync } from 'node:child_process';
 
@@ -29,6 +32,14 @@ const DRY_RUN = process.argv.includes('--dry-run');
 const FORCE = process.argv.includes('--force');
 
 const git = (...args) => execFileSync('git', args, { encoding: 'utf8' }).trim();
+const gitOk = (...args) => {
+  try {
+    execFileSync('git', args, { stdio: 'ignore' });
+    return true;
+  } catch {
+    return false;
+  }
+};
 
 /** 原始字节级的 git 输出；maxBuffer 放大到能装下仓库里最大的文件 */
 const gitBytes = (...args) =>
@@ -63,145 +74,219 @@ async function api(path, init = {}) {
   }
 
   if (!res.ok) {
-    throw new Error(`${init.method ?? 'GET'} ${path} → ${res.status}\n${JSON.stringify(body, null, 2).slice(0, 800)}`);
+    const err = new Error(`${init.method ?? 'GET'} ${path} → ${res.status}\n${JSON.stringify(body, null, 2).slice(0, 800)}`);
+    err.status = res.status;
+    throw err;
   }
   return body;
 }
 
 const LOCAL_HEAD = git('rev-parse', 'HEAD');
-const PARENT = git('rev-parse', `${LOCAL_HEAD}^`);
+const short = (sha) => sha.slice(0, 8);
 
 console.log(`本地提交   ${LOCAL_HEAD}`);
-console.log(`父提交     ${PARENT}`);
 
-// 远端 main 必须正好是父提交，否则说明远端有新内容，应当先人工处理
 const remoteRef = await api(`/repos/${OWNER}/${REPO}/git/ref/heads/${BRANCH}`);
-if (remoteRef.object.sha !== PARENT) {
-  if (!FORCE) {
-    console.error(`\n拒绝执行：远端 ${BRANCH} 指向 ${remoteRef.object.sha}，不是本提交的父提交 ${PARENT}。`);
-    console.error('远端可能已有新提交，请先 git fetch 并合并后再试。');
-    console.error('若你确定要用本地提交覆盖远端（例如上一次推坏了东西），加 --force。');
-    process.exit(1);
+let remoteTip = remoteRef.object.sha;
+console.log(`远端 ${BRANCH}  ${remoteTip}\n`);
+
+/* -------------------------------------------------------------------------- *
+ * 1) 找到共同祖先，列出这一批要推的提交（从早到晚）
+ * -------------------------------------------------------------------------- */
+
+/**
+ * 从远端那个提交往回走，直到遇到本地也有的提交。
+ *
+ * 不能直接用 `HEAD^`：积压多个提交时，远端根本没有那个对象。之所以要找到共同
+ * 祖先，是因为每个提交的 tree 都要以它的父提交为底来组装，而那个父提交必须先
+ * 在远端存在。
+ */
+async function findCommonAncestor() {
+  let cursor = remoteTip;
+  for (let hops = 0; hops < 1000; hops += 1) {
+    if (gitOk('cat-file', '-e', `${cursor}^{commit}`)) return cursor;
+
+    const commit = await api(`/repos/${OWNER}/${REPO}/git/commits/${cursor}`);
+    // 线性历史，取第一个父提交即可
+    const next = commit.parents?.[0];
+    if (!next) {
+      throw new Error('远端历史走到了根提交，却始终没找到本地也有的那个提交 —— 两侧不像同源');
+    }
+    cursor = next;
   }
-  console.warn(`\n⚠ --force：远端 ${BRANCH} 当前指向 ${remoteRef.object.sha}，将强制改为 ${LOCAL_HEAD}。`);
-  console.warn('  那个提交会变成不可达对象 —— 只在确认它没有需要保留的内容时才这么做。\n');
-} else {
-  console.log(`远端 ${BRANCH}  ${remoteRef.object.sha}  ✓ 与父提交一致\n`);
+  throw new Error('回溯层数过多，已放弃');
 }
 
-// 本次提交改动的文件（相对父提交）
-const changed = git('diff', '--name-only', `${PARENT}..${LOCAL_HEAD}`).split('\n').filter(Boolean);
-if (changed.length === 0) {
-  console.log('没有改动，无需推送。');
+const commonAncestor = await findCommonAncestor();
+if (commonAncestor !== remoteTip) {
+  console.log(`远端领先/分叉：共同祖先是 ${short(commonAncestor)}，远端那个提交将被替换`);
+}
+
+const backlog = git('log', '--reverse', '--format=%H', `${commonAncestor}..${LOCAL_HEAD}`)
+  .split('\n')
+  .filter(Boolean);
+
+if (backlog.length === 0) {
+  console.log('本地没有新提交，无需推送。');
   process.exit(0);
 }
 
-console.log(`待上传文件（${changed.length} 个）：`);
-for (const p of changed) console.log(`  ${p}`);
+// 远端那个提交不是这批里第一个提交的父提交 —— 也就是说两者分叉了，需要 --force
+const diverged = remoteTip !== commonAncestor;
+
+console.log(`待推送提交（${backlog.length} 个，从早到晚）：`);
+for (const sha of backlog) {
+  console.log(`  ${short(sha)}  ${git('log', '-1', '--format=%s', sha)}`);
+}
+
+if (diverged && !FORCE) {
+  console.error(`\n拒绝执行：远端 ${BRANCH} 指向 ${short(remoteTip)}，与本地这批提交分叉。`);
+  console.error('若你确定要用本地提交替换它（例如上一次推坏了东西），加 --force。');
+  process.exit(1);
+}
+if (diverged) {
+  console.warn(`\n⚠ --force：远端那个提交 ${short(remoteTip)} 会被替换成 ${short(backlog.at(-1))}。`);
+  console.warn('  它的内容若不在本地这批提交里，就会丢失。\n');
+}
 
 if (DRY_RUN) {
   console.log('\n--dry-run：仅检查，不做任何改动。');
   process.exit(0);
 }
 
-// 1) 上传 blob
-const entries = [];
-for (const path of changed) {
-  // 该路径在本提交里可能已被删除：tree 里要显式写 sha: null 才能删掉它
-  let mode = '';
-  try {
-    mode = git('ls-tree', LOCAL_HEAD, '--', path).split(/\s+/)[0] ?? '';
-  } catch {
-    mode = '';
-  }
-  if (!mode) {
-    entries.push({ path, mode: '100644', type: 'blob', sha: null });
-    console.log(`  ✗ ${path}  已删除`);
-    continue;
+/* -------------------------------------------------------------------------- *
+ * 2) 逐个提交地推
+ * -------------------------------------------------------------------------- */
+
+/** 上传一个提交改动过的文件，返回 tree 条目（含 sha: null 的删除项） */
+async function uploadEntries(parent, commit) {
+  const changed = git('diff', '--name-only', `${parent}..${commit}`).split('\n').filter(Boolean);
+  const entries = [];
+
+  for (const path of changed) {
+    let mode = '';
+    try {
+      mode = git('ls-tree', commit, '--', path).split(/\s+/)[0] ?? '';
+    } catch {
+      mode = '';
+    }
+
+    // 该路径在本提交里已被删除：tree 里要写 sha: null 才能删掉它
+    if (!mode) {
+      entries.push({ path, mode: '100644', type: 'blob', sha: null });
+      console.log(`    ✗ ${path}  已删除`);
+      continue;
+    }
+
+    const localBlob = git('rev-parse', `${commit}:${path}`);
+    const bytes = gitBytes('cat-file', 'blob', localBlob);
+
+    const blob = await api(`/repos/${OWNER}/${REPO}/git/blobs`, {
+      method: 'POST',
+      body: JSON.stringify({ content: bytes.toString('base64'), encoding: 'base64' }),
+    });
+
+    /*
+     * 逐个 blob 对齐 SHA。git 的 SHA 是内容寻址的，所以 SHA 相同就等于字节相同 ——
+     * 这是唯一能挡住「内容在送入 API 的过程中被悄悄改写」的检查。宁可在这里失败，
+     * 也不要把一份被改过的文件推上去（二进制文件尤其看不出来）。
+     */
+    if (blob.sha !== localBlob) {
+      console.error(`\n中止：上传后内容不一致 ${path}`);
+      console.error(`  本地 blob ${localBlob}（${bytes.length} 字节）`);
+      console.error(`  远端 blob ${blob.sha}`);
+      console.error('文件在送入 API 的过程中被改写了；请检查本脚本是否仍按字节读取内容。');
+      process.exit(1);
+    }
+
+    entries.push({ path, mode, type: 'blob', sha: blob.sha });
+    console.log(`    ✓ ${path}`);
   }
 
-  const localBlob = git('rev-parse', `${LOCAL_HEAD}:${path}`);
-  const bytes = gitBytes('cat-file', 'blob', localBlob);
+  return entries;
+}
 
-  const blob = await api(`/repos/${OWNER}/${REPO}/git/blobs`, {
+/** 取某个提交（本地或远端）的 tree sha —— 本地有就用本地，避免多余的 API 调用 */
+async function treeOf(sha) {
+  if (gitOk('cat-file', '-e', `${sha}^{commit}`)) return git('rev-parse', `${sha}^{tree}`);
+  const commit = await api(`/repos/${OWNER}/${REPO}/git/commits/${sha}`);
+  return commit.tree.sha;
+}
+
+let parent = commonAncestor;
+// 第一个提交要基于**远端那个 tree** 组装：本地祖先的 tree 与远端现状不同
+let baseTree = await treeOf(remoteTip);
+
+for (const [index, commit] of backlog.entries()) {
+  console.log(`\n[${index + 1}/${backlog.length}] ${short(commit)}  ${git('log', '-1', '--format=%s', commit)}`);
+
+  const entries = await uploadEntries(parent, commit);
+  const tree = await api(`/repos/${OWNER}/${REPO}/git/trees`, {
     method: 'POST',
-    body: JSON.stringify({ content: bytes.toString('base64'), encoding: 'base64' }),
+    body: JSON.stringify({ base_tree: baseTree, tree: entries }),
   });
 
+  const localTree = git('rev-parse', `${commit}^{tree}`);
   /*
-   * 逐个 blob 对齐 SHA。git 的 SHA 是内容寻址的，所以 SHA 相同就等于字节相同 ——
-   * 这是唯一能挡住「内容在送入 API 的过程中被悄悄改写」的检查。宁可在这里失败，
-   * 也不要把一份被改过的文件推上去（二进制文件尤其看不出来）。
+   * tree 不一致 = 远端会拿到一份与本地不同的内容，**到此为止，不要发布**。
+   * 以前这里只打一行「✗ 不一致」就继续推，还给一句「内容相同」的结论 ——
+   * 正是那次把 4 个二进制文件传坏了却看不出来。
    */
-  if (blob.sha !== localBlob) {
-    console.error(`\n中止：上传后内容不一致 ${path}`);
-    console.error(`  本地 blob ${localBlob}（${bytes.length} 字节）`);
-    console.error(`  远端 blob ${blob.sha}`);
-    console.error('文件在送入 API 的过程中被改写了；请检查本脚本是否仍按字节读取内容。');
+  if (tree.sha !== localTree) {
+    console.error(`\n中止：${short(commit)} 组装出的 tree 与本地不同，远端会拿到不一样的内容。`);
+    console.error(`  远端 tree ${tree.sha}`);
+    console.error(`  本地 tree ${localTree}`);
+    console.error('常见原因：文件内容在传输中被改写（二进制最容易被当文本处理）；');
+    console.error('或改动的文件清单不完整（新增 / 删除 / 改名的文件没被算进来）。');
     process.exit(1);
   }
 
-  entries.push({ path, mode, type: 'blob', sha: blob.sha });
-  console.log(`  ✓ ${path}  blob ${blob.sha.slice(0, 8)}  mode ${mode}`);
+  // 提交信息必须逐字节一致，否则 SHA 会对不上
+  const rawCommit = gitRaw('cat-file', 'commit', commit);
+  const message = rawCommit.slice(rawCommit.indexOf('\n\n') + 2);
+
+  const created = await api(`/repos/${OWNER}/${REPO}/git/commits`, {
+    method: 'POST',
+    body: JSON.stringify({
+      message,
+      tree: tree.sha,
+      parents: [parent],
+      author: {
+        name: git('show', '-s', '--format=%an', commit),
+        email: git('show', '-s', '--format=%ae', commit),
+        date: git('show', '-s', '--format=%aI', commit),
+      },
+      committer: {
+        name: git('show', '-s', '--format=%cn', commit),
+        email: git('show', '-s', '--format=%ce', commit),
+        date: git('show', '-s', '--format=%cI', commit),
+      },
+    }),
+  });
+
+  /*
+   * tree 已经逐字节对齐，那么 commit SHA 也必须一致（内容寻址：相同的 tree +
+   * 相同的父提交 + 相同的作者与时间 → 同一个 SHA）。对不上说明元数据有差异
+   * （作者、时间、提交信息），这时不该装作「内容相同」把它推上去。
+   */
+  if (created.sha !== commit) {
+    console.error(`\n中止：${short(commit)} 的 commit SHA 与本地不同，说明提交元数据有差异。`);
+    console.error(`  远端 ${created.sha}`);
+    console.error(`  本地 ${commit}`);
+    process.exit(1);
+  }
+
+  // 远端指针与这个提交的父提交不同 → 不是快进，必须 force
+  const needsForce = remoteTip !== parent;
+  await api(`/repos/${OWNER}/${REPO}/git/refs/heads/${BRANCH}`, {
+    method: 'PATCH',
+    body: JSON.stringify({ sha: created.sha, force: needsForce }),
+  });
+
+  remoteTip = created.sha;
+  parent = commit;
+  baseTree = localTree; // 下一个提交以这个 tree 为底（它已与远端一致）
+  console.log(`    ✓ tree 与提交 SHA 都对上了 → 远端 ${BRANCH} 现为 ${short(created.sha)}`);
 }
 
-// 2) 基于父 tree 组装新 tree
-const parentCommit = await api(`/repos/${OWNER}/${REPO}/git/commits/${PARENT}`);
-const tree = await api(`/repos/${OWNER}/${REPO}/git/trees`, {
-  method: 'POST',
-  body: JSON.stringify({ base_tree: parentCommit.tree.sha, tree: entries }),
-});
-
-const localTree = git('rev-parse', `${LOCAL_HEAD}^{tree}`);
-console.log(`\ntree  ${tree.sha}`);
-console.log(`本地  ${localTree}`);
-
-/*
- * tree 不一致 = 远端会拿到一份与本地不同的内容，**到此为止，不要发布**。
- * 以前这里只打一行「✗ 不一致」就继续推，还给一句「内容相同」的结论 ——
- * 正是那次把 4 个二进制文件传坏了却看不出来。
- */
-if (tree.sha !== localTree) {
-  console.error('\n中止：组装出的 tree 与本地提交的 tree 不同，远端会拿到不一样的内容。');
-  console.error('常见原因：文件内容在传输中被改写（二进制最容易被当文本处理）；');
-  console.error('或改动的文件清单不完整（新增 / 删除 / 改名的文件没被算进来）。');
-  process.exit(1);
-}
-console.log('  ✓ 与本地 tree 一致（内容逐字节相同）');
-
-// 3) 创建 commit。提交信息必须逐字节一致，否则 SHA 会对不上
-const rawCommit = gitRaw('cat-file', 'commit', LOCAL_HEAD);
-const message = rawCommit.slice(rawCommit.indexOf('\n\n') + 2);
-
-const commit = await api(`/repos/${OWNER}/${REPO}/git/commits`, {
-  method: 'POST',
-  body: JSON.stringify({
-    message,
-    tree: tree.sha,
-    parents: [PARENT],
-    author: { name: git('show', '-s', '--format=%an', LOCAL_HEAD), email: git('show', '-s', '--format=%ae', LOCAL_HEAD), date: git('show', '-s', '--format=%aI', LOCAL_HEAD) },
-    committer: { name: git('show', '-s', '--format=%cn', LOCAL_HEAD), email: git('show', '-s', '--format=%ce', LOCAL_HEAD), date: git('show', '-s', '--format=%cI', LOCAL_HEAD) },
-  }),
-});
-
-console.log(`\ncommit  ${commit.sha}`);
-console.log(`本地    ${LOCAL_HEAD}`);
-
-/*
- * tree 已经逐字节对齐，那么 commit SHA 也必须一致（内容寻址：相同的 tree + 相同的
- * 父提交 + 相同的作者与时间 → 同一个 SHA）。对不上说明元数据有差异（作者、时间、
- * 提交信息），这时不该装作「内容相同」把它推上去。
- */
-if (commit.sha !== LOCAL_HEAD) {
-  console.error('\n中止：commit SHA 与本地不同，说明提交元数据（作者 / 时间 / 提交信息）有差异。');
-  console.error('不发布，以免本地与远端从此分叉、以后每次推送都得先修引用。');
-  process.exit(1);
-}
-
-// 4) 移动分支指针。非 --force 时父提交校验已保证不会覆盖别人的提交
-await api(`/repos/${OWNER}/${REPO}/git/refs/heads/${BRANCH}`, {
-  method: 'PATCH',
-  body: JSON.stringify({ sha: commit.sha, force: FORCE }),
-});
-
-console.log(`\n✓ 已更新 ${OWNER}/${REPO} 的 ${BRANCH} → ${commit.sha.slice(0, 8)}（本地与远端 SHA 一致）`);
+console.log(`\n✓ 已推送 ${backlog.length} 个提交，${OWNER}/${REPO} 的 ${BRANCH} → ${short(LOCAL_HEAD)}（本地与远端 SHA 一致）`);
