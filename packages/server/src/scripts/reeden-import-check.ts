@@ -6,11 +6,14 @@
  * 里算出来的，不是照着实现反推的。
  *
  * 用法：
- *   READSYNC_DATA_DIR=./data-reeden npx tsx src/scripts/reeden-import-check.ts
+ *   READSYNC_DATA_DIR=./data-reeden REEDEN_SAMPLE=/path/to/你的/Reeden \
+ *     npx tsx src/scripts/reeden-import-check.ts
  *
- * 默认用仓库里的 examples/reeden-sample（一份实测过的真实导出）；
- * 换成自己的数据用 REEDEN_SAMPLE=/path/to/你的/Reeden。
- * 该目录**只读**：导入器不会改动它，这也是设计约束之一。
+ * 仓库里**不附带**样本（那份真实导出属于个人阅读数据，不该进公开仓库），
+ * 所以必须用 REEDEN_SAMPLE 指定。该目录**只读**：导入器不会改动它。
+ *
+ * 注意期望值（书目数、总秒数、单日秒数）是按某一份具体导出算出来的，
+ * 换一份数据要对你的导出重新算过。
  */
 import { cpSync, existsSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
 import path from 'node:path';
@@ -76,10 +79,12 @@ async function main(): Promise<void> {
   }
 
   /*
-   * 默认取仓库里的样本。从脚本自身位置往上找仓库根目录 ——
-   * 用 cwd 拼相对路径的话，在别的目录下跑就会静默找不到样本。
+   * 样本必须由调用方指定。
+   *
+   * 仓库里**不附带** Reeden 导出样本 —— 那是一份真实的阅读数据（书目、阅读时长、
+   * 划线标注），不该躺在公开仓库里。要跑这个验证，把自己 Reeden 根目录指过来即可。
    */
-  // packages/server/src/scripts → 四级回到仓库根
+  // packages/server/src/scripts → 四级回到仓库根（下面定位插件源码时要用）
   const repoRoot = path.resolve(
     path.dirname(fileURLToPath(import.meta.url)),
     '..',
@@ -87,12 +92,14 @@ async function main(): Promise<void> {
     '..',
     '..',
   );
-  const sampleDir = path.resolve(
-    process.env.REEDEN_SAMPLE ?? path.join(repoRoot, 'examples', 'reeden-sample'),
-  );
+  const sampleDir = path.resolve(process.env.REEDEN_SAMPLE ?? '');
   if (!existsSync(path.join(sampleDir, 'metadata'))) {
-    console.error(`找不到 Reeden 样本：${sampleDir}`);
-    console.error('用 REEDEN_SAMPLE=<你的 Reeden 根目录> 指定；目录里应有 metadata / book_progress / covers。');
+    console.error('需要一份 Reeden 导出才能跑这个验证。用 REEDEN_SAMPLE 指定它的根目录：');
+    console.error('  READSYNC_DATA_DIR=./data-reeden REEDEN_SAMPLE=/path/to/Reeden \\');
+    console.error('    npx tsx src/scripts/reeden-import-check.ts');
+    console.error('');
+    console.error('该目录下应有 metadata、book_progress、covers 这三样。');
+    console.error('脚本只读它，不会改动你的数据。');
     process.exit(1);
   }
 
