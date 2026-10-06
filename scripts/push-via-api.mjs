@@ -95,20 +95,36 @@ console.log(`远端 ${BRANCH}  ${remoteTip}\n`);
  * -------------------------------------------------------------------------- */
 
 /**
- * 从远端那个提交往回走，直到遇到本地也有的提交。
+ * 从远端那个提交往回走，直到遇到「本地也有、而且在 HEAD 的历史里」的提交。
  *
  * 不能直接用 `HEAD^`：积压多个提交时，远端根本没有那个对象。之所以要找到共同
  * 祖先，是因为每个提交的 tree 都要以它的父提交为底来组装，而那个父提交必须先
  * 在远端存在。
+ *
+ * **两个条件缺一不可。** 只判断「本地有没有」会踩到一种情况：一次失败的
+ * `git fetch` 会把远端那个提交的对象抓下来，于是它在本地存在、却不在我们的历史里
+ * ——那是兄弟不是祖先。把它当共同祖先，等于认为「两边是同一条线」，接着就会拿它
+ * 当新提交的父提交，SHA 必然对不上，报出来的错还会指向「提交元数据有差异」，
+ * 完全指错方向。
  */
+const isLocalAncestorOfHead = (sha) =>
+  gitOk('cat-file', '-e', `${sha}^{commit}`) && gitOk('merge-base', '--is-ancestor', sha, LOCAL_HEAD);
+
 async function findCommonAncestor() {
   let cursor = remoteTip;
   for (let hops = 0; hops < 1000; hops += 1) {
-    if (gitOk('cat-file', '-e', `${cursor}^{commit}`)) return cursor;
+    if (isLocalAncestorOfHead(cursor)) return cursor;
 
     const commit = await api(`/repos/${OWNER}/${REPO}/git/commits/${cursor}`);
-    // 线性历史，取第一个父提交即可
-    const next = commit.parents?.[0];
+    /*
+     * 线性历史，取第一个父提交即可。
+     *
+     * 注意这个端点的 parents 是**对象数组**（{ sha, url, html_url }），不是字符串
+     * 数组 —— 想当然按字符串用会把一个对象当成 SHA 拼进 URL，得到一个
+     * `git/commits/[object Object]` 的 404。两种形状都吃下。
+     */
+    const parentRef = commit.parents?.[0];
+    const next = typeof parentRef === 'string' ? parentRef : parentRef?.sha;
     if (!next) {
       throw new Error('远端历史走到了根提交，却始终没找到本地也有的那个提交 —— 两侧不像同源');
     }
