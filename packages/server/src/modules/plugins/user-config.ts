@@ -80,8 +80,12 @@ export function listUsersWithConfig(pluginId: string): number[] {
 /**
  * 用户视角下的完整配置：站点项 + 他自己填的项。
  *
- * 优先级：用户自己填的 > 清单默认值。站点配置里不会有 user 项（管理员那条写入
- * 路径会把它们过滤掉），所以不必考虑「站点填了 user 项」这种情况。
+ * 优先级：用户自己填的 > 清单默认值。
+ *
+ * **站点那份里只取 site 字段。** 看上去多此一举（管理员那条写入路径本来就丢弃
+ * user 字段），但升级上来的库里会有「历史遗留」：清单里的某项从 site 改成 user
+ * 之后，旧值仍躺在 `plugins.config` 里。若把它们一并当成默认值，管理员当年填的
+ * 网盘密码就会被发给每一个用户的导入 —— 那正是分层要避免的事。
  */
 export function resolveUserConfig(
   manifest: PluginManifest,
@@ -94,7 +98,14 @@ export function resolveUserConfig(
     .where(eq(plugins.pluginId, pluginId))
     .get();
 
-  const merged = resolvePluginConfig(manifest, (siteRow?.config as Record<string, unknown>) ?? {});
+  const siteStored = (siteRow?.config as Record<string, unknown> | undefined) ?? {};
+  const siteOnly: Record<string, unknown> = {};
+  for (const field of manifest.config) {
+    if (field.scope === 'user') continue;
+    if (siteStored[field.key] !== undefined) siteOnly[field.key] = siteStored[field.key];
+  }
+
+  const merged = resolvePluginConfig(manifest, siteOnly);
 
   const stored = storedUserConfig(pluginId, userId);
   if (Object.keys(stored).length === 0) return merged;

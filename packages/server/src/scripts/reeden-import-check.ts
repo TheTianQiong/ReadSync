@@ -524,6 +524,31 @@ async function main(): Promise<void> {
         { driver: localCfg.driver, path: localCfg.localPath },
       );
       check('S3 的密钥不会漏进别的账号的配置', localCfg.s3SecretAccessKey === undefined, localCfg.s3SecretAccessKey);
+
+      /*
+       * 升级场景：老版本把连接信息存在**站点配置**里，这些键现在是 user 归属了。
+       * 旧值不能继续当「所有人的默认值」—— 那样管理员当年填的网盘密码会被发给
+       * 每一个用户的导入。这里直接往 plugins.config 里塞一份遗留数据来复现。
+       */
+      db.update(plugins)
+        .set({
+          config: {
+            intervalMinutes: 0,
+            dailyAt: '',
+            driver: 'webdav',
+            webdavUrl: 'https://leaked.example.com/dav/',
+            webdavPassword: 'leaked-secret',
+          },
+        })
+        .where(eq(plugins.pluginId, PLUGIN_ID))
+        .run();
+
+      const afterStale = resolveUserConfig(manifestOf(), PLUGIN_ID, storageUser.id);
+      check(
+        '站点配置里遗留的旧连接信息不会当作用户默认值',
+        afterStale.webdavUrl === undefined && (afterStale.webdavPassword ?? '') === '',
+        { url: afterStale.webdavUrl, password: afterStale.webdavPassword },
+      );
     } finally {
       await s3.close();
     }

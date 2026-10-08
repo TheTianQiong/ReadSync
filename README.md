@@ -632,7 +632,7 @@ READSYNC_DATA_DIR=./data-e2e npx tsx src/scripts/smoke-e2e.ts
 # KOReader 插件的逻辑测试（25 项：每 N 页 / 每隔 N 分钟 / 仅 Wi-Fi / 菜单文案）
 npm run test:plugin
 
-# Reeden 导入的端到端验证（44 项：三种数据源 / 书目 / 进度 / 时长 / 封面 / 幂等 / 按用户配置互不串台）
+# Reeden 导入的端到端验证（45 项：三种数据源 / 书目 / 进度 / 时长 / 封面 / 幂等 / 按用户配置互不串台）
 # 需要一份 Reeden 导出：REEDEN_SAMPLE 指向它的根目录（仓库里不附带样本）
 READSYNC_DATA_DIR=./data-reeden REEDEN_SAMPLE=/path/to/Reeden \
   npx tsx src/scripts/reeden-import-check.ts
