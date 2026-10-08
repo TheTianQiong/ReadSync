@@ -30,6 +30,29 @@
  * 不是同一个地方（不同网盘、不同桶，或者干脆是本地目录），所以这里支持直接填
  * WebDAV / S3 / 本地路径，不必为了它在「存储管理」里多建一条存储条目；想复用
  * 已有存储时把 sourceMode 选成 existing 也行。
+ *
+ * ---------------------------------------------------------------------------
+ * 配置是**按用户**的
+ *
+ * 每个用户的 Reeden 放在自己的网盘上、有自己的凭据，所以连接信息、根目录、
+ * 时区这些都在清单里标了 `scope: "user"` —— 各自在「设置 → 插件」里填自己的。
+ * 插件这边只需要遍历 `ctx.usersWithConfig()`：
+ *
+ *     for (const userId of await ctx.usersWithConfig()) {
+ *       const cfg = await ctx.getUserConfig(userId);
+ *       const api = ctx.forUser(userId);
+ *       await importFor(api, cfg);
+ *     }
+ *
+ * 两条硬规矩（内核替我们兜住了，但要知道为什么）：
+ *  - **导入到哪个账号不由配置决定。** 早先这里有个「导入到哪个账号」的填写项，
+ *    那不是配置错误而是越权口子：任何用户只要填上别人的用户名，就能把数据
+ *    导进别人的账号。现在账号由内核在 `forUser(userId)` 时定死，插件的写入
+ *    入口里根本没有 user 参数。
+ *  - **每个用户自己那份配置互相不可见。** 凭据落库前加密，读出来只给对应用户
+ *    的那次导入用。
+ *
+ * `intervalMinutes` / `dailyAt` 是站点级的（管理员定全站的节奏）；其余都在用户手上。
  */
 
 import { inflateRawSync } from 'node:zlib';
@@ -311,38 +334,80 @@ function connectionFromConfig(cfg) {
 /**
  * 按配置打开读取器。
  *
- * 每次导入都重新建：管理员在后台改完连接信息就能立刻生效，不必重启服务 ——
- * 与 ctx.getConfig() 每次回库读取是同一个考虑。
+ * 每次导入都重新建：用户改完连接信息就能立刻生效，不必重启服务 ——
+ * 与 ctx.getUserConfig() 每次回库读取是同一个考虑。
+ *
+ * `storage` 是**绑定到某个用户**的那份（`ctx.forUser(userId).storage`）：
+ * 选「复用已有存储」时只能填到自己的存储，填别人的 ID 会被内核拒绝。
  */
-async function openSource(ctx, cfg) {
+async function openSource(storage, cfg) {
   if (String(cfg.sourceMode || 'connect') === 'existing') {
     const storageId = Number(cfg.storageId);
     if (!Number.isFinite(storageId) || storageId <= 0) {
       throw new Error('请填写「已有存储的 ID」（或把数据源改成「在这里填连接信息」）');
     }
-    return ctx.storage.forStorage(storageId);
+    return storage.forStorage(storageId);
   }
-  return ctx.storage.connect(connectionFromConfig(cfg));
+  return storage.connect(connectionFromConfig(cfg));
 }
 
 export async function register(ctx) {
   /**
-   * 跑一次完整导入。
+   * 跑一次完整导入（所有配置过的用户各跑一遍）。
+   *
+   * 某个用户配置有问题（网盘连不上、路径填错）时，只跳过他自己 —— 一次导入里
+   * 别人是别人的事，不该被连累。
+   */
+  async function runImport() {
+    const userIds = await ctx.usersWithConfig();
+    if (userIds.length === 0) {
+      ctx.log.info('还没有用户配置过自己的 Reeden 数据源，跳过（请在「设置 → 插件」里配置）');
+      return { users: 0, skippedUsers: 0 };
+    }
+
+    const totals = { users: 0, skippedUsers: 0, books: 0, created: 0, progress: 0, sessionRows: 0 };
+    for (const userId of userIds) {
+      try {
+        const cfg = await ctx.getUserConfig(userId);
+        const report = await runImportFor(userId, cfg);
+        totals.users += 1;
+        totals.books += report.books;
+        totals.created += report.created;
+        totals.progress += report.progress;
+        totals.sessionRows += report.sessionRows ?? 0;
+      } catch (err) {
+        totals.skippedUsers += 1;
+        ctx.log.error(`用户 #${userId} 的导入失败，已跳过该用户`, {
+          userId,
+          error: String(err?.message ?? err),
+        });
+      }
+    }
+
+    ctx.log.info(
+      `本轮导入完成：成功 ${totals.users} 个账号，跳过 ${totals.skippedUsers} 个；` +
+        `书 ${totals.books}（新登记 ${totals.created}），进度 ${totals.progress}，时长 ${totals.sessionRows} 段`,
+    );
+    return totals;
+  }
+
+  /**
+   * 单个用户的一次完整导入。
+   *
+   * `api` 是绑定到这个用户的写入入口（`ctx.forUser`），`cfg` 是他自己那份配置 ——
+   * 两者都由函数签名带进来，函数体里拿不到「别的用户」，也就不存在写错账号的可能。
    *
    * 幂等的关键：进度走服务端的 upsert（同一 document 只保留最新），
    * 时长按天替换（importSessions 先删后写）。所以重复跑不会累积。
    */
-  async function runImport() {
-    const cfg = ctx.getConfig();
-    if (!cfg.username) throw new Error('请先在插件配置里填写「导入到哪个账号」');
+  async function runImportFor(userId, cfg) {
+    const api = ctx.forUser(userId);
+    const source = await openSource(api.storage, cfg);
 
-    const source = await openSource(ctx, cfg);
-
-    // 连接信息与 Reeden 根目录都在插件配置里 —— 外部数据源的位置本来就该由它自己说
+    // 连接信息与 Reeden 根目录都在用户自己那份配置里 —— 外部数据源的位置本来就该由它自己说
     const root = asPrefix(cfg.rootPath);
     const progressDir = String(cfg.progressDir || 'book_progress').replace(/\/+$/, '');
     const offsetHours = Number.isFinite(Number(cfg.utcOffsetHours)) ? Number(cfg.utcOffsetHours) : 8;
-    const user = cfg.username;
     const platform = 'reeden';
 
     // ---- 1) metadata ----
@@ -370,11 +435,12 @@ export async function register(ctx) {
           progressFiles.set(bookId, JSON.parse(raw.toString('utf8')));
         } catch (err) {
           // 单个坏文件不该让整次导入失败
-          ctx.log.warn(`读取进度文件 ${entry.path} 失败，已跳过`, { error: String(err) });
+          ctx.log.warn(`读取进度文件 ${entry.path} 失败，已跳过`, { userId, error: String(err) });
         }
       }
     } catch (err) {
       ctx.log.warn(`目录 ${progressDir} 读不到（可能这一版 Reeden 用的是别的名字）`, {
+        userId,
         error: String(err),
       });
     }
@@ -403,8 +469,7 @@ export async function register(ctx) {
 
       let book = null;
       if (cfg.autoRegisterBooks !== false) {
-        book = await ctx.sync.ensureBook({
-          user,
+        book = await api.sync.ensureBook({
           title,
           md5: bookId,
           documentId: bookId,
@@ -425,7 +490,7 @@ export async function register(ctx) {
           }
         }
       } else {
-        book = await ctx.sync.findBook({ user, documentId: bookId });
+        book = await api.sync.findBook({ documentId: bookId });
         if (!book) {
           report.skipped += 1;
           continue;
@@ -437,8 +502,7 @@ export async function register(ctx) {
       // 进度
       const picked = pickProgress(progressFiles.get(bookId), meta);
       if (picked) {
-        const result = await ctx.sync.pushProgress({
-          user,
+        const result = await api.sync.pushProgress({
           document: bookId,
           title,
           progress: positionString(picked.position),
@@ -471,17 +535,18 @@ export async function register(ctx) {
        * 上游删掉的天要一起清掉，否则本地会留着已经不存在的数据。
        * 记着上次导入过哪些天，这次没出现的天用「空小时表」送过去即被清空。
        */
-      const imported = (await ctx.pluginData.get('importedDays')) ?? [];
+      const importedKey = `importedDays:${userId}`;
+      const imported = (await ctx.pluginData.get(importedKey)) ?? [];
       for (const day of Array.isArray(imported) ? imported : []) {
         if (!days.has(day)) days.set(day, []);
       }
 
       const payload = [...days.entries()].map(([day, hours]) => ({ day, hours }));
-      const result = await ctx.sync.importSessions({ user, platform, device: 'Reeden', days: payload });
+      const result = await api.sync.importSessions({ platform, device: 'Reeden', days: payload });
       report.sessionRows = result.inserted;
 
       await ctx.pluginData.set(
-        'importedDays',
+        importedKey,
         // 只留最近的若干天：这个列表只用来发现「上游删了哪一天」，不必永久保存
         [...days.keys()].sort().slice(-500),
       );
@@ -505,18 +570,28 @@ export async function register(ctx) {
 
           const mime = detectImageMime(raw);
           if (!mime) continue;
-          await ctx.sync.setCover({ book: job.book, mime, dataBase64: raw.toString('base64') });
+          await api.sync.setCover({ book: job.book, mime, dataBase64: raw.toString('base64') });
           report.covers += 1;
         }
       } catch (err) {
-        ctx.log.warn('读取封面失败（不影响进度与时长）', { error: String(err) });
+        ctx.log.warn('读取封面失败（不影响进度与时长）', { userId, error: String(err) });
       }
     }
 
-    await ctx.pluginData.set('lastRun', { at: new Date().toISOString(), ...report });
+    /*
+     * `lastRun:<用户id>` 是内核与插件之间的约定：用户自助页面上那句
+     * 「上次运行：… · 导入 N 条记录」就是从这里读出来渲染的。
+     */
+    await ctx.pluginData.set(`lastRun:${userId}`, {
+      at: new Date().toISOString(),
+      message: `书 ${report.books} 本（新登记 ${report.created}），进度 ${report.progress} 条，时长 ${report.sessionRows ?? 0} 段`,
+      ...report,
+    });
+
     ctx.log.info(
-      `导入完成：书 ${report.books}（新登记 ${report.created}），进度 ${report.progress}，` +
-        `时长 ${report.sessionRows ?? 0} 段，封面 ${report.covers}，跳过 ${report.skipped}`,
+      `用户 #${userId} 导入完成：书 ${report.books}（新登记 ${report.created}），` +
+        `进度 ${report.progress}，时长 ${report.sessionRows ?? 0} 段，封面 ${report.covers}，跳过 ${report.skipped}`,
+      { userId },
     );
     return report;
   }

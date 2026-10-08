@@ -26,6 +26,7 @@ import { Security } from './pages/settings/Security';
 import { Platforms } from './pages/settings/Platforms';
 import { Storages } from './pages/settings/Storages';
 import { SyncAccount } from './pages/settings/SyncAccount';
+import { PluginSettings } from './pages/settings/Plugins';
 
 /**
  * 应用根组件。
@@ -90,6 +91,7 @@ function AppRoutes(): ReactNode {
             <Route path="platforms" element={<Platforms />} />
             <Route path="storages" element={<Storages />} />
             <Route path="sync" element={<SyncAccount />} />
+            <Route path="plugins" element={<PluginSettings />} />
           </Route>
         </Route>
 

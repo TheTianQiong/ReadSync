@@ -4,7 +4,7 @@
 
 墨水屏风格界面 · 阅读数据可视化 · 多端进度同步 · 完整的 CLI 与插件体系
 
-[![Version](https://img.shields.io/badge/version-0.2.0-1a1a1a)](#版本管理)
+[![Version](https://img.shields.io/badge/version-0.3.0-1a1a1a)](#版本管理)
 [![License](https://img.shields.io/badge/license-MIT-1a1a1a)](#许可证)
 
 ---
@@ -509,6 +509,22 @@ readsync plugin install ./my-plugin.zip
 readsync plugin enable com.example.myplugin
 ```
 
+**配置可以分给用户自己填。** 清单里的配置项用 `scope` 声明归属：
+
+```json
+{
+  "config": [
+    { "key": "intervalMinutes", "label": "自动导入间隔", "type": "number", "default": 60 },
+    { "key": "webdavUrl", "label": "我的 WebDAV 地址", "type": "url", "scope": "user" }
+  ]
+}
+```
+
+`site`（默认）由管理员在后台填一次，全站共用；`user` 的那几项出现在每个用户的
+**设置 → 插件**页面上，各填各的。插件遍历 `ctx.usersWithConfig()`、用 `ctx.forUser(userId)`
+拿到的写入入口里**没有 `user` 参数** —— 数据只会进填配置的那个人自己的账号，
+用户想填别人的用户名都做不到（见 [Reeden 同步](docs/reeden-sync.md) 这个真实例子）。
+
 完整的清单字段、权限模型、钩子列表与调试技巧见 **[插件开发指南](docs/plugin-development.md)**。示例插件见 `packages/server/plugins-samples/demo-plugin/`。
 
 > 插件运行在服务端进程内。权限声明（`http`、`fs:data` 等）会真实影响注入的能力，但它**不是沙箱** —— 只安装你信任的插件。
@@ -610,13 +626,13 @@ READSYNC_DATA_DIR=./data-smoke npx tsx src/scripts/smoke-db.ts
 # 数据库迁移校验（含数据保留与外键完整性），会自建旧版库再升级
 READSYNC_DATA_DIR=./data-mig npx tsx src/scripts/check-migration.ts
 
-# 端到端集成测试（258 项断言：认证 / 2FA / 恢复码 / 上传 / 分片 / 预签名直传 / 只登记书目 / 进度关联 / 多标识 / 跨域 / 同步 / 统计 / KOSync / 权限隔离）
+# 端到端集成测试（282 项断言：认证 / 2FA / 恢复码 / 上传 / 分片 / 预签名直传 / 只登记书目 / 进度关联 / 多标识 / 跨域 / 同步 / 统计 / KOSync / 权限隔离 / 插件自助配置）
 READSYNC_DATA_DIR=./data-e2e npx tsx src/scripts/smoke-e2e.ts
 
 # KOReader 插件的逻辑测试（25 项：每 N 页 / 每隔 N 分钟 / 仅 Wi-Fi / 菜单文案）
 npm run test:plugin
 
-# Reeden 导入的端到端验证（35 项：三种数据源 / 书目 / 进度 / 时长 / 封面 / 幂等）
+# Reeden 导入的端到端验证（44 项：三种数据源 / 书目 / 进度 / 时长 / 封面 / 幂等 / 按用户配置互不串台）
 # 需要一份 Reeden 导出：REEDEN_SAMPLE 指向它的根目录（仓库里不附带样本）
 READSYNC_DATA_DIR=./data-reeden REEDEN_SAMPLE=/path/to/Reeden \
   npx tsx src/scripts/reeden-import-check.ts

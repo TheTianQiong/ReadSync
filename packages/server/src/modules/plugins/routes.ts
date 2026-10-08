@@ -2,9 +2,11 @@ import type { MultipartFile } from '@fastify/multipart';
 import type { FastifyInstance } from 'fastify';
 import {
   pluginConfigUpdateSchema,
+  userPluginConfigSchema,
   type ApiSuccess,
   type PluginConfigField,
   type PluginSummary,
+  type UserPluginSummary,
 } from '@readsync/shared';
 import { badRequest, unsupportedMediaType } from '../../errors.js';
 import { auditContextFrom, recordAudit } from '../../lib/audit.js';
@@ -20,12 +22,21 @@ import {
   uninstallPlugin,
   updatePluginConfig,
 } from './service.js';
+import {
+  clearMyPluginConfig,
+  listUserPlugins,
+  updateMyPluginConfig,
+} from './user-config.js';
 
 /**
  * 插件管理接口（前缀 /api/plugins）。
  *
- * 读接口登录即可，写接口（安装/卸载/启停/改配置）一律要求管理员：
- * 插件代码以服务进程权限运行，安装插件等价于获得服务器执行权限。
+ * 读接口登录即可，写接口分两类：
+ *  - **安装/卸载/启停/站点配置**要求管理员 —— 插件代码以服务进程权限运行，
+ *    安装插件等价于获得服务器执行权限。
+ *  - **用户自己那份配置**（`scope: 'user'` 的字段）任何登录用户都能写：
+ *    「导入我自己网盘上的阅读数据」这种事，管理员既不该代填也不一定知道。
+ *    写入只落到调用者自己的账号上，越权的事内核在 forUser 那层堵死了。
  *
  * 安装走 multipart，但注意本模块自行限制 zip 体积与解压后大小，
  * app.ts 里 2GB 的 multipart 上限是给书籍上传用的。
@@ -35,6 +46,53 @@ export async function registerPluginRoutes(app: FastifyInstance): Promise<void> 
   app.get('/api/plugins', { preHandler: requireAuth }, async () => {
     return { ok: true, data: listPlugins() } satisfies ApiSuccess<PluginSummary[]>;
   });
+
+  /**
+   * 列出「需要我自己配置」的插件。
+   *
+   * 注册在 `/api/plugins/:id` 之前只是可读性考虑，Fastify 的路由匹配优先
+   * 静态段，顺序不影响结果。
+   */
+  app.get('/api/plugins/mine', { preHandler: requireAuth }, async (req) => {
+    const user = currentUser(req);
+    return { ok: true, data: listUserPlugins(user.id) } satisfies ApiSuccess<UserPluginSummary[]>;
+  });
+
+  /** 保存我自己那份插件配置（只接受清单里 scope: 'user' 的字段） */
+  app.put<{ Params: { id: string } }>(
+    '/api/plugins/:id/my-config',
+    { preHandler: requireAuth },
+    async (req) => {
+      const input = userPluginConfigSchema.parse(req.body);
+      const user = currentUser(req);
+      const config = updateMyPluginConfig(req.params.id, user.id, input.config);
+
+      recordAudit('plugin.user_config', auditContextFrom(req), {
+        target: req.params.id,
+        // 只记字段名，配置里有网盘凭据
+        meta: { keys: Object.keys(input.config) },
+      });
+
+      return { ok: true, data: { config } } satisfies ApiSuccess<{
+        config: Record<string, unknown>;
+      }>;
+    },
+  );
+
+  /** 清空我自己那份配置：等于把这个插件从我的账号上摘掉 */
+  app.delete<{ Params: { id: string } }>(
+    '/api/plugins/:id/my-config',
+    { preHandler: requireAuth },
+    async (req) => {
+      const user = currentUser(req);
+      clearMyPluginConfig(req.params.id, user.id);
+      recordAudit('plugin.user_config', auditContextFrom(req), {
+        target: req.params.id,
+        meta: { cleared: true },
+      });
+      return { ok: true, data: { id: req.params.id } } satisfies ApiSuccess<{ id: string }>;
+    },
+  );
 
   /** 上传 zip 安装 / 覆盖升级插件 */
   app.post('/api/plugins/install', { preHandler: requireAdmin }, async (req) => {

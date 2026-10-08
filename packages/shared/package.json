@@ -1,6 +1,6 @@
 {
   "name": "@readsync/shared",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "description": "ReadSync 前后端共享的类型定义、校验 schema 与协议常量",

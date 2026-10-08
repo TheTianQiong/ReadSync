@@ -54,9 +54,17 @@ const MAX_MANIFEST_BYTES = 256 * 1024;
 /**
  * 保留的挂载路径首段。
  * 插件协议挂在 /api/plugins/{id}{mountPath}，若首段撞上管理接口
- * （config/data/enable/disable/install）会造成路由冲突，安装时直接拒绝。
+ * （config/data/enable/disable/install/mine/my-config）会造成路由冲突，安装时直接拒绝。
  */
-const RESERVED_MOUNT_SEGMENTS = new Set(['config', 'data', 'enable', 'disable', 'install']);
+const RESERVED_MOUNT_SEGMENTS = new Set([
+  'config',
+  'data',
+  'enable',
+  'disable',
+  'install',
+  'mine',
+  'my-config',
+]);
 
 /* ------------------------------ 查询 ------------------------------ */
 
@@ -70,7 +78,12 @@ export function listPlugins(): PluginSummary[] {
     .map((row) => toSummary(row));
 }
 
-/** 读取单个插件配置（脱敏） */
+/**
+ * 读取单个插件配置（脱敏）。
+ *
+ * 只返回**站点级**字段：`scope: 'user'` 的那些归每个用户自己在「设置 → 插件」里填，
+ * 管理员既不该看到也不该代填（他看到的会是自己的那份，纯属误导）。
+ */
 export function getPluginConfig(
   pluginId: string,
 ): { config: Record<string, unknown>; configFields: PluginConfigField[] } {
@@ -78,7 +91,7 @@ export function getPluginConfig(
   const manifest = requireManifest(row);
   return {
     config: maskPluginConfig(manifest, row.config ?? {}),
-    configFields: manifest.config,
+    configFields: manifest.config.filter((field) => field.scope !== 'user'),
   };
 }
 
@@ -280,9 +293,14 @@ export async function disablePlugin(pluginId: string): Promise<PluginSummary> {
 /* ------------------------------ 配置更新 ------------------------------ */
 
 /**
- * 更新插件配置。
+ * 更新插件配置（管理员那条路，只管站点级字段）。
+ *
  * 敏感字段：掩码值代表「不修改」，保留原密文而非把掩码写进库；
  * 其余敏感值用 encryptConfig 加密后落库。
+ *
+ * `scope: 'user'` 的字段在这里被丢弃：它们是每个用户各自的那一份，
+ * 管理员这份写进去不但没人用得上，还会在「用户没配过」时被当成默认值
+ * 悄悄用到所有人头上 —— 那正是分层的反面。
  */
 export async function updatePluginConfig(
   pluginId: string,
@@ -298,6 +316,10 @@ export async function updatePluginConfig(
     if (!field) {
       // 只接受清单声明的字段，避免前端误传的字段混进配置
       log.warn({ pluginId, key }, '插件配置更新忽略了清单未声明的字段');
+      continue;
+    }
+    if (field.scope === 'user') {
+      log.warn({ pluginId, key }, '插件配置更新忽略了「由用户自己填写」的字段（请到用户端配置）');
       continue;
     }
     if (isMaskedValue(value)) continue; // 保留原密文

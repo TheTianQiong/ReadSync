@@ -6,7 +6,7 @@
   "description": "最小可用示例：读取配置、写入数据目录、注册同步协议路由与生命周期钩子。",
   "homepage": "https://github.com/",
   "license": "MIT",
-  "apiVersion": ">=0.1.0 <0.3.0",
+  "apiVersion": ">=0.1.0 <0.4.0",
   "capabilities": ["sync", "metadata"],
   "main": "index.js",
   "runtime": "node",

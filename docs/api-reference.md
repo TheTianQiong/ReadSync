@@ -278,10 +278,25 @@ KOReader 算的是**采样 MD5**（12 个固定偏移各读 1KB，见 `KOREADER_
 | POST | `/api/plugins/install` | 管理员 | 上传 zip 安装 |
 | DELETE | `/api/plugins/:id` | 管理员 | 卸载 |
 | POST | `/api/plugins/:id/enable` / `disable` | 管理员 | 启用 / 停用 |
-| GET / PATCH | `/api/plugins/:id/config` | 管理员 | 读取 / 更新配置 |
+| GET / PATCH | `/api/plugins/:id/config` | 管理员 | 读取 / 更新**站点级**配置 |
 | GET | `/api/plugins/:id/data` | 管理员 | 插件键值数据 |
+| GET | `/api/plugins/mine` | 登录 | 需要**我自己**配置的插件列表 |
+| PUT / DELETE | `/api/plugins/:id/my-config` | 登录 | 保存 / 清空我自己那份配置 |
 
 插件若声明了同步协议，其路由挂载在 `/api/plugins/{pluginId}{mountPath}`。
+
+**站点级配置与用户级配置是两套**，由清单里每个配置项的 `scope` 决定（默认 `site`）。
+两条写入路径都按归属过滤：
+
+- `PATCH /api/plugins/:id/config` 忽略 `scope: "user"` 的字段（那些是每个用户各自
+  的一份，写进站点配置会变成「所有人共用的默认值」）；
+- `PUT /api/plugins/:id/my-config` 只接受 `scope: "user"` 的字段，其余键静默丢弃。
+
+配置里的 `password` 字段一律加密落库，读回来是掩码 `••••••••`；把掩码原样提交
+表示「不修改」。用户级配置按用户隔离，任何接口都不会把甲的值回给乙。
+
+`GET /api/plugins/mine` 返回的每一项可能带 `lastRun`（插件按 `lastRun:<用户id>` 键
+写在 `plugin_data` 里的上次运行结果），用户自助页面据此显示「上次运行：…」。
 
 ### 3.7 管理后台 `/api/admin`
 

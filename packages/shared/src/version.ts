@@ -7,7 +7,7 @@
  *
  * 修改版本号时只需改这里，前端通过 Vite define 注入，后端直接引用。
  */
-export const VERSION = '0.2.0';
+export const VERSION = '0.3.0';
 
 /** 产品名，用于日志横幅、OTP 发行方、邮件标题等 */
 export const APP_NAME = 'ReadSync';

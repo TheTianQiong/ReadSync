@@ -49,6 +49,7 @@ const ACTION_LABELS: Record<string, string> = {
   'plugin.enable': '启用插件',
   'plugin.disable': '停用插件',
   'plugin.uninstall': '卸载插件',
+  'plugin.user_config': '配置插件（用户自助）',
 };
 
 /**

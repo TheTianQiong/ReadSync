@@ -1,6 +1,6 @@
 {
   "name": "readsync",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "description": "读记服务器 ReadSync - 支持 WebDAV、对象存储、KOSync 等多协议的自托管阅读同步服务器",
   "type": "module",

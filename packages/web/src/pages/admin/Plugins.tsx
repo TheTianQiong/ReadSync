@@ -1,12 +1,19 @@
-import type { PluginConfigField, PluginSummary } from '@readsync/shared';
+import type { PluginSummary } from '@readsync/shared';
 import { Plug, RefreshCw, Settings2, Trash2, Upload } from 'lucide-react';
-import { useEffect, useRef, useState, type ReactNode } from 'react';
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import {
+  ConfigFieldControl,
+  collectConfig,
+  initialValues,
+  visibleFields,
+  type FieldValues,
+} from '../../components/PluginConfigFields';
 import { Alert } from '../../components/ui/Alert';
 import { Badge, StatusBadge } from '../../components/ui/Badge';
 import { Button } from '../../components/ui/Button';
-import { Card, CardBody, CardHeader } from '../../components/ui/Card';
+import { Card, CardHeader } from '../../components/ui/Card';
 import { EmptyState } from '../../components/ui/EmptyState';
-import { Field, Input, Select } from '../../components/ui/Input';
+import { Field } from '../../components/ui/Input';
 import { ConfirmDialog, Modal } from '../../components/ui/Modal';
 import { PageSpinner } from '../../components/ui/Spinner';
 import { Switch } from '../../components/ui/Switch';
@@ -244,11 +251,24 @@ function PluginConfigDialog({
   onClose: () => void;
   onSaved: () => void;
 }): ReactNode {
-  const [values, setValues] = useState<Record<string, string | boolean>>({});
+  const [values, setValues] = useState<FieldValues>({});
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const [loadedFor, setLoadedFor] = useState<string | null>(null);
+
+  /*
+   * 管理员只填站点级字段。
+   *
+   * `scope: 'user'` 的那些（网盘地址、凭据……）归每个用户在「设置 → 插件」里填：
+   * 管理员代填的话，一个插件只有一份，第二个用户根本没法用；何况那是别人网盘的
+   * 密码，本来也不该经管理员的手。
+   */
+  const fields = useMemo(
+    () => (plugin?.configFields ?? []).filter((field) => field.scope !== 'user'),
+    [plugin],
+  );
+  const userFieldCount = (plugin?.configFields ?? []).length - fields.length;
 
   useEffect(() => {
     if (!plugin) {
@@ -259,23 +279,8 @@ function PluginConfigDialog({
 
     setLoadedFor(plugin.id);
     setError(null);
-
-    // 已保存的值优先；脱敏字段（含 *）不回填，留空表示不修改
-    const next: Record<string, string | boolean> = {};
-    for (const field of plugin.configFields) {
-      const saved = plugin.config?.[field.key];
-      if (field.type === 'boolean') {
-        next[field.key] = saved === true || saved === 'true' || saved === field.default;
-        continue;
-      }
-      if (typeof saved === 'string' && saved.includes('*')) {
-        next[field.key] = '';
-        continue;
-      }
-      next[field.key] = saved === undefined || saved === null ? String(field.default ?? '') : String(saved);
-    }
-    setValues(next);
-  }, [plugin, loadedFor]);
+    setValues(initialValues(fields, plugin.config ?? {}));
+  }, [plugin, fields, loadedFor]);
 
   const handleSave = async (): Promise<void> => {
     if (!plugin) return;
@@ -283,20 +288,7 @@ function PluginConfigDialog({
     setSaving(true);
     setError(null);
     try {
-      /*
-       * 只提交当前可见的字段。
-       *
-       * 条件字段（例如选了 WebDAV 时那些 S3 的框）若一并提交，会把用户上次
-       * 填过的旧值再写回去 —— 换连接方式后配置里混着两种驱动的参数，
-       * 下次切换回去时看到的就是过期的值。
-       */
-      const config: Record<string, unknown> = {};
-      for (const field of visibleFields(plugin.configFields, values)) {
-        const value = values[field.key];
-        // 留空的可选敏感字段不提交，避免把空串写进配置
-        if (value === '' && !field.required) continue;
-        config[field.key] = field.type === 'number' ? Number(value) : value;
-      }
+      const config = collectConfig(fields, values);
       await api.patch(`/plugins/${plugin.id}/config`, { config });
       onSaved();
       onClose();
@@ -325,83 +317,39 @@ function PluginConfigDialog({
         </>
       }
     >
-      {!plugin || plugin.configFields.length === 0 ? (
+      {!plugin || (fields.length === 0 && userFieldCount === 0) ? (
         <EmptyState title="该插件没有可配置项" />
       ) : (
         <div className="flex flex-col gap-3.5">
-          {visibleFields(plugin.configFields, values).map((field) => (
-            <Field
-              key={field.key}
-              label={field.label}
-              required={field.required}
-              hint={field.description}
-            >
-              <ConfigFieldControl
-                field={field}
-                value={values[field.key]}
-                onChange={(value) => setValues((prev) => ({ ...prev, [field.key]: value }))}
-              />
-            </Field>
-          ))}
+          {userFieldCount > 0 ? (
+            <Alert tone="info">
+              这个插件有 {userFieldCount} 项需要<strong>每个用户自己填写</strong>
+              （例如各自的网盘地址与凭据），已放在「设置 → 插件」里，这里不显示。
+            </Alert>
+          ) : null}
+
+          {fields.length === 0 ? (
+            <EmptyState title="没有需要管理员配置的项" className="border-0" />
+          ) : (
+            visibleFields(fields, values).map((field) => (
+              <Field
+                key={field.key}
+                label={field.label}
+                required={field.required}
+                hint={field.description}
+              >
+                <ConfigFieldControl
+                  field={field}
+                  value={values[field.key]}
+                  onChange={(value) => setValues((prev) => ({ ...prev, [field.key]: value }))}
+                />
+              </Field>
+            ))
+          )}
 
           {error ? <Alert tone="danger">{error}</Alert> : null}
         </div>
       )}
     </Modal>
-  );
-}
-
-/**
- * 按 showWhen 挑出当前该显示的配置项。
- *
- * 「连接方式」这类配置必然需要它：选了 WebDAV 就不该看到 S3 的密钥框。
- * 没有条件显示，一个支持多驱动的插件会甩出十几个字段，大半与当前选择无关。
- */
-function visibleFields(
-  fields: PluginConfigField[],
-  values: Record<string, string | boolean>,
-): PluginConfigField[] {
-  return fields.filter((field) => {
-    if (!field.showWhen) return true;
-    const current = values[field.showWhen.key];
-    // 比较前统一成字符串：select 的值是字符串，而 showWhen 里可能写成数字或布尔
-    return String(current) === String(field.showWhen.equals);
-  });
-}
-
-function ConfigFieldControl({
-  field,
-  value,
-  onChange,
-}: {
-  field: PluginConfigField;
-  value: string | boolean | undefined;
-  onChange: (value: string | boolean) => void;
-}): ReactNode {
-  if (field.type === 'boolean') {
-    return <Switch checked={value === true} onChange={onChange} />;
-  }
-
-  if (field.type === 'select') {
-    return (
-      <Select value={String(value ?? '')} onChange={(event) => onChange(event.target.value)}>
-        <option value="">请选择</option>
-        {(field.options ?? []).map((option) => (
-          <option key={option.value} value={option.value}>
-            {option.label}
-          </option>
-        ))}
-      </Select>
-    );
-  }
-
-  return (
-    <Input
-      type={field.type === 'password' ? 'password' : field.type === 'number' ? 'number' : 'text'}
-      value={String(value ?? '')}
-      onChange={(event) => onChange(event.target.value)}
-      placeholder={field.placeholder ?? ''}
-      autoComplete={field.type === 'password' ? 'new-password' : undefined}
-    />
   );
 }

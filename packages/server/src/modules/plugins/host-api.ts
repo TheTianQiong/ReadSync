@@ -8,10 +8,11 @@ import {
   type PluginSessionImport,
   type PluginStorageConnection,
   type PluginStorageEntry,
+  type PluginUserScope,
 } from '@readsync/shared';
 import { getDb } from '../../db/index.js';
 import { books, pluginData, readingSessions, storages, users } from '../../db/schema.js';
-import { badRequest, notFound } from '../../errors.js';
+import { badRequest, forbidden, notFound } from '../../errors.js';
 import { addDocumentId, findBookByDocumentId, normalizeDocumentId } from '../library/documents.js';
 import { createBook } from '../library/service.js';
 import { saveBookCover } from '../library/cover.js';
@@ -228,15 +229,15 @@ function adapterFromConnection(connection: PluginStorageConnection): StorageAdap
   return createAdapter(driver, config);
 }
 
-export function buildStorageApi(pluginId: string, allowed: boolean) {
+export function buildStorageApi(pluginId: string, allowed: boolean, boundUserId?: number) {
   const guard = (): void => {
     if (!allowed) throw denied(pluginId, 'fs:storage', '读取存储后端');
   };
 
   /*
    * 两种取法都不接受「随便传个 storageId」：一个是插件配置里的连接参数，
-   * 另一个是管理员在「存储管理」里已经配好的存储行（归属以该行自己的
-   * ownerId 为准）。插件拿不到账号列表，也就翻不到别人的网盘。
+   * 另一个是「存储管理」里已经配好的存储行（归属以该行自己的 ownerId 为准）。
+   * 插件拿不到账号列表，也就翻不到别人的网盘。
    */
   const ownerOf = (storageId: number): number => {
     const row = getDb()
@@ -246,6 +247,24 @@ export function buildStorageApi(pluginId: string, allowed: boolean) {
       .get();
     if (!row) throw notFound(`存储 #${storageId} 不存在`);
     return row.ownerId;
+  };
+
+  /**
+   * 这次访问的存储归谁。
+   *
+   * 绑定用户（按用户跑任务）时只认那个用户自己的存储：用户在自己配置里填的
+   * 「存储 ID」不过是个数字，若不校验，A 填上 B 的存储 ID 就能读 B 的网盘。
+   */
+  const assertAccess = (storageId: number, ownerId: number, requested?: number): void => {
+    if (boundUserId !== undefined) {
+      if (ownerId !== boundUserId) {
+        throw forbidden(`存储 #${storageId} 不属于当前用户，拒绝访问`);
+      }
+      return;
+    }
+    if (requested !== undefined && ownerId !== requested) {
+      throw forbidden(`存储 #${storageId} 不属于用户 #${requested}，拒绝访问`);
+    }
   };
 
   return {
@@ -268,10 +287,16 @@ export function buildStorageApi(pluginId: string, allowed: boolean) {
       return bindReader(adapter);
     },
 
-    /** 复用「存储管理」里已配好的某条存储 */
-    async forStorage(storageId: number) {
+    /**
+     * 复用「存储管理」里已配好的某条存储。
+     *
+     * `ownerUserId` 是给**站点级**插件用的归属声明；绑定用户之后该参数不再需要
+     * （绑定本身就限定了属主），传了也只会被拿去校验。
+     */
+    async forStorage(storageId: number, ownerUserId?: number) {
       guard();
       const ownerId = ownerOf(storageId);
+      assertAccess(storageId, ownerId, ownerUserId);
       const adapter = await getAdapterForStorage(storageId, ownerId);
       return bindReader(adapter, async () => {
         const result = await browseStorage(storageId, ownerId, { prefix: '' });
@@ -288,7 +313,16 @@ export function buildStorageApi(pluginId: string, allowed: boolean) {
 
 /* --------------------------------- sync ---------------------------------- */
 
-export function buildSyncApi(pluginId: string, syncAllowed: boolean, booksAllowed: boolean) {
+/** 写入类入参：绑定用户后 `user` 就不该出现，因此内部一律按可空处理 */
+type WithOptionalUser<T extends { user: unknown }> = Omit<T, 'user'> & { user?: string | number };
+
+export function buildSyncApi(
+  pluginId: string,
+  syncAllowed: boolean,
+  booksAllowed: boolean,
+  /** 绑定到这个用户之后，写入再也不能指定别的账号（`ctx.forUser()` 用） */
+  boundUserId?: number,
+) {
   const guardSync = (): void => {
     if (!syncAllowed) throw denied(pluginId, 'sync:write', '写入阅读数据');
   };
@@ -296,14 +330,40 @@ export function buildSyncApi(pluginId: string, syncAllowed: boolean, booksAllowe
     if (!booksAllowed) throw denied(pluginId, 'books:write', '登记书目');
   };
 
+  /**
+   * 这次写入落到哪个账号。
+   *
+   * 这是「用户在自己配置里填上别人的用户名，就能把数据导进别人的账号」那道口子
+   * 的封堵点。绑定之后正常路径下插件**给不出** `user`（类型里就没有这个字段），
+   * 这里再拦一道：万一插件（多半是被改过的旧版本）传了别的用户，直接拒绝。
+   */
+  const targetUser = (user?: string | number): number => {
+    if (boundUserId === undefined) {
+      if (user === undefined || user === null || String(user).trim() === '') {
+        throw badRequest('必须指定 user（用户名或用户 id）');
+      }
+      return resolveUserId(user);
+    }
+
+    if (user !== undefined && user !== null && String(user).trim() !== '') {
+      const requested = resolveUserId(user);
+      if (requested !== boundUserId) {
+        throw forbidden(
+          `插件已绑定到用户 #${boundUserId}，不能写入其它账号（收到 #${requested}）`,
+        );
+      }
+    }
+    return boundUserId;
+  };
+
   return {
-    async pushProgress(input: PluginProgressPush): Promise<{ accepted: boolean }> {
+    async pushProgress(input: WithOptionalUser<PluginProgressPush>): Promise<{ accepted: boolean }> {
       guardSync();
       if (!/^[a-fA-F0-9]{32}$/.test(input.document)) {
         throw badRequest(`document 必须是 32 位十六进制，收到「${input.document}」`);
       }
 
-      const userId = resolveUserId(input.user);
+      const userId = targetUser(input.user);
       // 复用统一同步接口的写入逻辑：冲突判定、书目关联、冗余字段回写全都一致
       const result = upsertProgress(userId, {
         document: input.document.toLowerCase(),
@@ -322,7 +382,7 @@ export function buildSyncApi(pluginId: string, syncAllowed: boolean, booksAllowe
     },
 
     async importSessions(
-      input: PluginSessionImport,
+      input: WithOptionalUser<PluginSessionImport>,
     ): Promise<{ days: number; inserted: number }> {
       guardSync();
       if (!input.platform) throw badRequest('platform 不能为空');
@@ -330,7 +390,7 @@ export function buildSyncApi(pluginId: string, syncAllowed: boolean, booksAllowe
         throw badRequest(`一次最多导入 ${MAX_IMPORT_DAYS} 天，收到 ${input.days.length} 天`);
       }
 
-      const userId = resolveUserId(input.user);
+      const userId = targetUser(input.user);
       const db = getDb();
       const device = input.device || 'import';
       let inserted = 0;
@@ -384,18 +444,20 @@ export function buildSyncApi(pluginId: string, syncAllowed: boolean, booksAllowe
       return { days, inserted };
     },
 
-    async findBook(input: { user: string | number; documentId: string }): Promise<{ id: number } | null> {
+    async findBook(
+      input: WithOptionalUser<{ user: string | number; documentId: string }>,
+    ): Promise<{ id: number } | null> {
       guardBooks();
-      const userId = resolveUserId(input.user);
+      const userId = targetUser(input.user);
       const documentId = normalizeDocumentId(input.documentId);
       // 主标识与补充标识都要查：书可能是网页端手工登记的，也可能由导入建的
       const id = findBookByDocumentId(userId, documentId);
       return id === null ? null : { id };
     },
 
-    async ensureBook(input: PluginBookInput): Promise<{ id: number; created: boolean }> {
+    async ensureBook(input: WithOptionalUser<PluginBookInput>): Promise<{ id: number; created: boolean }> {
       guardBooks();
-      const userId = resolveUserId(input.user);
+      const userId = targetUser(input.user);
       const md5 = input.md5.toLowerCase();
       if (!/^[a-f0-9]{32}$/.test(md5)) {
         throw badRequest(`md5 必须是 32 位十六进制，收到「${input.md5}」`);
@@ -450,9 +512,37 @@ export function buildSyncApi(pluginId: string, syncAllowed: boolean, booksAllowe
 
     async setCover(input: { book: number; mime: string; dataBase64: string }): Promise<void> {
       guardBooks();
-      const row = getDb().select({ id: books.id }).from(books).where(eq(books.id, input.book)).get();
+      const row = getDb()
+        .select({ id: books.id, ownerId: books.ownerId })
+        .from(books)
+        .where(eq(books.id, input.book))
+        .get();
       if (!row) throw notFound(`书籍 #${input.book} 不存在`);
+      // 封面挂在书上行上，所以这里也得按属主把关：绑定用户后不能给别人的书写封面
+      if (boundUserId !== undefined && row.ownerId !== boundUserId) {
+        throw forbidden(`书籍 #${input.book} 不属于当前用户，拒绝写入封面`);
+      }
       saveBookCover(input.book, input.mime, input.dataBase64, new Date());
     },
+  };
+}
+
+/* ---------------------------- 绑定到某个用户 ---------------------------- */
+
+/**
+ * 构造 `ctx.forUser(userId)`：把写入入口固定到这个账号上。
+ *
+ * 权限仍按清单授予（未声明 sync:write 的插件绑定后照样写不了），
+ * 只是「写给谁」不再由插件决定。
+ */
+export function buildUserScope(
+  pluginId: string,
+  userId: number,
+  permissions: { syncWrite: boolean; booksWrite: boolean; fsStorage: boolean },
+): PluginUserScope {
+  return {
+    userId,
+    sync: buildSyncApi(pluginId, permissions.syncWrite, permissions.booksWrite, userId),
+    storage: buildStorageApi(pluginId, permissions.fsStorage, userId),
   };
 }

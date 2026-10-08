@@ -11,13 +11,15 @@
 import { createHash, publicEncrypt, constants, randomUUID } from 'node:crypto';
 import { and, eq } from 'drizzle-orm';
 import { OTP } from 'otplib';
+import AdmZip from 'adm-zip';
 import { mkdirSync, rmSync } from 'node:fs';
 import type { FastifyInstance } from 'fastify';
 import { buildApp } from '../app.js';
 import { loadConfig } from '../config.js';
 import { ensureKeyPair } from '../crypto/keys.js';
 import { closeDatabase, getDb, openDatabase } from '../db/index.js';
-import { emailCodes, users } from '../db/schema.js';
+import { emailCodes, pluginUserConfig, users } from '../db/schema.js';
+import { buildStorageApi, buildSyncApi } from '../modules/plugins/host-api.js';
 import { sha256Hex } from '../crypto/password.js';
 import { computeKoreaderDocumentId } from '@readsync/shared';
 import { koreaderDocumentIdFromStorage } from '../lib/document-id.js';
@@ -63,6 +65,21 @@ function encryptPassword(password: string, publicKeyPem: string): string {
     { key: publicKeyPem, padding: constants.RSA_PKCS1_OAEP_PADDING, oaepHash: 'sha256' },
     Buffer.from(password, 'utf8'),
   ).toString('base64');
+}
+
+/**
+ * 跑一个应当抛错的异步操作，把错误信息拿回来。
+ *
+ * 用于「越权写入必须被拒绝」这类断言：只断言「没抛错」是不够的，
+ * 还得看清拒绝的理由，否则一个无关的报错也能让测试变绿。
+ */
+async function rejectsWith(fn: () => Promise<unknown>): Promise<string | null> {
+  try {
+    await fn();
+    return null;
+  } catch (err) {
+    return err instanceof Error ? err.message : String(err);
+  }
 }
 
 /** 手工构造 multipart/form-data 请求体 */
@@ -2117,6 +2134,237 @@ async function main(): Promise<void> {
       },
     });
     check('关闭注册后新用户注册被拒', regBlocked.statusCode === 403, regBlocked.body);
+
+    /* ------------------- 10b. 插件：用户自助配置 ------------------- */
+    section('10b. 插件：用户自助配置与越权防线');
+    {
+      /*
+       * 装一个「有用户级字段」的最小插件。
+       * 真插件（Reeden 同步）另有一份端到端验证；这里要验的是**接口层**：
+       * 谁配得了、配的东西谁看得见、以及写不进别人的账号。
+       */
+      const PLUGIN_ID = 'com.readsync.test-userconfig';
+      const normalUserId = getDb()
+        .select({ id: users.id })
+        .from(users)
+        .where(eq(users.username, 'normaluser'))
+        .get()!.id;
+      const testManifest = {
+        id: PLUGIN_ID,
+        name: '自助配置测试插件',
+        version: '1.0.0',
+        apiVersion: '>=0.3.0 <0.4.0',
+        capabilities: ['metadata'],
+        permissions: [],
+        config: [
+          { key: 'siteInterval', label: '站点间隔', type: 'number', default: 0 },
+          { key: 'personalUrl', label: '我的地址', type: 'url', scope: 'user' },
+          { key: 'personalSecret', label: '我的密钥', type: 'password', scope: 'user' },
+        ],
+      };
+      const testZip = new AdmZip();
+      testZip.addFile('plugin.json', Buffer.from(JSON.stringify(testManifest), 'utf8'));
+      testZip.addFile('index.js', Buffer.from('export function register() {}\n', 'utf8'));
+
+      const zipPart = buildMultipart(
+        {},
+        {
+          field: 'file',
+          filename: 'userconfig-plugin.zip',
+          content: testZip.toBuffer(),
+          contentType: 'application/zip',
+        },
+      );
+      const installed = await api({
+        method: 'POST',
+        url: '/api/plugins/install',
+        headers: { ...auth, 'content-type': zipPart.contentType },
+        payload: zipPart.body,
+      });
+      check(
+        '上传安装测试插件成功',
+        installed.statusCode === 200 && installed.json().data?.status === 'enabled',
+        installed.body,
+      );
+
+      const anonMine = await api({ method: 'GET', url: '/api/plugins/mine' });
+      check('未登录读取自助插件列表返回 401', anonMine.statusCode === 401, anonMine.statusCode);
+
+      const mineAsUser = await api({ method: 'GET', url: '/api/plugins/mine', headers: userAuth });
+      const entry = (mineAsUser.json().data ?? []).find(
+        (item: { id: string }) => item.id === PLUGIN_ID,
+      ) as
+        | { configFields: Array<{ key: string; scope: string }>; configured: boolean; config: Record<string, unknown> }
+        | undefined;
+      check('用户端能看到需要自己配置的插件', entry !== undefined, mineAsUser.body);
+      check(
+        '用户端只拿到 user 归属的字段',
+        entry?.configFields.length === 2 && entry.configFields.every((f) => f.scope === 'user'),
+        entry?.configFields,
+      );
+      check('还没配过时标记为未配置', entry?.configured === false, entry);
+
+      const saved = await api({
+        method: 'PUT',
+        url: `/api/plugins/${PLUGIN_ID}/my-config`,
+        headers: userAuth,
+        payload: {
+          config: { personalUrl: 'https://dav.example.com/dav/', personalSecret: 'my-secret-token' },
+        },
+      });
+      check('普通用户可保存自己的插件配置', saved.statusCode === 200, saved.body);
+      check(
+        '密钥回显为掩码（不是明文）',
+        /^[•*]+$/.test(String(saved.json().data?.config?.personalSecret)),
+        saved.json().data?.config,
+      );
+
+      const mineAgain = await api({ method: 'GET', url: '/api/plugins/mine', headers: userAuth });
+      const mineAfter = (mineAgain.json().data ?? []).find(
+        (item: { id: string }) => item.id === PLUGIN_ID,
+      ) as { configured: boolean; config: Record<string, unknown> } | undefined;
+      check('用户自己能读到已保存的配置', mineAfter?.configured === true, mineAfter);
+      check(
+        '地址原样回显',
+        mineAfter?.config?.personalUrl === 'https://dav.example.com/dav/',
+        mineAfter?.config,
+      );
+
+      /*
+       * 隔离：管理员读同一个插件，看到的是**他自己**那份（空）。
+       * 若这里能读到刚才那个用户的地址与密钥，分层就没有任何意义。
+       */
+      const mineAsAdmin = await api({ method: 'GET', url: '/api/plugins/mine', headers: auth });
+      const adminEntry = (mineAsAdmin.json().data ?? []).find(
+        (item: { id: string }) => item.id === PLUGIN_ID,
+      ) as { configured: boolean; config: Record<string, unknown> } | undefined;
+      check(
+        '别的用户的配置在管理员那里也看不到',
+        adminEntry?.configured === false && adminEntry?.config?.personalUrl === undefined,
+        adminEntry,
+      );
+
+      /*
+       * 两条写入路径都要按归属过滤，方向相反：
+       *  - 用户那条只认 user 字段（否则谁都能改全站的导入节奏）；
+       *  - 管理员那条只认 site 字段（user 字段写进站点配置就会变成「所有人
+       *    共用的默认值」，正好是分层的反面）。
+       *
+       * 管理员先给站点字段设一个值，下面用「用户改完之后它还是不是这个值」
+       * 来判断用户到底改没改得动。
+       */
+      const adminPatch = await api({
+        method: 'PATCH',
+        url: `/api/plugins/${PLUGIN_ID}/config`,
+        headers: auth,
+        payload: { config: { siteInterval: 3, personalUrl: 'https://site-wide.example.com/' } },
+      });
+      check(
+        '管理员可以设置站点级字段',
+        adminPatch.json().data?.config?.siteInterval === 3,
+        adminPatch.body,
+      );
+      check(
+        '管理员提交 user 归属字段会被丢弃',
+        adminPatch.json().data?.config?.personalUrl === undefined,
+        adminPatch.json().data?.config,
+      );
+
+      const sneaky = await api({
+        method: 'PUT',
+        url: `/api/plugins/${PLUGIN_ID}/my-config`,
+        headers: userAuth,
+        payload: { config: { siteInterval: 5, personalUrl: 'https://dav.example.com/dav/' } },
+      });
+      check('提交站点级字段不报错但被忽略', sneaky.statusCode === 200, sneaky.body);
+
+      // 直接看库：站点字段连存都不该存进用户那份（只在接口层看不见是不够的）
+      const userConfigRow = getDb()
+        .select()
+        .from(pluginUserConfig)
+        .where(
+          and(
+            eq(pluginUserConfig.pluginId, PLUGIN_ID),
+            eq(pluginUserConfig.userId, normalUserId),
+          ),
+        )
+        .get();
+      check(
+        '站点级字段没有落进用户那份配置',
+        userConfigRow?.config?.siteInterval === undefined,
+        userConfigRow?.config,
+      );
+
+      const cfgAsAdmin = await api({
+        method: 'GET',
+        url: `/api/plugins/${PLUGIN_ID}/config`,
+        headers: auth,
+      });
+      check(
+        '站点配置没有被用户改动',
+        cfgAsAdmin.json().data?.config?.siteInterval === 3,
+        cfgAsAdmin.json().data?.config,
+      );
+      check(
+        '管理员配置接口不返回 user 字段',
+        (cfgAsAdmin.json().data?.configFields ?? []).every(
+          (f: { scope: string }) => f.scope !== 'user',
+        ),
+        cfgAsAdmin.json().data?.configFields,
+      );
+
+      const cleared = await api({
+        method: 'DELETE',
+        url: `/api/plugins/${PLUGIN_ID}/my-config`,
+        headers: userAuth,
+      });
+      check('用户可以清空自己的配置', cleared.statusCode === 200, cleared.body);
+      const afterClear = await api({ method: 'GET', url: '/api/plugins/mine', headers: userAuth });
+      check(
+        '清空后回到未配置',
+        (afterClear.json().data ?? []).find((item: { id: string }) => item.id === PLUGIN_ID)
+          ?.configured === false,
+      );
+
+      const missing = await api({
+        method: 'PUT',
+        url: '/api/plugins/com.example.nonexistent/my-config',
+        headers: userAuth,
+        payload: { config: { personalUrl: 'https://x.example.com/' } },
+      });
+      check('给不存在的插件存配置返回 404', missing.statusCode === 404, missing.statusCode);
+
+      /*
+       * 越权写入的封堵点。
+       *
+       * 绑定到某个用户之后，写入入口里**根本没有 user 参数**；万一（比如一个
+       * 被改过的旧版插件）硬塞了别人，必须被拒绝。这里直接调内核那一层，
+       * 是因为要验的正是这道防线本身 —— 界面与插件都绕不过它。
+       */
+      const boundSync = buildSyncApi(PLUGIN_ID, true, true, normalUserId);
+
+      const crossWrite = await rejectsWith(
+        () => boundSync.pushProgress({ user: 'admin', document: 'a'.repeat(32), percentage: 0.5 }),
+      );
+      check('绑定用户后写入别人的账号被拒绝', /不能写入其它账号/.test(crossWrite ?? ''), crossWrite);
+
+      const ownWrite = await rejectsWith(() =>
+        boundSync.pushProgress({ document: 'b'.repeat(32), percentage: 0.5 }),
+      );
+      check('绑定用户后不带 user 的写入正常', ownWrite === null, ownWrite);
+
+      const boundStorage = buildStorageApi(PLUGIN_ID, true, normalUserId);
+      const stolen = await rejectsWith(() => boundStorage.forStorage(storageId));
+      check('用户引用别人的存储被拒绝', /不属于当前用户/.test(stolen ?? ''), stolen);
+
+      const siteStorage = buildStorageApi(PLUGIN_ID, true);
+      const mismatch = await rejectsWith(() => siteStorage.forStorage(storageId, normalUserId));
+      check('站点级接口传错归属同样被拒', /不属于用户/.test(mismatch ?? ''), mismatch);
+
+      // 卸载，别把测试插件留给后面的段落
+      const removed = await api({ method: 'DELETE', url: `/api/plugins/${PLUGIN_ID}`, headers: auth });
+      check('测试插件可以卸载', removed.statusCode === 200, removed.body);
+    }
 
     /* ---------------------------- 11. 错误信封 ---------------------------- */
     section('11. 错误响应格式');

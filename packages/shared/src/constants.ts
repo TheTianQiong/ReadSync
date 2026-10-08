@@ -164,6 +164,7 @@ export const AUDIT_ACTIONS = [
   'plugin.enable',
   'plugin.disable',
   'plugin.uninstall',
+  'plugin.user_config',
 ] as const;
 export type AuditAction = (typeof AUDIT_ACTIONS)[number];
 

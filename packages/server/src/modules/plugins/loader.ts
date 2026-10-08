@@ -20,7 +20,8 @@ import { http } from '../../lib/http.js';
 import { getModuleLogger } from '../../logger.js';
 import { assertApiVersionCompatible, isPathInside, safeParseManifest } from './internal.js';
 import { resolvePluginConfig } from './plugin-config.js';
-import { buildPluginDataApi, buildStorageApi, buildSyncApi } from './host-api.js';
+import { buildPluginDataApi, buildStorageApi, buildSyncApi, buildUserScope } from './host-api.js';
+import { listUsersWithConfig, requireActiveUser, resolveUserConfig } from './user-config.js';
 
 /**
  * 插件运行时（加载 / 卸载 / 钩子 / 路由挂载）。
@@ -353,6 +354,21 @@ function createLoadedPlugin(
     // 先占位，下面用带警告的 getter 覆盖
     dataDir: '',
     fetch: buildFetch(pluginId, permissions.has('http')),
+    /*
+     * 按用户配置那一组。
+     *
+     * 「哪些用户配过」和「某个用户的配置」都由内核从库里读，插件拿不到密码之外的
+     * 任何账号信息；而写入落到谁头上由 forUser 绑死，插件一句话也改不了。
+     */
+    usersWithConfig: async (): Promise<number[]> => listUsersWithConfig(pluginId),
+    getUserConfig: async <T = Record<string, unknown>>(userId: number): Promise<T> =>
+      resolveUserConfig(manifest, pluginId, requireActiveUser(userId)) as T,
+    forUser: (userId: number) =>
+      buildUserScope(pluginId, requireActiveUser(userId), {
+        syncWrite: permissions.has('sync:write'),
+        booksWrite: permissions.has('books:write'),
+        fsStorage: permissions.has('fs:storage'),
+      }),
     registerStorageDriver: (driverId: string, factory: unknown) => {
       registerStorageDriver(loaded, driverId, factory);
     },

@@ -577,6 +577,35 @@ export const pluginData = sqliteTable(
   (t) => [uniqueIndex('plugin_data_unique').on(t.pluginId, t.key)],
 );
 
+/**
+ * 插件配置里「归用户自己填」的那部分（清单中 scope: 'user' 的字段）。
+ *
+ * 为什么单独一张表：这些配置属于个人 —— 自己的网盘地址与凭据、自己要不要导入。
+ * 放在插件的站点配置里，意味着管理员得替所有人保管凭据，而且一个插件只能配一份。
+ * 拆出来之后，用户能在「设置 → 插件」里自助填写，各管各的。
+ *
+ * 敏感字段与站点配置用同一套加密（见 plugin-config.ts）。
+ */
+export const pluginUserConfig = sqliteTable(
+  'plugin_user_config',
+  {
+    id: integer('id').primaryKey({ autoIncrement: true }),
+    pluginId: text('plugin_id').notNull(),
+    userId: integer('user_id')
+      .notNull()
+      .references(() => users.id, { onDelete: 'cascade' }),
+    /** 该用户填的内容（敏感字段为密文） */
+    config: text('config', { mode: 'json' }).$type<Record<string, unknown>>(),
+    updatedAt: integer('updated_at', { mode: 'timestamp_ms' })
+      .notNull()
+      .default(sql`(unixepoch() * 1000)`),
+  },
+  (t) => [
+    uniqueIndex('plugin_user_config_unique').on(t.pluginId, t.userId),
+    index('plugin_user_config_user_idx').on(t.userId),
+  ],
+);
+
 /** 审计日志 */
 export const auditLogs = sqliteTable(
   'audit_logs',

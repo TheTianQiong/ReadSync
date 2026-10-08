@@ -1,4 +1,4 @@
-import { Cloud, KeyRound, Link2, MonitorSmartphone, UserCog } from 'lucide-react';
+import { Cloud, KeyRound, Link2, MonitorSmartphone, Plug, UserCog } from 'lucide-react';
 import type { ReactNode } from 'react';
 import { NavLink, Outlet } from 'react-router-dom';
 import { cn } from '../lib/utils';
@@ -15,6 +15,7 @@ const SECTIONS = [
   { to: 'platforms', label: '阅读平台', description: '管理用于统计的平台标识', icon: MonitorSmartphone },
   { to: 'storages', label: '存储管理', description: 'WebDAV、对象存储、本地目录', icon: Cloud },
   { to: 'sync', label: '同步账号', description: 'KOSync 与接入令牌', icon: Link2 },
+  { to: 'plugins', label: '插件配置', description: '需要你自己填写的插件', icon: Plug },
 ] as const;
 
 export function Settings(): ReactNode {

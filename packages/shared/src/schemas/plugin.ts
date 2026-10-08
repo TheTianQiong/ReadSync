@@ -22,6 +22,18 @@ export const pluginConfigFieldSchema = z.object({
   key: z.string().min(1),
   label: z.string().min(1),
   type: z.enum(['string', 'password', 'number', 'boolean', 'select', 'url']),
+  /**
+   * 这一项由谁填。
+   *
+   *  - `site`（默认）：管理员在后台填一次，全站共用 —— 适合「多久跑一次」这类
+   *    站点级节奏。
+   *  - `user`：**每个用户填自己的那份**（在「设置 → 插件」里）—— 适合「你自己的
+   *    网盘地址与凭据」这类只属于个人、且管理员不该代管的配置。
+   *
+   * 一个插件只要有 user 项，它就会出现在用户的自助页面里，内核也会提供
+   * `ctx.usersWithConfig()` 让它按用户逐个跑。
+   */
+  scope: z.enum(['site', 'user']).default('site'),
   required: z.boolean().default(false),
   default: z.unknown().optional(),
   placeholder: z.string().optional(),
@@ -63,7 +75,7 @@ export const pluginManifestSchema = z.object({
   license: z.string().max(32).optional(),
 
   /**
-   * 兼容的 ReadSync 主版本范围（语义化版本 range），例如 ">=0.2.0 <0.3.0"。
+   * 兼容的 ReadSync 主版本范围（语义化版本 range），例如 ">=0.3.0 <0.4.0"。
    * 服务端在安装与加载时都会校验，避免插件与内核 API 不匹配。
    */
   apiVersion: z.string().min(1),
@@ -194,8 +206,40 @@ export interface PluginContext {
     warn(msg: string, meta?: Record<string, unknown>): void;
     error(msg: string, meta?: Record<string, unknown>): void;
   };
-  /** 读取插件配置 */
+  /** 读取插件配置（站点级那一份） */
   getConfig<T = Record<string, unknown>>(): T;
+  /**
+   * 哪些用户填了自己的那份配置（按用户跑任务的插件用它遍历）。
+   *
+   * 只包含**已经保存过**配置的用户：没人配过就不该去打扰他们。
+   */
+  usersWithConfig(): Promise<number[]>;
+  /**
+   * 某个用户视角下的完整配置：站点项 + 他自己的项（他自己的覆盖站点默认）。
+   *
+   * 目标账号**不由配置决定** —— 导入到哪个账号由内核给出 userId，插件只能
+   * 把数据写进那个人的账号。否则用户只要在自己配置里填上别人的用户名，
+   * 就能把数据导进别人的账号。
+   */
+  getUserConfig<T = Record<string, unknown>>(userId: number): Promise<T>;
+  /**
+   * 把宿主能力绑定到某个用户身上，返回一份「写不了别人账号」的入口。
+   *
+   * 按用户跑任务的插件应该用它，而不是用 `ctx.sync`：
+   *
+   * ```js
+   * for (const userId of await ctx.usersWithConfig()) {
+   *   const cfg = await ctx.getUserConfig(userId);
+   *   const user = ctx.forUser(userId);
+   *   await user.sync.importSessions({ platform: 'reeden', device: 'reeden', days });
+   * }
+   * ```
+   *
+   * 两处收紧：
+   *  - `user.sync` 的方法**没有 `user` 参数**，目标账号在绑定时就定死了；
+   *  - `user.storage.forStorage()` 只允许访问该用户自己的存储。
+   */
+  forUser(userId: number): PluginUserScope;
   /** 插件专属数据目录的绝对路径（仅当声明 fs:data 权限时可用） */
   dataDir: string;
   /** 发起 HTTP 请求（仅当声明 http 权限时可用） */
@@ -227,14 +271,16 @@ export interface PluginContext {
    *  - `connect()`：用插件自己声明的连接参数。**外部数据源用这个** ——
    *    Reeden 的同步目录、别的阅读器的数据目录，往往与「书籍文件存储」
    *    根本不是同一个位置，不该逼着用户为它建一条存储条目。
-   *  - `forStorage()`：复用「存储管理」里已配好的某条存储。
+   *  - `forStorage()`：复用「存储管理」里已配好的某条存储。传了 ownerUserId
+   *    时只允许访问**那个用户自己的**存储 —— 按用户跑任务的插件必须传它，
+   *    否则用户 A 只要在自己的配置里填上 B 的存储 ID，就能读到 B 的网盘。
    *
-   * 参数里的连接信息由管理员在插件配置里填写（plugin.json 声明成 password
-   * 类型即可加密落库），插件自己拿不到账号列表，也就翻不到别人的网盘。
+   * 连接信息要么来自管理员填的站点配置，要么来自用户自己填的那份，
+   * 插件自己拿不到账号列表，也就翻不到别人的网盘。
    */
   storage: {
     connect(connection: PluginStorageConnection): Promise<PluginStorageReader>;
-    forStorage(storageId: number): Promise<PluginStorageReader>;
+    forStorage(storageId: number, ownerUserId?: number): Promise<PluginStorageReader>;
   };
 
   /**
@@ -355,6 +401,41 @@ export interface PluginBookInput {
   description?: string;
 }
 
+/* ---------------------------- 按用户绑定的入口 ---------------------------- */
+
+/**
+ * 绑定到某个用户之后的写入入口。
+ *
+ * 与 `ctx.sync` 唯一的区别：**没有 `user` 参数**。目标账号在绑定时就定死了，
+ * 插件连「指定别的账号」这个动作都表达不出来 —— 这比运行时校验更可靠，
+ * 因为漏掉一次校验就是一个越权写入。
+ */
+export interface PluginUserSyncApi {
+  /** 推送一条进度；与 PUT /api/sync/progress 同语义 */
+  pushProgress(input: Omit<PluginProgressPush, 'user'>): Promise<{ accepted: boolean }>;
+  /** 按天替换阅读会话（只动这个账号在 platform 下的这些天） */
+  importSessions(input: Omit<PluginSessionImport, 'user'>): Promise<{ days: number; inserted: number }>;
+  /** 登记一本没有文件的书 */
+  ensureBook(input: Omit<PluginBookInput, 'user'>): Promise<{ id: number; created: boolean }>;
+  /** 按文档标识查书；查不到返回 null */
+  findBook(input: { documentId: string }): Promise<{ id: number } | null>;
+  /** 给书籍写封面 */
+  setCover(input: { book: number; mime: string; dataBase64: string }): Promise<void>;
+}
+
+/** 绑定到某个用户之后的存储入口：只允许访问他自己的存储 */
+export interface PluginUserStorageApi {
+  connect(connection: PluginStorageConnection): Promise<PluginStorageReader>;
+  forStorage(storageId: number): Promise<PluginStorageReader>;
+}
+
+/** `ctx.forUser(userId)` 的返回值 */
+export interface PluginUserScope {
+  readonly userId: number;
+  readonly sync: PluginUserSyncApi;
+  readonly storage: PluginUserStorageApi;
+}
+
 /** 插件入口模块的约定导出 */
 export interface PluginModule {
   /** 插件激活入口，宿主在加载时调用一次 */
@@ -362,3 +443,33 @@ export interface PluginModule {
   /** 可选：停用时的清理逻辑 */
   unregister?(): void | Promise<void>;
 }
+
+/* ---------------------------- 用户自助配置 ---------------------------- */
+
+/** 用户视角下的一个插件：只有它声明为 user 归属的字段 */
+export interface UserPluginSummary {
+  id: string;
+  name: string;
+  version: string;
+  description: string | null;
+  /** 需要用户自己填的配置项（scope: 'user'） */
+  configFields: PluginConfigField[];
+  /** 该用户已保存的值（敏感字段脱敏） */
+  config: Record<string, unknown>;
+  /** 是否已经配过（没配过时用户端应当显示「还没配置」而不是空表单） */
+  configured: boolean;
+  /**
+   * 上次运行的记录，由插件自己写进 pluginData。
+   *
+   * 约定：插件把每个用户的上次运行结果写进 `ctx.pluginData.set('lastRun:<用户id>', …)`，
+   * 内核会自动读出来显示在自助页面上 —— 用户配完之后最想知道的就是
+   * 「它到底跑没跑、导进来多少」，这句话只能由插件说。
+   */
+  lastRun?: unknown;
+}
+
+/** 保存用户自己的那份插件配置 */
+export const userPluginConfigSchema = z.object({
+  config: z.record(z.string(), z.unknown()),
+});
+export type UserPluginConfigInput = z.infer<typeof userPluginConfigSchema>;

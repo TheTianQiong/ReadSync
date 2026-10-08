@@ -33,7 +33,7 @@ my-plugin.zip
   "version": "1.0.0",
   "author": "你的名字",
   "description": "一个演示插件",
-  "apiVersion": ">=0.2.0 <0.3.0",
+  "apiVersion": ">=0.3.0 <0.4.0",
   "capabilities": ["notification"],
   "main": "index.js",
   "permissions": ["log"],
@@ -100,7 +100,7 @@ readsync plugin enable com.example.hello
 | `id` | string | ✅ | 唯一标识，小写字母/数字/`.`/`_`/`-`，建议反向域名风格 |
 | `name` | string | ✅ | 显示名称 |
 | `version` | string | ✅ | 语义化版本，如 `1.0.0` |
-| `apiVersion` | string | ✅ | 兼容的内核版本范围，如 `">=0.2.0 <0.3.0"`。不匹配时内核拒绝加载 |
+| `apiVersion` | string | ✅ | 兼容的内核版本范围，如 `">=0.3.0 <0.4.0"`。不匹配时内核拒绝加载 |
 | `capabilities` | string[] | ✅ | 声明能力，见下节 |
 | `main` | string | | 入口文件，默认 `index.js` |
 | `runtime` | string | | 目前只支持 `node` |
@@ -145,6 +145,7 @@ readsync plugin enable com.example.hello
   "key": "serverUrl",
   "label": "服务器地址",
   "type": "url",
+  "scope": "site",
   "required": true,
   "default": "https://example.com",
   "placeholder": "https://...",
@@ -162,6 +163,22 @@ readsync plugin enable com.example.hello
   插件必备：选了 WebDAV 就不该看到 S3 的密钥框，否则一个插件会甩出十几个字段，
   大半与当前选择无关。表单保存时也只提交当前可见的字段，不会把上一个选项的旧值
   一起写回去。
+
+#### scope：这一项由谁填
+
+`scope` 决定这一项归谁配置，默认 `"site"`：
+
+| 取值 | 谁填 | 出现在哪 | 什么时候用 |
+|---|---|---|---|
+| `site`（默认） | 管理员，全站一份 | 管理后台 → 插件 → 配置 | 「多久跑一次」「每日补同步时间」这类全站节奏 |
+| `user` | **每个用户填自己的** | 设置 → 插件 | 「你自己的网盘地址与凭据」这类只属于个人、管理员也不该代管的配置 |
+
+只要清单里有 user 项，这个插件就会出现在每个用户的「设置 → 插件」页面上，内核也会
+把两把钥匙交给插件（见 §4.5）。两个方向都会过滤：管理员那条写入路径丢弃 user 字段，
+用户那条只接受 user 字段。
+
+判断标准很简单：**这个值会不会因人而异？** 会，就该是 `user` —— 否则一个插件只有
+一份配置，第二个用户要么用不了，要么得把自己的网盘密码交给管理员。
 
 ---
 
@@ -183,6 +200,9 @@ readsync plugin enable com.example.hello
 | `ctx.storage` | 读取存储后端：`connect()` 用插件自己的连接 / `forStorage()` 复用已有存储（需 `fs:storage` 权限） |
 | `ctx.sync` | 写入进度/会话、登记书目、写封面（需 `sync:write` / `books:write`） |
 | `ctx.schedule(name, minutes, fn)` | 注册周期任务（`minutes` 为 0 表示只手动触发） |
+| `ctx.usersWithConfig()` | 哪些用户填了自己的那份配置（清单里有 user 项时用） |
+| `ctx.getUserConfig<T>(userId)` | 某个用户视角下的完整配置：站点项 + 他自己那份 |
+| `ctx.forUser(userId)` | 把写入入口绑到这个账号上（见 §4.5） |
 
 ### 4.1 插件专属 KV
 
@@ -257,9 +277,60 @@ ctx.schedule('manual-only', 0, async () => { /* 只在 plugin:run 时执行 */ }
 readsync plugin:run <插件ID> [任务名]
 ```
 
----
+### 4.5 按用户配置（scope: "user"）
 
-## 五、生命周期钩子
+清单里有 user 项的插件，通常是这样跑的：遍历「配过的人」，逐个读他的配置、逐个导入。
+
+```js
+for (const userId of await ctx.usersWithConfig()) {
+  const cfg = await ctx.getUserConfig(userId);   // 站点项 + 他自己填的项
+  const user = ctx.forUser(userId);              // 写入入口绑在这个账号上
+
+  const src = await user.storage.connect({ driver: 'webdav', config: { ... } });
+  await user.sync.ensureBook({ title: '书名', md5, documentId });
+  await user.sync.importSessions({ platform: 'myapp', device: 'X', days });
+}
+```
+
+三条要点：
+
+1. **`ctx.usersWithConfig()` 只包含已经保存过配置的用户**（且账号处于启用状态）。
+   没人配过就什么都没发生 —— 不该去打扰没配置的人，更不该拿一份「默认配置」代跑。
+
+2. **`ctx.forUser(userId)` 返回的写入入口里没有 `user` 参数。** 目标账号在绑定那一刻
+   就定死了，插件连「指定别的账号」这个动作都表达不出来：
+   - `user.sync.pushProgress / importSessions / ensureBook / findBook / setCover`
+   - `user.storage.connect / forStorage`（`forStorage` 只允许访问**该用户自己的**存储）
+
+   这不是洁癖：早先的版本让插件自己填「导入到哪个账号」，那就等于任何用户都能把
+   数据导进别人的账号。现在 `ctx.sync`（带 `user` 参数的那套，见 §4.3）只留给
+   **管理员用**的站点级插件。
+
+3. **每个用户那份配置是加密落库、按用户隔离的。** 管理员那份（site 项）不会进到
+   用户配置里，用户 A 填的凭据也读不到 B 的那份。
+
+想让用户自助页面上显示「上次运行：… · 导入 N 条」，把结果写在约定好的键上：
+
+```js
+await ctx.pluginData.set(`lastRun:${userId}`, {
+  at: new Date().toISOString(),
+  message: `导入 ${inserted} 条记录`,
+});
+```
+
+**别让一个用户的失败带走所有人。** 网盘连不上、路径填错都是常态，逐个 try/catch：
+
+```js
+for (const userId of await ctx.usersWithConfig()) {
+  try {
+    await importFor(userId);
+  } catch (err) {
+    ctx.log.error(`用户 #${userId} 导入失败，已跳过`, { userId, error: String(err?.message ?? err) });
+  }
+}
+```
+
+---
 
 ## 五、生命周期钩子
 
@@ -409,6 +480,12 @@ journalctl -u readsync -f | grep 'plugin:com.example.hello'
 
 1. **只安装你信任的插件**。插件可以读取进程内存、发起网络请求、读写数据目录（在声明的权限范围内）。
 2. **权限模型是约束而非沙箱**。它防止插件意外越权，但无法抵御恶意代码 —— Node.js 没有真正的进程内沙箱。
+
+   这也解释了为什么 `scope: "user"` 是这套模型里重要的一环：插件代码本身拦不住
+   （它想写谁的账号都做得到），但**安装插件需要管理员**，而「每个用户自己填自己那份
+   配置」把「插件说了算」换成了「内核给了谁就是谁」。越权写入的封堵点在
+   `ctx.forUser()`：绑定之后写入入口里根本没有 `user` 参数。
+
 3. 上架/分发插件时，请**明确告知用户插件会访问哪些数据**。
 4. 若你需要更强的隔离，建议把外部服务做成独立进程，插件只做 HTTP 转发（声明 `http` 权限即可）。
 
