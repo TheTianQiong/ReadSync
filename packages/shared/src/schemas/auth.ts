@@ -106,6 +106,11 @@ export interface VerificationRequirements {
   changePassword: boolean;
   disableTwoFactor: boolean;
 }
+/*
+ * 注意这里**没有 login**，永远也不该有：登录的验证方式由账号自己决定 ——
+ * 开了两步验证就填 TOTP，没开就只填密码。邮箱验证码管的是「注册 / 改邮箱 /
+ * 改密码 / 关两步验证」这几件事，与登录无关。
+ */
 
 /**
  * 两步验证凭据：6 位 TOTP 验证码，或一次性恢复码。

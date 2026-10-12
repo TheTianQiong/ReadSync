@@ -336,6 +336,46 @@ async function main(): Promise<void> {
         publicSettings.json().data?.emailVerification,
       );
 
+      /*
+       * 登录**绝不**该因为「开了邮箱验证」而多要一个验证码。
+       *
+       * 登录的验证方式由账号自己决定：开了两步验证就填 TOTP，没开就只填密码。
+       * 这两条断言来自一个真实 bug —— 验证码输入框曾被摆在登录表单里，于是选了
+       * 「注册 + 改密码」这一档之后，**每次登录**都会弹出一个必填的验证码框，
+       * 而登录接口根本不读它（用户白等一封邮件，还进不去）。
+       */
+      const loginDespiteEmailMode = await api({
+        method: 'POST',
+        url: '/api/auth/login',
+        payload: {
+          username: 'admin',
+          password: { ciphertext: encryptPassword(adminPassword, publicKey), encrypted: true },
+        },
+      });
+      check(
+        '开了邮箱验证也不影响登录（只凭密码就能进）',
+        loginDespiteEmailMode.statusCode === 200 && !!loginDespiteEmailMode.json().data?.accessToken,
+        loginDespiteEmailMode.body,
+      );
+
+      const requirements = await api({
+        method: 'GET',
+        url: '/api/auth/verification-requirements',
+        headers: auth,
+      });
+      check(
+        '需要验证码的动作里没有「登录」这一项',
+        requirements.json().data?.login === undefined &&
+          requirements.json().data?.registration === true &&
+          requirements.json().data?.changeEmail === true,
+        requirements.json().data,
+      );
+      check(
+        '邮箱没验证过的账号，改密码不要求验证码（否则它会改不了密码）',
+        requirements.json().data?.changePassword === false,
+        requirements.json().data,
+      );
+
       const newEmail = `codeuser-${randomUUID().slice(0, 8)}@example.com`;
       const send = await api({ method: 'POST', url: '/api/auth/register/code', payload: { email: newEmail } });
       check('注册发码接口返回成功', send.statusCode === 200, send.body);

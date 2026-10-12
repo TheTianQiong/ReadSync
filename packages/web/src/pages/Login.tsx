@@ -453,34 +453,6 @@ export function Login(): ReactNode {
                   ) : null}
                 </div>
 
-                {emailCodeRequired ? (
-                  <Field label="邮箱验证码" required hint="本站要求先验证邮箱，验证码有效 10 分钟">
-                    <div className="flex items-center gap-2">
-                      <Input
-                        value={emailCode}
-                        onChange={(event) => setEmailCode(event.target.value.replace(/\D/g, ''))}
-                        inputMode="numeric"
-                        placeholder="6 位数字"
-                        maxLength={6}
-                        className="font-mono"
-                        required
-                      />
-                      <Button
-                        type="button"
-                        variant="secondary"
-                        size="md"
-                        loading={sendingCode}
-                        onClick={() => void handleSendCode()}
-                        className="shrink-0 whitespace-nowrap"
-                      >
-                        发送验证码
-                      </Button>
-                    </div>
-                  </Field>
-                ) : null}
-
-                {codeNotice ? <Alert tone="info">{codeNotice}</Alert> : null}
-
                 {error ? <Alert tone="danger">{error}</Alert> : null}
 
                 <Button
@@ -552,6 +524,40 @@ export function Login(): ReactNode {
                     required
                   />
                 </Field>
+
+                {/*
+                  邮箱验证码只属于**注册**：站点开了邮箱验证时，建号前要证明邮箱是你的。
+                  登录不在这里 —— 登录该用账号自己的验证方式（开了两步验证就填 TOTP）。
+                  这段曾经被摆在登录表单里，于是「注册+改密码」这一档会让**每次登录**
+                  都弹出一个必填的验证码框（而登录接口根本不读它），白等一封邮件。
+                */}
+                {emailCodeRequired ? (
+                  <Field label="邮箱验证码" required hint="本站要求先验证邮箱，验证码有效 10 分钟">
+                    <div className="flex items-center gap-2">
+                      <Input
+                        value={emailCode}
+                        onChange={(event) => setEmailCode(event.target.value.replace(/\D/g, ''))}
+                        inputMode="numeric"
+                        placeholder="6 位数字"
+                        maxLength={6}
+                        className="font-mono"
+                        required
+                      />
+                      <Button
+                        type="button"
+                        variant="secondary"
+                        size="md"
+                        loading={sendingCode}
+                        onClick={() => void handleSendCode()}
+                        className="shrink-0 whitespace-nowrap"
+                      >
+                        发送验证码
+                      </Button>
+                    </div>
+                  </Field>
+                ) : null}
+
+                {codeNotice ? <Alert tone="info">{codeNotice}</Alert> : null}
 
                 <Field label="显示名称" hint="可选，展示在导航栏">
                   <Input

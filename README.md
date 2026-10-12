@@ -4,7 +4,7 @@
 
 墨水屏风格界面 · 阅读数据可视化 · 多端进度同步 · 完整的 CLI 与插件体系
 
-[![Version](https://img.shields.io/badge/version-0.4.4-1a1a1a)](#版本管理)
+[![Version](https://img.shields.io/badge/version-0.4.5-1a1a1a)](#版本管理)
 [![License](https://img.shields.io/badge/license-MIT-1a1a1a)](#许可证)
 
 ---
