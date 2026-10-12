@@ -1,4 +1,4 @@
-import { APP_NAME, APP_NAME_CN, VERSION, type SessionUser } from '@readsync/shared';
+import { APP_NAME, APP_NAME_CN, VERSION, resolveLoginAccount, type SessionUser } from '@readsync/shared';
 import { BookOpen, Eye, EyeOff, Fingerprint, KeyRound, LogIn, Mail, UserPlus } from 'lucide-react';
 import { useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react';
 import { Link, useLocation, useNavigate } from 'react-router-dom';
@@ -47,6 +47,8 @@ export function Login(): ReactNode {
   /** 本机上次登录过的账号（不含任何凭据）。有它就把账号字段收起来，只让填密码 */
   const [lastAccount, setLastAccount] = useState<LastAccount | null>(() => readLastAccount());
   const [useOtherAccount, setUseOtherAccount] = useState(false);
+  /** 账号字段的 DOM 引用：浏览器自动填充可能不触发 onChange，提交时用它兜底取真实值 */
+  const usernameRef = useRef<HTMLInputElement>(null);
   const [passkeySupported, setPasskeySupported] = useState(false);
   const [conditionalReady, setConditionalReady] = useState(false);
   const [passkeyBusy, setPasskeyBusy] = useState(false);
@@ -193,11 +195,32 @@ export function Login(): ReactNode {
     err.code === 'UNAUTHORIZED' &&
     /2fa|totp|验证码|动态口令|两步/i.test(err.message);
 
+  /**
+   * 提交时真正使用的账号。
+   *
+   * 账号字段被收起来（本机已记住）时，`username` 这个 state 是**空的** ——
+   * 输入框根本没渲染，没人会去填它。此时必须以记住的那个账号为准，否则
+   * 「只填密码登录」会在前端校验就被拦下（union 两个分支都失败）。
+   *
+   * 另外：浏览器的自动填充有时不触发 React 的 onChange，state 会是空串而
+   * DOM 里其实有值，所以输入框可见时再读一次 DOM 兜底。
+   */
+  const resolveLoginIdentifier = (): string =>
+    resolveLoginAccount({
+      remembered: lastAccount?.username,
+      // 浏览器自动填充有时不触发 onChange：state 是空串而 DOM 里其实有值，读 DOM 兜底
+      typed: username || usernameRef.current?.value || '',
+      useOtherAccount,
+    });
+
   const handleLogin = async (event: FormEvent<HTMLFormElement>): Promise<void> => {
     event.preventDefault();
     setError(null);
 
-    const invalid = validateAll([[loginIdentifierField, username]]);
+    const identifier = resolveLoginIdentifier();
+    const invalid = identifier
+      ? validateAll([[loginIdentifierField, identifier]])
+      : '请输入用户名或邮箱';
     if (invalid) {
       setError(invalid);
       return;
@@ -213,7 +236,12 @@ export function Login(): ReactNode {
 
     setSubmitting(true);
     try {
-      const result = await login({ username, password, totpCode: totpCode || undefined, remember });
+      const result = await login({
+        username: identifier,
+        password,
+        totpCode: totpCode || undefined,
+        remember,
+      });
 
       // 账号开启了 2FA 但本次未带验证码：服务端会返回 requires2fa 且不下发令牌
       if (result.requires2fa && !result.accessToken) {
@@ -388,6 +416,7 @@ export function Login(): ReactNode {
                     }
                   >
                     <Input
+                      ref={usernameRef}
                       value={username}
                       onChange={(event) => setUsername(event.target.value)}
                       // `webauthn` 这个 token 是条件式 UI 的开关：没有它浏览器不会填充通行密钥

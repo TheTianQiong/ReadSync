@@ -9,7 +9,7 @@
  * 该脚本会清空并重建指定的数据目录，**不要指向生产数据目录**。
  */
 import { createHash, publicEncrypt, constants, randomUUID } from 'node:crypto';
-import { buildCalendarWeeks, recentYearRange } from '@readsync/shared';
+import { buildCalendarWeeks, loginSchema, recentYearRange, resolveLoginAccount } from '@readsync/shared';
 import { and, eq } from 'drizzle-orm';
 import { OTP } from 'otplib';
 import AdmZip from 'adm-zip';
@@ -2978,6 +2978,59 @@ export function register(ctx) {
     });
     check('已开启 2FA 的账号登录被要求二次验证', needTotp.json().data?.requires2fa === true, needTotp.body);
     check('未提供验证码时不签发令牌', needTotp.json().data?.accessToken === undefined);
+
+    /*
+     * 空账号提交：`username` 是「用户名 or 邮箱」的 union，空串让两个分支同时失败。
+     * zod 对 union 失败的默认文案是英文的裸 "Invalid input" —— 前端把这个 message
+     * 原样显示给用户，于是用户看到一句既不说字段、也不说原因的话。
+     * 这里钉死：schema 自带中文文案，且错误响应带字段路径。
+     */
+    const emptyIdentifier = loginSchema.shape.username.safeParse('');
+    check(
+      '登录标识的 union 失败时有中文文案',
+      emptyIdentifier.error?.issues[0]?.message === '请输入用户名或邮箱',
+      emptyIdentifier.error?.issues[0]?.message,
+    );
+
+    const emptyName = await api({
+      method: 'POST',
+      url: '/api/auth/login',
+      payload: { username: '', password: { ciphertext: 'x', encrypted: true } },
+    });
+    check('空账号登录返回 400 而不是 500', emptyName.statusCode === 400, emptyName.body);
+    check(
+      '空账号的报错带字段名且是中文',
+      emptyName.json().error?.message === 'username: 请输入用户名或邮箱',
+      emptyName.body,
+    );
+
+    /*
+     * 登录页把账号字段收起来时（本机记住过这个账号），输入框根本没渲染，
+     * 它的 state 一定是空的。这时候还拿 state 去当账号，union 校验必然失败，
+     * 用户只见一句 "Invalid input"、请求发不出去、TOTP 输入框也不出现。
+     * 这段判定已经抽成 shared 的纯函数，这里把它钉死。
+     */
+    check(
+      '本机记住账号时，空输入框也要用记住的那个账号',
+      resolveLoginAccount({ remembered: 'normaluser', typed: '', useOtherAccount: false }) ===
+        'normaluser',
+    );
+    check(
+      '解析出的账号确实能通过登录校验（改回拿输入框状态就会红）',
+      loginSchema.shape.username.safeParse(
+        resolveLoginAccount({ remembered: 'normaluser', typed: '', useOtherAccount: false }),
+      ).success,
+    );
+    check(
+      '点了「使用其他账号」就以手填的为准',
+      resolveLoginAccount({ remembered: 'normaluser', typed: ' someone ', useOtherAccount: true }) ===
+        'someone',
+    );
+    check(
+      '本机没记住账号时用手填的',
+      resolveLoginAccount({ typed: 'fresh', useOtherAccount: false }) === 'fresh',
+    );
+    check('两边都空时返回空串（界面据此提示「请输入用户名或邮箱」）', resolveLoginAccount({}) === '');
 
     const badTotp = await api({
       method: 'POST',

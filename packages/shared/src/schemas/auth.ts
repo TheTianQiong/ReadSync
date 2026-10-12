@@ -51,7 +51,14 @@ export type EncryptedPayload = z.infer<typeof encryptedPayloadSchema>;
  * 默认情况下明文会在解密环节被拒绝（BAD_REQUEST）。schema 只描述传输形状，
  * 策略检查集中在 crypto/keys.ts 一处。
  */
-export const passwordPayloadSchema = z.union([encryptedPayloadSchema, z.string().min(1).max(256)]);
+export const passwordPayloadSchema = z.union([encryptedPayloadSchema, z.string().min(1).max(256)], {
+  /*
+   * union 失败时 zod 只报「两个分支都不匹配」，默认文案是英文的裸 "Invalid input" ——
+   * 既没说哪个字段，也不像人话。前端把 issues[0].message 原样显示给用户，
+   * 所以这里必须自带中文文案（它同时是服务端 400 的 message）。
+   */
+  error: '密码载荷格式不正确，请刷新页面后重试',
+});
 
 export type PasswordPayload = z.infer<typeof passwordPayloadSchema>;
 
@@ -133,9 +140,21 @@ export function isTotpCode(code: string): boolean {
   return /^[0-9]{6}$/.test(code.trim());
 }
 
+/**
+ * 「用户名或邮箱」：登录、通行密钥登录都用它。
+ *
+ * 这是个 union，空串会让两个分支同时失败，而 zod 对 union 失败的默认文案是
+ * 英文的裸 "Invalid input" —— 既没说哪个字段，也不像人话。前端会把
+ * issues[0].message 原样显示给用户，所以这里必须自带中文文案
+ * （它同时是服务端 400 响应的 message）。
+ */
+const usernameOrEmailSchema = z.union([usernameSchema, z.email()], {
+  error: '请输入用户名或邮箱',
+});
+
 /** 登录请求 */
 export const loginSchema = z.object({
-  username: usernameSchema.or(z.email()),
+  username: usernameOrEmailSchema,
   password: passwordPayloadSchema,
   /** 两步验证凭据：TOTP 验证码或恢复码，当账号开启 TOTP 时需要 */
   totpCode: twoFactorCodeSchema.optional(),
@@ -239,7 +258,7 @@ export const passkeyRegisterVerifySchema = z.object({
 });
 
 export const passkeyLoginVerifySchema = z.object({
-  username: usernameSchema.or(z.email()).optional(),
+  username: usernameOrEmailSchema.optional(),
   response: z.any(),
 });
 
