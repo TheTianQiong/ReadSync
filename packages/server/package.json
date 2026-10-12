@@ -1,6 +1,6 @@
 {
   "name": "@readsync/server",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "private": true,
   "type": "module",
   "description": "ReadSync 后端服务与 CLI",

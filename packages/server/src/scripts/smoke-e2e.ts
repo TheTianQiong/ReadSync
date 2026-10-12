@@ -9,6 +9,7 @@
  * 该脚本会清空并重建指定的数据目录，**不要指向生产数据目录**。
  */
 import { createHash, publicEncrypt, constants, randomUUID } from 'node:crypto';
+import { buildCalendarWeeks, recentYearRange } from '@readsync/shared';
 import { and, eq } from 'drizzle-orm';
 import { OTP } from 'otplib';
 import AdmZip from 'adm-zip';
@@ -2045,6 +2046,82 @@ async function main(): Promise<void> {
         '切到某一年后，年份列表仍然列全',
         JSON.stringify(yearScoped.json().data?.availableYears) === JSON.stringify([2026, 2025]),
         yearScoped.json().data?.availableYears,
+      );
+
+      /* ---- 全年日历：数据源 + 排布 ---- */
+
+      // 日历按天取整段区间，靠的就是趋势接口把没读的日子补成 0
+      const yearTrend = await api({
+        method: 'GET',
+        url: `/api/stats/trend?granularity=day&platform=${PLATFORM}&from=2026-01-01&to=2026-12-31`,
+        headers: auth,
+      });
+      const yearPoints: Array<{ date: string; seconds: number }> = yearTrend.json().data?.points ?? [];
+      check('按天取整年返回 365 个桶（日历要的是一天一格，不能缺日期）', yearPoints.length === 365, yearPoints.length);
+      check(
+        '没读的日子补 0（否则日历上那些天会没有格子）',
+        yearPoints.filter((point) => point.seconds > 0).length === 25,
+        yearPoints.filter((point) => point.seconds > 0).length,
+      );
+      check(
+        '全年合计与写入的一致',
+        yearPoints.reduce((sum, point) => sum + point.seconds, 0) === 25 * 600,
+        yearPoints.reduce((sum, point) => sum + point.seconds, 0),
+      );
+
+      // 闰年：多一天，桶也要跟着多一个（日期计算最容易在这里差一格）
+      const leapTrend = await api({
+        method: 'GET',
+        url: `/api/stats/trend?granularity=day&platform=${PLATFORM}&from=2024-01-01&to=2024-12-31`,
+        headers: auth,
+      });
+      check('闰年按 366 天切', (leapTrend.json().data?.points ?? []).length === 366, leapTrend.json().data?.points?.length);
+
+      /*
+       * 「哪一天落在哪一列」这段日期数学在 shared（前后端共用、可测）。
+       * 它错了不会报错，只会让整张图悄悄错位一行 —— 所以直接断言格子。
+       */
+      const emptySeconds = new Map<string, number>();
+      // 2026-01-01 是周四 → 第一列要留出周一到周三三个空位
+      const weeks2026 = buildCalendarWeeks('2026-01-01', '2026-12-31', emptySeconds, '2026-10-12');
+      const firstWeek2026 = weeks2026[0] ?? [];
+      check(
+        '区间起点不在周一时，前面补空位（2026-01-01 是周四 → 3 个空位）',
+        firstWeek2026.slice(0, 3).every((cell) => cell === null) && firstWeek2026[3]?.date === '2026-01-01',
+        firstWeek2026.map((cell) => cell?.date ?? null),
+      );
+      const days2026 = weeks2026.flat().filter((cell) => cell !== null);
+      check('整年 365 天都在格子里', days2026.length === 365, days2026.length);
+      check(
+        '每列都是 7 格（网格才不会错位）',
+        weeks2026.every((week) => week.length === 7),
+        weeks2026.map((week) => week.length).slice(0, 5),
+      );
+      check(
+        '最后一个格子是 12-31（区间末尾要补齐到整周）',
+        days2026.at(-1)?.date === '2026-12-31',
+        days2026.at(-1)?.date,
+      );
+      check(
+        '未来（截至今天的区间外）标记成 future',
+        days2026.filter((cell) => cell?.future).length === 365 - 285 && days2026.find((cell) => cell?.date === '2026-01-01')?.future === false,
+        days2026.filter((cell) => cell?.future).length,
+      );
+
+      // 近一年：以今天为基准往前 365 天，两端都对齐到整周
+      const recent = recentYearRange('2026-10-12');
+      check('「近一年」= 今天往前推 365 天', recent.from === '2025-10-13' && recent.to === '2026-10-12', recent);
+      const recentWeeks = buildCalendarWeeks(recent.from, recent.to, emptySeconds, recent.to);
+      check(
+        '近一年正好 365 格（起止不落在整周时，列首列尾是空位）',
+        recentWeeks.flat().filter((cell) => cell !== null).length === 365,
+        recentWeeks.flat().filter((cell) => cell !== null).length,
+      );
+      check(
+        '区间外的日子是空位而不是「没读」',
+        recentWeeks.flat().some((cell) => cell === null) &&
+          recentWeeks.flat().filter((cell) => cell !== null).every((cell) => cell?.date >= recent.from && cell.date <= recent.to),
+        recentWeeks[0]?.map((cell) => cell?.date ?? null),
       );
     }
 

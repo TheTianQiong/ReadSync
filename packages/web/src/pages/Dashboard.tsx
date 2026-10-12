@@ -6,6 +6,7 @@ import {
   type DashboardWidget,
   type Paginated,
   type ReadingHeatmap as ReadingHeatmapData,
+  type ReadingTimeTrend,
   type StatGranularity,
   type SyncEntry,
 } from '@readsync/shared';
@@ -13,9 +14,10 @@ import { ChevronDown, ChevronUp, LayoutGrid, RefreshCw, Settings2 } from 'lucide
 import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { PlatformPie } from '../components/charts/PlatformPie';
+import { ReadingCalendar, buildCalendarWeeks, calendarSecondsMap } from '../components/charts/ReadingCalendar';
 import {
   ReadingHeatmap,
-  heatmapCellLabel,
+  heatmapSlotName,
   heatmapYearOptions as heatmapYearOptionsOf,
   heatmapYearRange,
   type HeatmapYear,
@@ -84,31 +86,65 @@ export function Dashboard(): ReactNode {
   const [drilldown, setDrilldown] = useState<DrilldownState>(CLOSED_DRILLDOWN);
   /** 热力图的年份（'all' = 全部历史）。见下面 heatmapForYear 的说明 */
   const [heatmapYear, setHeatmapYear] = useState<HeatmapYear>('all');
+  /**
+   * 热力图的两种看法：
+   *  - `hour`：星期 × 小时 —— 「我通常在周几几点读」（作息画像）；
+   *  - `calendar`：全年一天一格 —— 「今年哪天读了、断了没有」（时间轴）。
+   * 两者口径不同，但都叫「热力图」，所以放在同一张卡片里切换，而不是再加一个组件。
+   */
+  const [heatmapView, setHeatmapView] = useState<'hour' | 'calendar'>('hour');
 
   const { data, loading, error, reload } = useAsync(
     () => api.get<DashboardData>('/stats/dashboard', { granularity }),
     [granularity],
   );
 
+  /** 浏览器本地日期（YYYY-MM-DD）：只用来算「近一年」的起点与「哪些日子还没到」 */
+  const today = useMemo(() => new Date().toLocaleDateString('sv-SE'), []);
+
   /*
-   * 热力图的年份单独查一次。
+   * 热力图的范围**单独查一次**，不复用 /stats/dashboard 里那份。
    *
-   * 不复用 /stats/dashboard：那里同时装着趋势、平台分布，把 from/to 传进去会
-   * 顺手把它们也限制在某一年里 —— 用户只是想回看某一年的作息，不是要换掉
-   * 整页的口径。
+   * 那两个视图（作息 / 全年）看的是同一段区间（默认「近一年」，也可回到某个具体
+   * 年份），把 from/to 传给 /stats/dashboard 会顺手把趋势、平台分布也限制住 ——
+   * 用户只是回看某一年，不是要换掉整页的口径。
    */
-  const heatmapForYear = useAsync(
-    () =>
-      heatmapYear === 'all'
-        ? Promise.resolve(null)
-        : api.get<ReadingHeatmapData>('/stats/heatmap', heatmapYearRange(heatmapYear)),
-    [heatmapYear],
+  const heatmapRange = heatmapYearRange(heatmapYear, today);
+  const heatmapRangeLabel = heatmapYear === 'recent' ? '近一年' : `${heatmapYear} 年`;
+
+  const heatmapData = useAsync(
+    () => api.get<ReadingHeatmapData>('/stats/heatmap', heatmapRange),
+    [`${heatmapRange.from}|${heatmapRange.to}`],
   );
+  const heatmap = heatmapData.data ?? null;
 
   // 年份选项来自接口的 availableYears（它不受当前范围影响，所以一直列得全）
-  const yearChoices = data?.heatmap?.availableYears ?? [];
+  const yearChoices = heatmapData.data?.availableYears ?? [];
   const heatmapYearOptions = useMemo(() => heatmapYearOptionsOf(yearChoices), [yearChoices]);
-  const heatmap = heatmapYear === 'all' ? (data?.heatmap ?? null) : (heatmapForYear.data ?? null);
+
+  // 日历按天取同一段区间：接口会把没读的日子补成 0，正好一天一格
+  const calendarTrend = useAsync(
+    () =>
+      heatmapView === 'calendar'
+        ? api.get<ReadingTimeTrend>('/stats/trend', {
+            granularity: 'day',
+            from: heatmapRange.from,
+            to: heatmapRange.to,
+          })
+        : Promise.resolve(null),
+    [heatmapView, heatmapRange.from, heatmapRange.to],
+  );
+
+  const calendarWeeks = useMemo(
+    () =>
+      buildCalendarWeeks(
+        heatmapRange.from,
+        heatmapRange.to,
+        calendarSecondsMap(calendarTrend.data?.points ?? []),
+        today,
+      ),
+    [heatmapRange.from, heatmapRange.to, calendarTrend.data, today],
+  );
 
   const recentBooks = useAsync(
     () =>
@@ -211,26 +247,55 @@ export function Dashboard(): ReactNode {
             description={DASHBOARD_WIDGET_META[widget].description}
             className="lg:col-span-2"
             actions={
-              heatmapYearOptions.length > 1 ? (
+              <div className="flex flex-wrap items-center gap-1.5">
                 <Segmented
                   size="sm"
-                  value={heatmapYear}
-                  onChange={setHeatmapYear}
-                  options={heatmapYearOptions}
+                  value={heatmapView}
+                  onChange={setHeatmapView}
+                  options={[
+                    { value: 'hour', label: '作息' },
+                    { value: 'calendar', label: '全年' },
+                  ]}
                 />
-              ) : null
+                {heatmapYearOptions.length > 1 ? (
+                  <Segmented
+                    size="sm"
+                    value={heatmapYear}
+                    onChange={setHeatmapYear}
+                    options={heatmapYearOptions}
+                  />
+                ) : null}
+              </div>
             }
           >
-            {heatmapYear !== 'all' && heatmapForYear.loading ? (
-              <PageSpinner label="载入该年份的热力图…" />
+            {heatmapView === 'calendar' ? (
+              calendarTrend.loading ? (
+                <PageSpinner label="载入日历…" />
+              ) : (
+                <ReadingCalendar
+                  label={heatmapRangeLabel}
+                  from={heatmapRange.from}
+                  to={heatmapRange.to}
+                  weeks={calendarWeeks}
+                  onSelect={(day) =>
+                    openDrilldown({
+                      title: `${day.date} 的阅读明细`,
+                      description: `当日阅读 ${formatDuration(day.seconds)}`,
+                      // 单日下钻就走后端的日期过滤（与趋势图点柱子同一条路）
+                      filters: { from: day.date, to: day.date },
+                    })
+                  }
+                />
+              )
+            ) : heatmapData.loading ? (
+              <PageSpinner label="载入热力图…" />
             ) : (
               <ReadingHeatmap
                 data={heatmap}
+                scopeLabel={heatmapRangeLabel}
                 onSelect={(cell) =>
                   openDrilldown({
-                    title: `${heatmapCellLabel(cell.weekday, cell.hour, cell.seconds).split(' · ')[0]}${
-                      heatmapYear === 'all' ? '' : `（${heatmapYear} 年）`
-                    }的阅读明细`,
+                    title: `${heatmapSlotName(cell.weekday, cell.hour)}（${heatmapRangeLabel}）的阅读明细`,
                     description: `该时段累计阅读 ${formatDuration(cell.seconds)}`,
                     /*
                      * 星期与小时**交给后端过滤**（/stats/sessions 支持这两个参数）。
@@ -242,8 +307,9 @@ export function Dashboard(): ReactNode {
                     filters: {
                       weekday: cell.weekday,
                       hour: cell.hour,
-                      // 看的是哪一年的热力图，明细就限定在哪一年
-                      ...heatmapYearRange(heatmapYear),
+                      // 看的是哪一段的热力图，明细就限定在哪一段
+                      from: heatmapRange.from,
+                      to: heatmapRange.to,
                     },
                   })
                 }
