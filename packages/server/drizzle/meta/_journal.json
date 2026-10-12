@@ -50,6 +50,13 @@
       "when": 1791465954455,
       "tag": "0006_yellow_hairball",
       "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "6",
+      "when": 1791801046277,
+      "tag": "0007_acoustic_cannonball",
+      "breakpoints": true
     }
   ]
 }

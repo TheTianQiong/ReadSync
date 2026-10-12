@@ -33,7 +33,7 @@ my-plugin.zip
   "version": "1.0.0",
   "author": "你的名字",
   "description": "一个演示插件",
-  "apiVersion": ">=0.3.0 <0.4.0",
+  "apiVersion": ">=0.4.0 <0.5.0",
   "capabilities": ["notification"],
   "main": "index.js",
   "permissions": ["log"],
@@ -100,7 +100,7 @@ readsync plugin enable com.example.hello
 | `id` | string | ✅ | 唯一标识，小写字母/数字/`.`/`_`/`-`，建议反向域名风格 |
 | `name` | string | ✅ | 显示名称 |
 | `version` | string | ✅ | 语义化版本，如 `1.0.0` |
-| `apiVersion` | string | ✅ | 兼容的内核版本范围，如 `">=0.3.0 <0.4.0"`。不匹配时内核拒绝加载 |
+| `apiVersion` | string | ✅ | 兼容的内核版本范围，如 `">=0.4.0 <0.5.0"`。不匹配时内核拒绝加载 |
 | `capabilities` | string[] | ✅ | 声明能力，见下节 |
 | `main` | string | | 入口文件，默认 `index.js` |
 | `runtime` | string | | 目前只支持 `node` |
@@ -132,6 +132,7 @@ readsync plugin enable com.example.hello
 | `fs:storage` | `ctx.storage` 可**只读**读取存储后端（写入请走存储驱动那一节） |
 | `log` | `ctx.log` 输出日志 |
 | `db:plugin` | 可使用 `plugin_data` 表中的专属键值存储 |
+| `sqlite:read` | `ctx.sqlite.open()` 可**只读**打开外部 SQLite 数据库（读别的阅读器的数据文件） |
 | `sync:write` | `ctx.sync.pushProgress` / `importSessions` 可写阅读进度与时长 |
 | `books:write` | `ctx.sync.ensureBook` / `setCover` 可登记书目、写封面 |
 
@@ -198,6 +199,7 @@ readsync plugin enable com.example.hello
 | `ctx.on(hook, handler)` | 注册生命周期钩子 |
 | `ctx.pluginData` | 插件专属 KV（需 `db:plugin` 权限） |
 | `ctx.storage` | 读取存储后端：`connect()` 用插件自己的连接 / `forStorage()` 复用已有存储（需 `fs:storage` 权限） |
+| `ctx.sqlite` | 只读打开外部 SQLite 数据库（需 `sqlite:read` 权限） |
 | `ctx.sync` | 写入进度/会话、登记书目、写封面（需 `sync:write` / `books:write`） |
 | `ctx.schedule(name, minutes, fn)` | 注册周期任务（`minutes` 为 0 表示只手动触发） |
 | `ctx.usersWithConfig()` | 哪些用户填了自己的那份配置（清单里有 user 项时用） |
@@ -261,17 +263,40 @@ await ctx.sync.setCover({ book: 12, mime: 'image/jpeg', dataBase64: '…' });
 
 `user` 可以是用户名、邮箱或用户 id。
 
+**`hour` 可以传 `null`** —— 表示「只知道这一天的合计，不知道是几点读的」。
+有些数据源天生是日粒度（Anx Reader 的 `tb_reading_time` 就是每本书每天的合计），
+那种情况下把时长硬塞进某个小时是编数据：热力图上会凭空长出一座并不存在的
+「凌晨高峰」。传 null 之后，这些时长**照常计入**日/周/月统计与总时长，
+但**不会**出现在热力图与按小时下钻里（明细会标成「时间未知」）。
+
 ### 4.4 周期任务
 
 ```js
 ctx.schedule('sync', 60, async () => { /* 每 60 分钟 */ });
 ctx.schedule('manual-only', 0, async () => { /* 只在 plugin:run 时执行 */ });
+ctx.schedule('nightly', 24 * 60, fn, { offsetMinutes: -10 }); // 每天整点前 10 分钟
 ```
 
 计时器由宿主代管，插件停用/卸载和服务退出时会一并清掉 —— 插件自己 `setInterval`
-会出现「界面上已停用、定时任务还在写数据」这种很难发现的问题。
+会出现「界面上已停用、定时任务还在写数据」这种很难发现的问题。任务抛错只记日志，
+不影响下一次执行。
 
-任务抛错只记日志，不影响下一次执行。手动触发：
+**触发时刻是「整点对齐 + 固定偏移」，不是「注册时刻 + 间隔」**：
+
+```
+  触发时刻 = k × 间隔 + 偏移        （k 为整数）
+```
+
+60 分钟的任务因此落在每小时的 `HH:00` 前后，24 小时的任务落在每天同一时刻 ——
+而不是「服务启动在 10:03:17，于是永远在 :03:17 跑」。两件事都因此变好：重启不再
+让全站同步时刻整体漂移；多个导入插件也不会挤在同一瞬间一起去连网盘、写库。
+
+偏移由**插件 id + 任务名**哈希得到，范围 ±3 分钟，所以不同插件自然错开，而同一个
+插件每次重启仍落在同一时刻。想自己定就传 `options.offsetMinutes`（负数表示整点前）。
+
+任务跑完才排下一次，于是任务跑超时或系统休眠之后能自己校正回来，不会「补跑」一串。
+
+手动触发（任何注册过的任务，包括 `everyMinutes` 为 0 的）：
 
 ```bash
 readsync plugin:run <插件ID> [任务名]
@@ -329,6 +354,34 @@ for (const userId of await ctx.usersWithConfig()) {
   }
 }
 ```
+
+### 4.6 读取外部 SQLite 数据库
+
+别的阅读器常把自己的数据放在一个 SQLite 文件里（Anx Reader 的 `database7.db`）。
+插件是无依赖的纯 JS，装不了原生驱动，所以宿主把已经带着的 better-sqlite3 包了一层：
+
+```js
+const src = await user.storage.connect(connection);          // 先从存储里取出字节
+const bytes = await src.get('database7.db');
+
+const db = await ctx.sqlite.open({ data: bytes });           // 需要 sqlite:read 权限
+try {
+  const books = await db.all('SELECT id, title, reading_percentage FROM tb_books WHERE is_deleted = 0');
+  const one = await db.get('SELECT COUNT(*) AS n FROM tb_reading_time WHERE book_id = ?', [books[0].id]);
+} finally {
+  db.close();   // 不关会在临时目录里留下文件（宿主卸载插件时也会兜底清）
+}
+```
+
+三条限制，都是刻意的：
+
+- **只读**。那是**别人的**数据库 —— 导入是单向的，读它、写自己的库。只读连接由
+  SQLite 自己保证，任何写语句都会被拒绝。
+- **只认单条 SELECT**（`SELECT` / `WITH` / `PRAGMA table_info` / `EXPLAIN`）。
+  这不是沙箱（插件本来就能 `import('node:fs')`，见第九章），拦的是手滑。
+- **数据是字节**：调用方自己从存储里取（`ctx.storage`），插件拿不到文件路径。
+
+参数一律用 `?` 占位，别把值拼进 SQL —— 表名、书名里带引号是常事。
 
 ---
 

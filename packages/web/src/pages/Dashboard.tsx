@@ -5,7 +5,7 @@ import {
   type DashboardData,
   type DashboardWidget,
   type Paginated,
-  type ReadingSessionDetail,
+  type ReadingHeatmap as ReadingHeatmapData,
   type StatGranularity,
   type SyncEntry,
 } from '@readsync/shared';
@@ -13,7 +13,13 @@ import { ChevronDown, ChevronUp, LayoutGrid, RefreshCw, Settings2 } from 'lucide
 import { useEffect, useMemo, useState, type ReactNode } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { PlatformPie } from '../components/charts/PlatformPie';
-import { ReadingHeatmap } from '../components/charts/ReadingHeatmap';
+import {
+  ReadingHeatmap,
+  heatmapCellLabel,
+  heatmapYearOptions as heatmapYearOptionsOf,
+  heatmapYearRange,
+  type HeatmapYear,
+} from '../components/charts/ReadingHeatmap';
 import { TrendChart, type TrendMetric, type TrendVariant } from '../components/charts/TrendChart';
 import { SessionsModal } from '../components/SessionsModal';
 import { Alert } from '../components/ui/Alert';
@@ -29,7 +35,7 @@ import { useAuth } from '../contexts/AuthContext';
 import { useToast } from '../components/ui/Toast';
 import { api } from '../lib/api';
 import { useAsync } from '../lib/hooks';
-import { formatBytes, formatDateTime, formatDuration, formatRelative, toDate } from '../lib/utils';
+import { formatBytes, formatDateTime, formatDuration, formatRelative } from '../lib/utils';
 
 const GRANULARITY_OPTIONS: ReadonlyArray<{ value: StatGranularity; label: string }> = [
   { value: 'day', label: '日' },
@@ -54,7 +60,6 @@ interface DrilldownState {
   title: string;
   description?: ReactNode;
   filters: Record<string, string | number>;
-  clientFilter?: (session: ReadingSessionDetail) => boolean;
 }
 
 const CLOSED_DRILLDOWN: DrilldownState = { open: false, title: '', filters: {} };
@@ -77,11 +82,33 @@ export function Dashboard(): ReactNode {
   const [variant, setVariant] = useState<TrendVariant>('bar');
   const [customizeOpen, setCustomizeOpen] = useState(false);
   const [drilldown, setDrilldown] = useState<DrilldownState>(CLOSED_DRILLDOWN);
+  /** 热力图的年份（'all' = 全部历史）。见下面 heatmapForYear 的说明 */
+  const [heatmapYear, setHeatmapYear] = useState<HeatmapYear>('all');
 
   const { data, loading, error, reload } = useAsync(
     () => api.get<DashboardData>('/stats/dashboard', { granularity }),
     [granularity],
   );
+
+  /*
+   * 热力图的年份单独查一次。
+   *
+   * 不复用 /stats/dashboard：那里同时装着趋势、平台分布，把 from/to 传进去会
+   * 顺手把它们也限制在某一年里 —— 用户只是想回看某一年的作息，不是要换掉
+   * 整页的口径。
+   */
+  const heatmapForYear = useAsync(
+    () =>
+      heatmapYear === 'all'
+        ? Promise.resolve(null)
+        : api.get<ReadingHeatmapData>('/stats/heatmap', heatmapYearRange(heatmapYear)),
+    [heatmapYear],
+  );
+
+  // 年份选项来自接口的 availableYears（它不受当前范围影响，所以一直列得全）
+  const yearChoices = data?.heatmap?.availableYears ?? [];
+  const heatmapYearOptions = useMemo(() => heatmapYearOptionsOf(yearChoices), [yearChoices]);
+  const heatmap = heatmapYear === 'all' ? (data?.heatmap ?? null) : (heatmapForYear.data ?? null);
 
   const recentBooks = useAsync(
     () =>
@@ -183,24 +210,45 @@ export function Dashboard(): ReactNode {
             title={DASHBOARD_WIDGET_META[widget].label}
             description={DASHBOARD_WIDGET_META[widget].description}
             className="lg:col-span-2"
+            actions={
+              heatmapYearOptions.length > 1 ? (
+                <Segmented
+                  size="sm"
+                  value={heatmapYear}
+                  onChange={setHeatmapYear}
+                  options={heatmapYearOptions}
+                />
+              ) : null
+            }
           >
-            <ReadingHeatmap
-              data={data?.heatmap ?? null}
-              onSelect={(cell) =>
-                openDrilldown({
-                  title: `${['周日', '周一', '周二', '周三', '周四', '周五', '周六'][cell.weekday] ?? ''} ${
-                    cell.hour
-                  }:00 的阅读明细`,
-                  description: `该时段累计阅读 ${formatDuration(cell.seconds)}`,
-                  filters: {},
-                  // 后端 stats/sessions 目前只按日期/平台过滤，星期与小时在前端筛
-                  clientFilter: (session) => {
-                    const date = toDate(session.startedAt);
-                    return !!date && date.getDay() === cell.weekday && date.getHours() === cell.hour;
-                  },
-                })
-              }
-            />
+            {heatmapYear !== 'all' && heatmapForYear.loading ? (
+              <PageSpinner label="载入该年份的热力图…" />
+            ) : (
+              <ReadingHeatmap
+                data={heatmap}
+                onSelect={(cell) =>
+                  openDrilldown({
+                    title: `${heatmapCellLabel(cell.weekday, cell.hour, cell.seconds).split(' · ')[0]}${
+                      heatmapYear === 'all' ? '' : `（${heatmapYear} 年）`
+                    }的阅读明细`,
+                    description: `该时段累计阅读 ${formatDuration(cell.seconds)}`,
+                    /*
+                     * 星期与小时**交给后端过滤**（/stats/sessions 支持这两个参数）。
+                     *
+                     * 早先是传空 filters + 一个前端 clientFilter，而明细弹窗只拉
+                     * 第一页 20 条 —— 「周三 15 点」的会话几乎永远落不进最新 20 条里，
+                     * 于是点开永远是空列表。筛选能下推就别在客户端做。
+                     */
+                    filters: {
+                      weekday: cell.weekday,
+                      hour: cell.hour,
+                      // 看的是哪一年的热力图，明细就限定在哪一年
+                      ...heatmapYearRange(heatmapYear),
+                    },
+                  })
+                }
+              />
+            )}
           </WidgetCard>
         );
 
@@ -420,7 +468,6 @@ export function Dashboard(): ReactNode {
         title={drilldown.title}
         description={drilldown.description}
         filters={drilldown.filters}
-        clientFilter={drilldown.clientFilter}
       />
     </div>
   );

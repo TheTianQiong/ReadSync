@@ -1,6 +1,6 @@
-import { APP_NAME, APP_NAME_CN, VERSION } from '@readsync/shared';
-import { BookOpen, Eye, EyeOff, KeyRound, LogIn, Mail, UserPlus } from 'lucide-react';
-import { useEffect, useState, type FormEvent, type ReactNode } from 'react';
+import { APP_NAME, APP_NAME_CN, VERSION, type SessionUser } from '@readsync/shared';
+import { BookOpen, Eye, EyeOff, Fingerprint, KeyRound, LogIn, Mail, UserPlus } from 'lucide-react';
+import { useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react';
 import { Link, useLocation, useNavigate } from 'react-router-dom';
 import { Alert } from '../components/ui/Alert';
 import { Button } from '../components/ui/Button';
@@ -10,6 +10,14 @@ import { Segmented } from '../components/ui/Segmented';
 import { useAuth } from '../contexts/AuthContext';
 import { ApiError, api } from '../lib/api';
 import { isEncryptionAvailable } from '../lib/crypto';
+import {
+  isConditionalUiSupported,
+  isPasskeySupported,
+  maskAccount,
+  readLastAccount,
+  rememberLastAccount,
+  type LastAccount,
+} from '../lib/webauthn';
 import {
   checkPasswordStrength,
   emailField,
@@ -33,9 +41,15 @@ type Mode = 'login' | 'register';
 export function Login(): ReactNode {
   const navigate = useNavigate();
   const location = useLocation();
-  const { login, register, settings, user } = useAuth();
+  const { login, loginWithPasskey, register, settings, user } = useAuth();
 
   const [mode, setMode] = useState<Mode>('login');
+  /** 本机上次登录过的账号（不含任何凭据）。有它就把账号字段收起来，只让填密码 */
+  const [lastAccount, setLastAccount] = useState<LastAccount | null>(() => readLastAccount());
+  const [useOtherAccount, setUseOtherAccount] = useState(false);
+  const [passkeySupported, setPasskeySupported] = useState(false);
+  const [conditionalReady, setConditionalReady] = useState(false);
+  const [passkeyBusy, setPasskeyBusy] = useState(false);
   const [username, setUsername] = useState('');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
@@ -73,6 +87,98 @@ export function Login(): ReactNode {
   useEffect(() => {
     if (!registrationEnabled && mode === 'register') setMode('login');
   }, [registrationEnabled, mode]);
+
+  /* ------------------------------ 通行密钥 ------------------------------ */
+
+  useEffect(() => {
+    setPasskeySupported(isPasskeySupported());
+    let cancelled = false;
+    void isConditionalUiSupported().then((ok) => {
+      if (!cancelled) setConditionalReady(ok);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  /** 登录成功后记住这台设备用的是哪个账号（不存凭据），下次只让填密码 */
+  const rememberAccount = (account: SessionUser | null | undefined): void => {
+    if (!account) return;
+    rememberLastAccount({
+      username: account.username,
+      displayName: account.displayName ?? null,
+      avatarUrl: account.avatarUrl ?? null,
+      hasPasskey: (account.passkeyCount ?? 0) > 0,
+    });
+  };
+
+  /**
+   * 条件式 UI：让浏览器把这台设备上的通行密钥填进「用户名」输入框。
+   *
+   * 必须在页面加载时就发起，并把 `mediation: 'conditional'` 交给浏览器 ——
+   * 此时**不会弹系统框**，凭据出现在自动填充里，用户点一下才算数。
+   * 用户完全可能改用密码登录，那个 Promise 就永远挂着，所以用 AbortController
+   * 在离开页面（或已登录）时中止它。
+   *
+   * 只在输入框可见时启用：账号字段被收起来（本机已记住）时没有可填充的输入框，
+   * 条件式 UI 无从触发。
+   */
+  const conditionalDoneRef = useRef(false);
+  useEffect(() => {
+    if (!conditionalReady || mode !== 'login' || user || conditionalDoneRef.current) return;
+    if (lastAccount && !useOtherAccount) return;
+
+    const controller = new AbortController();
+    void loginWithPasskey({ conditional: true, signal: controller.signal })
+      .then((result) => {
+        if (!result?.accessToken) return;
+        conditionalDoneRef.current = true;
+        rememberAccount(result.user);
+        navigate(redirectTo, { replace: true });
+      })
+      .catch((err: unknown) => {
+        // 自动填充阶段出错不该打断用户（他可能压根没打算用通行密钥）
+        console.warn('条件式通行密钥登录未完成', err);
+      });
+
+    return () => controller.abort();
+  }, [conditionalReady, mode, user, lastAccount, useOtherAccount, loginWithPasskey, navigate, redirectTo]);
+
+  /** 点按钮唤起通行密钥登录（本机账号有凭据就用它，否则走免账号的可发现凭据） */
+  const handlePasskeyLogin = async (): Promise<void> => {
+    setError(null);
+    setPasskeyBusy(true);
+    try {
+      const scoped = lastAccount && !useOtherAccount ? { username: lastAccount.username } : {};
+      const result = await loginWithPasskey(scoped);
+
+      // null = 用户取消或系统里没有可用凭据；不是错误，别吓他
+      if (!result) {
+        setError('没有可用的通行密钥，或已取消。可以改用密码登录。');
+        return;
+      }
+      if (!result.accessToken) {
+        setError('通行密钥登录未完成，请重试或改用密码登录');
+        return;
+      }
+
+      rememberAccount(result.user);
+      navigate(redirectTo, { replace: true });
+    } catch (err) {
+      setError(err instanceof Error ? err.message : '通行密钥登录失败');
+    } finally {
+      setPasskeyBusy(false);
+    }
+  };
+
+  /** 「使用其他账号」：把账号字段放回来，并忘掉本机记住的那个 */
+  const switchAccount = (): void => {
+    setUseOtherAccount(true);
+    setUsername('');
+    setPassword('');
+    setError(null);
+    setNeedsTotp(false);
+  };
 
   const switchMode = (next: Mode): void => {
     setMode(next);
@@ -235,15 +341,62 @@ export function Login(): ReactNode {
 
             {mode === 'login' ? (
               <form className="flex flex-col gap-3.5" onSubmit={(event) => void handleLogin(event)}>
-                <Field label="用户名或邮箱" required>
-                  <Input
-                    value={username}
-                    onChange={(event) => setUsername(event.target.value)}
-                    autoComplete="username"
-                    autoFocus
+                {/*
+                  本机登录过的账号：把账号字段收起来，只让填密码。
+                  账号是打码显示的（`ti***ng`）—— 屏幕上可能还有别人看着，
+                  但要打码到「自己一眼能认出来」为止，否则这个快捷路径就没意义。
+                */}
+                {lastAccount && !useOtherAccount ? (
+                  <div className="flex items-center gap-2.5 rounded-sm border border-line bg-raised px-3 py-2">
+                    {lastAccount.avatarUrl ? (
+                      <img
+                        src={lastAccount.avatarUrl}
+                        alt=""
+                        className="size-8 shrink-0 rounded-full border border-line object-cover"
+                      />
+                    ) : (
+                      <span className="flex size-8 shrink-0 items-center justify-center rounded-full border border-line bg-surface text-muted">
+                        <BookOpen size={14} />
+                      </span>
+                    )}
+
+                    <div className="min-w-0 flex-1">
+                      <div className="truncate font-sans text-sm text-ink">
+                        {lastAccount.displayName || maskAccount(lastAccount.username)}
+                      </div>
+                      <div className="truncate font-mono text-[11px] text-muted">
+                        {maskAccount(lastAccount.username)}
+                      </div>
+                    </div>
+
+                    <button
+                      type="button"
+                      onClick={switchAccount}
+                      className="shrink-0 cursor-pointer font-sans text-xs text-accent underline-offset-2 hover:underline"
+                    >
+                      使用其他账号
+                    </button>
+                  </div>
+                ) : (
+                  <Field
+                    label="用户名或邮箱"
                     required
-                  />
-                </Field>
+                    hint={
+                      conditionalReady
+                        ? '本机若存有通行密钥，点一下这个输入框就会出现在自动填充里'
+                        : undefined
+                    }
+                  >
+                    <Input
+                      value={username}
+                      onChange={(event) => setUsername(event.target.value)}
+                      // `webauthn` 这个 token 是条件式 UI 的开关：没有它浏览器不会填充通行密钥
+                      autoComplete={conditionalReady ? 'username webauthn' : 'username'}
+                      autoFocus
+                      required
+                    />
+                  </Field>
+                )}
 
                 <Field label="密码" required>
                   <div className="relative">
@@ -340,6 +493,43 @@ export function Login(): ReactNode {
                 >
                   登录
                 </Button>
+
+                {/*
+                  通行密钥入口。三种情形都给得到：
+                   - 本机记住了账号且它有通行密钥：按钮显眼一些（多数人点这个就走完了）；
+                   - 本机记住了账号但它没有通行密钥（没开过、或已经删掉）：仍然给按钮，
+                     「再次唤起」不该因为一次取消就消失；
+                   - 新设备（没有记住的账号）：按钮就是唯一入口，走免账号的可发现凭据。
+                */}
+                {passkeySupported ? (
+                  <div className="flex flex-col gap-2">
+                    <div className="flex items-center gap-2">
+                      <span className="h-px flex-1 bg-line" />
+                      <span className="font-sans text-[11px] text-faint">或</span>
+                      <span className="h-px flex-1 bg-line" />
+                    </div>
+
+                    <Button
+                      type="button"
+                      variant={lastAccount?.hasPasskey && !useOtherAccount ? 'secondary' : 'ghost'}
+                      size="lg"
+                      loading={passkeyBusy}
+                      icon={<Fingerprint size={15} />}
+                      className="w-full"
+                      onClick={() => void handlePasskeyLogin()}
+                    >
+                      {lastAccount && !useOtherAccount
+                        ? '用通行密钥登录'
+                        : '用通行密钥登录（免账号）'}
+                    </Button>
+
+                    <p className="text-center font-sans text-[11px] leading-relaxed text-faint">
+                      {lastAccount && !useOtherAccount
+                        ? '用指纹 / 面容 / 设备 PIN 验证，不必输密码'
+                        : '在这台设备上用指纹 / 面容 / 设备 PIN 直接登录，不必先输账号'}
+                    </p>
+                  </div>
+                ) : null}
               </form>
             ) : (
               <form className="flex flex-col gap-3.5" onSubmit={(event) => void handleRegister(event)}>

@@ -20,7 +20,13 @@ import { http } from '../../lib/http.js';
 import { getModuleLogger } from '../../logger.js';
 import { assertApiVersionCompatible, isPathInside, safeParseManifest } from './internal.js';
 import { resolvePluginConfig } from './plugin-config.js';
+import {
+  describeOffset,
+  nextAlignedDelayMs,
+  scheduleOffsetMinutes,
+} from './schedule-timing.js';
 import { buildPluginDataApi, buildStorageApi, buildSyncApi, buildUserScope } from './host-api.js';
+import { buildSqliteApi, closePluginSqlite } from './host-sqlite.js';
 import { listUsersWithConfig, requireActiveUser, resolveUserConfig } from './user-config.js';
 
 /**
@@ -53,6 +59,14 @@ interface LoadedPlugin {
   timers: Map<string, NodeJS.Timeout>;
   /** 任务处理器（含只手动触发、没有定时器的那些） */
   tasks: Map<string, () => void | Promise<void>>;
+  /**
+   * 计时器已被停掉。
+   *
+   * 周期任务用「跑完再排下一次」的方式续命（这样能自我校正漂移），于是有个
+   * 窗口：任务正在跑的时候插件被停用了。那次运行结束时不能再去排下一次 ——
+   * 排出来的计时器没人清，就变成「界面上已停用、后台还在同步」。
+   */
+  schedulesStopped: boolean;
 }
 
 const log = getModuleLogger('plugins');
@@ -196,6 +210,8 @@ export async function unloadPlugin(pluginId: string): Promise<void> {
   }
 
   clearSchedules(loaded);
+  // 插件忘了 close 的 SQLite 临时文件在这里兜底清掉
+  closePluginSqlite(pluginId);
 
   log.info({ pluginId }, '插件已卸载');
 }
@@ -326,6 +342,7 @@ function createLoadedPlugin(
     protocols: new Map(),
     timers: new Map(),
     tasks: new Map(),
+    schedulesStopped: false,
     context: null as unknown as PluginContext,
   };
 
@@ -381,9 +398,15 @@ function createLoadedPlugin(
     // 下面四组由 host-api.ts 提供，权限逐个 gate：未声明时拿到的是抛错的桩
     pluginData: buildPluginDataApi(pluginId, permissions.has('db:plugin')),
     storage: buildStorageApi(pluginId, permissions.has('fs:storage')),
+    sqlite: buildSqliteApi(pluginId, permissions.has('sqlite:read')),
     sync: buildSyncApi(pluginId, permissions.has('sync:write'), permissions.has('books:write')),
-    schedule: (name: string, everyMinutes: number, fn: () => void | Promise<void>) => {
-      registerSchedule(loaded, name, everyMinutes, fn);
+    schedule: (
+      name: string,
+      everyMinutes: number,
+      fn: () => void | Promise<void>,
+      options?: { offsetMinutes?: number },
+    ) => {
+      registerSchedule(loaded, name, everyMinutes, fn, options);
     },
   } as unknown as PluginContext;
 
@@ -440,6 +463,10 @@ function buildFetch(pluginId: string, allowed: boolean): FetchLike {
  * 否则「停用了插件但定时任务还在跑」是个很难发现的问题 —— 界面上插件已经灰了，
  * 它却还在写数据。
  *
+ * 触发时刻按「整点对齐 + 每个插件固定偏移」排（见 schedule-timing.ts）：多个
+ * 导入插件不会挤在同一瞬间去连网盘、写库，而且触发时刻不再随重启漂移。
+ * 想自己指定偏移的插件可以传 `options.offsetMinutes`。
+ *
  * 任务是**旁路**的：抛错只记日志，不会打断下一次执行，也不会影响主流程。
  */
 function registerSchedule(
@@ -447,6 +474,7 @@ function registerSchedule(
   name: string,
   everyMinutes: number,
   fn: () => void | Promise<void>,
+  options?: { offsetMinutes?: number },
 ): void {
   const minutes = Number(everyMinutes);
   if (!Number.isFinite(minutes) || minutes < 0) {
@@ -463,7 +491,7 @@ function registerSchedule(
   plugin.tasks.set(name, fn);
 
   const existing = plugin.timers.get(name);
-  if (existing) clearInterval(existing);
+  if (existing) clearTimeout(existing);
   plugin.timers.delete(name);
 
   if (minutes === 0) {
@@ -471,25 +499,49 @@ function registerSchedule(
     return;
   }
 
-  const timer = setInterval(() => {
-    // runHook 那套错误隔离在这里同样适用：任务失败不能把进程带下去
-    Promise.resolve()
-      .then(fn)
-      .catch((err: unknown) => {
-        log.error({ err, pluginId: plugin.id, name }, '插件周期任务执行失败');
-      });
-  }, Math.round(minutes * 60_000));
-  // Node 默认会因为这个计时器而拒绝退出，明确放行
-  timer.unref?.();
-  plugin.timers.set(name, timer);
+  const periodMs = Math.round(minutes * 60_000);
+  const requested = Number(options?.offsetMinutes);
+  const offsetMinutes = Number.isFinite(requested)
+    ? requested
+    : scheduleOffsetMinutes(plugin.id, name);
+  const offsetMs = Math.round(offsetMinutes * 60_000);
 
-  log.info({ pluginId: plugin.id, name, everyMinutes }, '插件周期任务已注册');
+  /** 排下一次；每次从「现在」重算，于是任务跑超时或系统休眠后能自己校正回来 */
+  const scheduleNext = (): void => {
+    const delay = nextAlignedDelayMs(Date.now(), periodMs, offsetMs);
+    const timer = setTimeout(() => {
+      plugin.timers.delete(name);
+      Promise.resolve()
+        .then(fn)
+        .catch((err: unknown) => {
+          // runHook 那套错误隔离在这里同样适用：任务失败不能把进程带下去
+          log.error({ err, pluginId: plugin.id, name }, '插件周期任务执行失败');
+        })
+        .finally(() => {
+          // 这次运行期间插件被停用/卸载了就不续排，否则会留下没人清的计时器
+          if (!plugin.schedulesStopped) scheduleNext();
+        });
+    }, delay);
+    // Node 默认会因为这个计时器而拒绝退出，明确放行
+    timer.unref?.();
+    plugin.timers.set(name, timer);
+  };
+
+  plugin.schedulesStopped = false;
+  scheduleNext();
+
+  log.info(
+    { pluginId: plugin.id, name, everyMinutes, offsetMinutes: describeOffset(offsetMinutes) },
+    `插件周期任务已注册（每 ${minutes} 分钟，${describeOffset(offsetMinutes)}）`,
+  );
 }
 
 /** 清掉某个插件的全部周期任务 */
 function clearSchedules(plugin: LoadedPlugin): void {
+  // 先立起停止标记：正在跑的那次任务结束时据此决定不再续排下一次
+  plugin.schedulesStopped = true;
   for (const [name, timer] of plugin.timers) {
-    clearInterval(timer);
+    clearTimeout(timer);
     log.debug({ pluginId: plugin.id, name }, '插件周期任务已停止');
   }
   plugin.timers.clear();

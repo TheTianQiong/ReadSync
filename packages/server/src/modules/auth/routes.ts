@@ -780,7 +780,19 @@ export async function registerAuthRoutes(app: FastifyInstance): Promise<void> {
       attestationType: 'none',
       // 排除已注册凭据，避免同一认证器重复绑定同一个账号
       excludeCredentials: existing.map((p) => ({ id: p.credentialId, transports: p.transports ?? [] })),
-      authenticatorSelection: { residentKey: 'preferred', userVerification: 'preferred' },
+      /*
+       * `residentKey: 'required'` 是「免账号登录」的前提。
+       *
+       * 可发现凭据把「我是谁」也一起存在认证器里，于是登录时不必先知道用户名 ——
+       * 新设备上第一次登录就是靠它。用 'preferred' 时由认证器自行决定，多数平台
+       * 会照做，但没照做的那些在免账号登录时就是找不到，而且**注册时看不出来**，
+       * 等用户换了设备才发现。
+       *
+       * 代价是认证器要占一个凭据槽位（安全密钥通常有几十个），自托管场景无所谓。
+       * 早年用 'preferred' 注册过的凭据仍可用于「指定账号」的登录，只是不出现在
+       * 免账号的列表里。
+       */
+      authenticatorSelection: { residentKey: 'required', userVerification: 'preferred' },
     });
 
     rememberChallenge('register', options.challenge, user.id);

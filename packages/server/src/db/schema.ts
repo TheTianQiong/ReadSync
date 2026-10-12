@@ -464,8 +464,15 @@ export const readingSessions = sqliteTable(
     seconds: integer('seconds').notNull().default(0),
     /** 会话所属日期，YYYY-MM-DD，按用户时区归集，便于按天聚合 */
     day: text('day').notNull(),
-    /** 小时 0-23，用于热力图 */
-    hour: integer('hour').notNull().default(0),
+    /**
+     * 小时 0-23，用于热力图；**null 表示「只知道当天的总时长，不知道是几点读的」**。
+     *
+     * 有些数据源天生只有日粒度（Anx Reader 的 tb_reading_time 就是每本书每天的合计）。
+     * 那种情况下把时长硬塞进某个小时是**编数据**：热力图会长出一个凭空出现的
+     * 凌晨高峰。宁可如实记 null —— 日/周/月统计照常包含它，热力图与「按小时下钻」
+     * 跳过它。
+     */
+    hour: integer('hour'),
     /** 星期 0-6（0=周日），用于热力图 */
     weekday: integer('weekday').notNull().default(0),
     progressPercent: integer('progress_percent'),

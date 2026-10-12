@@ -79,8 +79,15 @@ function weekdayOf(day: string): number {
   return parsed.getUTCDay();
 }
 
-/** `YYYY-MM-DD` + 小时 → 时刻（按 UTC 构造，仅用于会话起止的展示与排序） */
-function hourStart(day: string, hour: number): Date {
+/**
+ * `YYYY-MM-DD` + 小时 → 时刻（按 UTC 构造，仅用于会话起止的展示与排序）。
+ *
+ * `hour` 为 null 表示「只知道当天的合计」：时刻退化成当天 0 点，仅供排序与
+ * 分页使用 —— 前端靠响应里的 `hourKnown` 决定显示「时间未知」还是显示时刻，
+ * 不会把这个占位值当成真的 0 点读过书。
+ */
+function hourStart(day: string, hour: number | null): Date {
+  if (hour === null) return new Date(`${day}T00:00:00Z`);
   return new Date(`${day}T${String(Math.max(0, Math.min(23, hour))).padStart(2, '0')}:00:00Z`);
 }
 
@@ -428,7 +435,8 @@ export function buildSyncApi(
               device,
               seconds,
               day: day.day,
-              hour: Math.max(0, Math.min(23, Math.round(entry.hour))),
+              // null 原样落库：日粒度的数据源（Anx Reader）不该被塞进某个小时
+              hour: entry.hour === null ? null : Math.max(0, Math.min(23, Math.round(entry.hour))),
               weekday,
               progressPercent: null,
               startedAt: at,

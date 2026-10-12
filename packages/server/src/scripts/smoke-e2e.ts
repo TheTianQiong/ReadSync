@@ -18,8 +18,12 @@ import { buildApp } from '../app.js';
 import { loadConfig } from '../config.js';
 import { ensureKeyPair } from '../crypto/keys.js';
 import { closeDatabase, getDb, openDatabase } from '../db/index.js';
-import { emailCodes, pluginUserConfig, users } from '../db/schema.js';
+import { emailCodes, pluginUserConfig, readingSessions, users } from '../db/schema.js';
 import { buildStorageApi, buildSyncApi } from '../modules/plugins/host-api.js';
+import {
+  nextAlignedDelayMs,
+  scheduleOffsetMinutes,
+} from '../modules/plugins/schedule-timing.js';
 import { sha256Hex } from '../crypto/password.js';
 import { computeKoreaderDocumentId } from '@readsync/shared';
 import { koreaderDocumentIdFromStorage } from '../lib/document-id.js';
@@ -1925,6 +1929,125 @@ async function main(): Promise<void> {
     const dashboard = await api({ method: 'GET', url: '/api/stats/dashboard', headers: auth });
     check('首页聚合接口可用', dashboard.statusCode === 200 && dashboard.json().data?.status !== undefined, dashboard.body);
 
+    /* ---------------- 7b. 热力图：年份切换与按星期/小时下钻 ---------------- */
+    section('7b. 热力图：年份切换与按星期/小时下钻');
+    {
+      /*
+       * 这两个功能都曾是坏的，而且坏在「看着像好的」：
+       *
+       *  - 点热力图格子查明细时，前端是「拉第一页 20 条 → 在本地按星期/小时筛」，
+       *    而某个「周三 15 点」的会话几乎永远落不进最新 20 条里 → 弹窗总是空的。
+       *    后端其实早就支持 weekday/hour 过滤，只是没人用。
+       *  - 热力图不能切年份：它统计全部历史，而 /stats/dashboard 从不给它 from/to。
+       *
+       * 所以这里造一批数据，把「那条要被下钻的记录被挤出第一页」这件事坐实，
+       * 两边的行为都断言出来。
+       */
+      const me = getDb().select().from(users).where(eq(users.username, 'admin')).get()!;
+      const PLATFORM = 'heatchk';
+      const TARGET_DAY = '2025-04-16'; // 周三
+      const TARGET_WEEKDAY = 3;
+      const TARGET_HOUR = 15;
+
+      const insertSession = (day: string, hour: number, seconds: number): void => {
+        const at = new Date(`${day}T${String(hour).padStart(2, '0')}:00:00Z`);
+        getDb()
+          .insert(readingSessions)
+          .values({
+            userId: me.id,
+            platform: PLATFORM,
+            device: 'heatchk',
+            seconds,
+            day,
+            hour,
+            weekday: at.getUTCDay(),
+            progressPercent: null,
+            startedAt: at,
+            endedAt: at,
+          })
+          .run();
+      };
+
+      // 25 条「更新的」会话，足够把 2025 那条挤出第一页（每页 20 条）
+      for (let i = 0; i < 25; i += 1) {
+        insertSession(`2026-09-${String(i + 1).padStart(2, '0')}`, 10, 600);
+      }
+      insertSession(TARGET_DAY, TARGET_HOUR, 1234);
+
+      const wide = await api({
+        method: 'GET',
+        url: `/api/stats/sessions?platform=${PLATFORM}&page=1&pageSize=20`,
+        headers: auth,
+      });
+      const wideItems = wide.json().data?.items ?? [];
+      check(
+        '前提成立：这条记录确实不在第一页里（旧做法因此永远筛不出来）',
+        wideItems.length === 20 && !wideItems.some((row: { seconds: number }) => row.seconds === 1234),
+        wideItems.map((row: { seconds: number }) => row.seconds),
+      );
+
+      const drilled = await api({
+        method: 'GET',
+        url: `/api/stats/sessions?platform=${PLATFORM}&weekday=${TARGET_WEEKDAY}&hour=${TARGET_HOUR}&page=1&pageSize=20`,
+        headers: auth,
+      });
+      check(
+        '按星期 + 小时下钻能查到那条记录（后端过滤）',
+        drilled.json().data?.total === 1 && drilled.json().data?.items?.[0]?.seconds === 1234,
+        drilled.json().data,
+      );
+
+      const otherHour = await api({
+        method: 'GET',
+        url: `/api/stats/sessions?platform=${PLATFORM}&weekday=${TARGET_WEEKDAY}&hour=${TARGET_HOUR + 1}`,
+        headers: auth,
+      });
+      check('同一星期换个小时查不到（过滤真的生效）', otherHour.json().data?.total === 0, otherHour.json().data);
+
+      // ---- 年份切换 ----
+      const allYears = await api({
+        method: 'GET',
+        url: `/api/stats/heatmap?platform=${PLATFORM}`,
+        headers: auth,
+      });
+      check(
+        '热力图返回可选年份（由近及远）',
+        JSON.stringify(allYears.json().data?.availableYears) === JSON.stringify([2026, 2025]),
+        allYears.json().data?.availableYears,
+      );
+      check(
+        '热力图返回总时长',
+        allYears.json().data?.totalSeconds === 25 * 600 + 1234,
+        allYears.json().data?.totalSeconds,
+      );
+
+      const yearScoped = await api({
+        method: 'GET',
+        url: `/api/stats/heatmap?platform=${PLATFORM}&from=2025-01-01&to=2025-12-31`,
+        headers: auth,
+      });
+      check(
+        '限定年份后总时长只剩那一年的',
+        yearScoped.json().data?.totalSeconds === 1234,
+        yearScoped.json().data?.totalSeconds,
+      );
+      const targetCell = (yearScoped.json().data?.cells ?? []).find(
+        (cell: { weekday: number; hour: number }) =>
+          cell.weekday === TARGET_WEEKDAY && cell.hour === TARGET_HOUR,
+      );
+      check('该年份的格子落在正确的星期与小时上', targetCell?.seconds === 1234, targetCell);
+
+      /*
+       * 这条是「切了年份之后还回得去」的保证：可选年份**不带 from/to** 算，
+       * 否则列表会缩成当前那一年，用户再也点不回「全部」。
+       */
+      check(
+        '切到某一年后，年份列表仍然列全',
+        JSON.stringify(yearScoped.json().data?.availableYears) === JSON.stringify([2026, 2025]),
+        yearScoped.json().data?.availableYears,
+      );
+    }
+
     /* ---------------------------- 8. KOSync 协议 ---------------------------- */
     section('8. KOSync 兼容协议');
     const kosyncKey = createHash('md5').update(adminPassword).digest('hex');
@@ -2136,6 +2259,8 @@ async function main(): Promise<void> {
     check('关闭注册后新用户注册被拒', regBlocked.statusCode === 403, regBlocked.body);
 
     /* ------------------- 10b. 插件：用户自助配置 ------------------- */
+    /** 本段装的测试插件；10c 的周期任务测试也用同一个 */
+    const PLUGIN_ID = 'com.readsync.test-userconfig';
     section('10b. 插件：用户自助配置与越权防线');
     {
       /*
@@ -2143,7 +2268,6 @@ async function main(): Promise<void> {
        * 真插件（Reeden 同步）另有一份端到端验证；这里要验的是**接口层**：
        * 谁配得了、配的东西谁看得见、以及写不进别人的账号。
        */
-      const PLUGIN_ID = 'com.readsync.test-userconfig';
       const normalUserId = getDb()
         .select({ id: users.id })
         .from(users)
@@ -2153,18 +2277,48 @@ async function main(): Promise<void> {
         id: PLUGIN_ID,
         name: '自助配置测试插件',
         version: '1.0.0',
-        apiVersion: '>=0.3.0 <0.4.0',
+        apiVersion: '>=0.3.0 <0.5.0',
         capabilities: ['metadata'],
-        permissions: [],
+        // db:plugin 是为了下面那个「周期任务真的会跑」的探针
+        permissions: ['db:plugin'],
         config: [
           { key: 'siteInterval', label: '站点间隔', type: 'number', default: 0 },
           { key: 'personalUrl', label: '我的地址', type: 'url', scope: 'user' },
           { key: 'personalSecret', label: '我的密钥', type: 'password', scope: 'user' },
         ],
       };
+
+      /*
+       * 测试插件注册两个周期任务（0.05 分钟 = 3 秒，让测试等得起）：
+       *
+       *  - `tick`：立刻把 plugin_data 里的计数器加一。用来验「真的会按时触发」。
+       *  - `slow`：先记开始、睡 4 秒、再记结束。用来验「停用后不再续排」——
+       *    周期任务是「跑完再排下一次」，只有让停用正好落在它运行中，
+       *    才真的会踩到那个窗口（否则测试只是在赌）。
+       */
+      const testEntry = `
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+export function register(ctx) {
+  ctx.schedule('tick', 0.05, async () => {
+    const n = (await ctx.pluginData.get('tick')) ?? 0;
+    await ctx.pluginData.set('tick', n + 1);
+  });
+
+  ctx.schedule('slow', 0.05, async () => {
+    const started = ((await ctx.pluginData.get('slowStarted')) ?? 0) + 1;
+    await ctx.pluginData.set('slowStarted', started);
+    await sleep(4000);
+    const done = ((await ctx.pluginData.get('slowDone')) ?? 0) + 1;
+    await ctx.pluginData.set('slowDone', done);
+  });
+}
+`;
       const testZip = new AdmZip();
       testZip.addFile('plugin.json', Buffer.from(JSON.stringify(testManifest), 'utf8'));
-      testZip.addFile('index.js', Buffer.from('export function register() {}\n', 'utf8'));
+      testZip.addFile('index.js', Buffer.from(testEntry, 'utf8'));
 
       const zipPart = buildMultipart(
         {},
@@ -2360,10 +2514,168 @@ async function main(): Promise<void> {
       const siteStorage = buildStorageApi(PLUGIN_ID, true);
       const mismatch = await rejectsWith(() => siteStorage.forStorage(storageId, normalUserId));
       check('站点级接口传错归属同样被拒', /不属于用户/.test(mismatch ?? ''), mismatch);
+    }
+
+    /* ------------- 10c. 插件周期任务的触发时刻 ------------- */
+    section('10c. 插件周期任务：整点对齐、偏移与真正的触发');
+    {
+      /*
+       * 触发时刻 = k × 周期 + 偏移，偏移由「插件 id + 任务名」哈希而来。
+       * 这几条是纯函数断言 —— 对齐算错的表现（永不触发、或每次重排都命中过去
+       * 那个时间点变成忙等）正好是纯函数能照出来的。
+       */
+      const hour = 3_600_000;
+      const base = Date.UTC(2026, 9, 12, 10, 3, 17);
+
+      const offsetA = scheduleOffsetMinutes('com.readsync.reeden-sync', 'sync');
+      check(
+        '偏移是确定的（重启后不会漂）',
+        offsetA === scheduleOffsetMinutes('com.readsync.reeden-sync', 'sync'),
+        offsetA,
+      );
+      check('偏移落在 ±3 分钟内', Math.abs(offsetA) <= 3, offsetA);
+      check(
+        '同一个插件里不同任务也各自错开',
+        scheduleOffsetMinutes('com.readsync.reeden-sync', 'daily-check') !== offsetA,
+      );
+
+      const delay = nextAlignedDelayMs(base, hour, offsetA * 60_000);
+      check('延迟在 (0, 一个周期] 之内', delay > 0 && delay <= hour, delay);
+      check(
+        '触发时刻满足 t ≡ 偏移 (mod 周期)',
+        (base + delay - offsetA * 60_000) % hour === 0,
+        { delay, fireAt: new Date(base + delay).toISOString() },
+      );
+
+      // 恰好在触发点上：应当等满一个周期，而不是立刻触发
+      const onTheHour = Date.UTC(2026, 9, 12, 10, 0, 0);
+      check('恰好对准时取下一个周期', nextAlignedDelayMs(onTheHour, hour, 0) === hour);
+      // 刚过触发点 0.5 秒：同样要等下一个周期（留的余量是 1 秒）
+      check(
+        '刚过触发点 0.5 秒时不会立刻再触发',
+        nextAlignedDelayMs(onTheHour + 500, hour, 0) === hour - 500,
+        nextAlignedDelayMs(onTheHour + 500, hour, 0),
+      );
+      check(
+        '周期为 1 分钟时也按分钟对齐',
+        nextAlignedDelayMs(base, 60_000, 0) === 60_000 - (base % 60_000),
+        nextAlignedDelayMs(base, 60_000, 0),
+      );
+
+      /*
+       * 然后是「真的会按时触发」与「停用后真的会停」。
+       *
+       * 这一段刻意等真实时间：定时器的失败模式（压根没排上、跑完不续排、
+       * 或者停用后还在续排）都不是纯函数断言能覆盖的。
+       */
+      const probe = async (key: string): Promise<number> => {
+        const res = await api({ method: 'GET', url: `/api/plugins/${PLUGIN_ID}/data`, headers: auth });
+        const item = (res.json().data?.items ?? []).find((row: { key: string }) => row.key === key);
+        return Number(item?.value ?? 0);
+      };
+
+      console.log('  … 等待 7 秒，观察快任务是否按 3 秒触发');
+      await new Promise((resolve) => setTimeout(resolve, 7_000));
+      const ticks = await probe('tick');
+      check('周期任务确实按间隔触发了（≥2 次）', ticks >= 2, ticks);
+
+      /*
+       * 停用要挑在慢任务**正在跑**的时候。
+       *
+       * 这样才真的踩到那个窗口：跑完之后的续排会不会被拦住。若只是随便挑个
+       * 时刻停用，测试照不出「少了这道检查」，只是碰巧没踩上 —— 第一版就是
+       * 这样，把守卫删掉它照样绿。
+       */
+      let sawMidRun = false;
+      for (let i = 0; i < 30 && !sawMidRun; i += 1) {
+        sawMidRun = (await probe('slowStarted')) > (await probe('slowDone'));
+        if (!sawMidRun) await new Promise((resolve) => setTimeout(resolve, 300));
+      }
+      check('慢任务已进入运行中（这才算踩上了那个窗口）', sawMidRun);
+
+      const stopped = await api({
+        method: 'POST',
+        url: `/api/plugins/${PLUGIN_ID}/disable`,
+        headers: auth,
+      });
+      check('停用插件成功', stopped.statusCode === 200, stopped.body);
+
+      const startedAtStop = await probe('slowStarted');
+      console.log('  … 等待 9 秒，确认停用后不再有新的运行');
+      await new Promise((resolve) => setTimeout(resolve, 9_000));
+      const doneAfterStop = await probe('slowDone');
+      check(
+        '停用后只跑完正在进行的那次，不再续排',
+        doneAfterStop === startedAtStop,
+        { startedAtStop, doneAfterStop },
+      );
 
       // 卸载，别把测试插件留给后面的段落
       const removed = await api({ method: 'DELETE', url: `/api/plugins/${PLUGIN_ID}`, headers: auth });
       check('测试插件可以卸载', removed.statusCode === 200, removed.body);
+    }
+
+    /* ---------------- 10d. 通行密钥：免账号登录的入口 ---------------- */
+    section('10d. 通行密钥：注册参数与免账号登录');
+    {
+      /*
+       * 真的走一遍 WebAuthn 断言需要硬件认证器，测试里做不到。能验、也该验的是
+       * 「免账号登录」这条路**在服务端是否真的通**：
+       *
+       *  - 不带用户名请求 options 时必须给出空的 allowCredentials —— 那正是
+       *    「可发现凭据」的意思：让认证器自己说我是谁，而不是我们先报账号。
+       *  - 带了不存在的用户名也不能露馅（同样返回空列表，而不是报「查无此人」）。
+       *  - 注册时必须要求 residentKey: 'required' —— 只有可发现凭据才能用于
+       *    免账号登录；用 'preferred' 时注册环节看不出问题，等用户换设备才发现，
+       *    那时候已经晚了。
+       */
+      const anonOptions = await api({
+        method: 'POST',
+        url: '/api/auth/passkeys/login/options',
+        payload: {},
+      });
+      const anonData = anonOptions.json().data;
+      check('不带用户名也能取到登录 challenge', anonOptions.statusCode === 200 && !!anonData?.challenge, anonOptions.body);
+      check(
+        '免账号登录给的是空的 allowCredentials（可发现凭据）',
+        Array.isArray(anonData?.allowCredentials) && anonData.allowCredentials.length === 0,
+        anonData?.allowCredentials,
+      );
+
+      const ghostOptions = await api({
+        method: 'POST',
+        url: '/api/auth/passkeys/login/options',
+        payload: { username: 'no-such-user-here' },
+      });
+      check(
+        '不存在的账号不会露馅（返回同样的空列表）',
+        ghostOptions.statusCode === 200 &&
+          (ghostOptions.json().data?.allowCredentials ?? []).length === 0,
+        ghostOptions.json().data,
+      );
+
+      const registerOptions = await api({
+        method: 'POST',
+        url: '/api/auth/passkeys/register/options',
+        headers: auth,
+      });
+      check(
+        '注册时要求可发现凭据（residentKey = required）',
+        registerOptions.json().data?.authenticatorSelection?.residentKey === 'required',
+        registerOptions.json().data?.authenticatorSelection,
+      );
+
+      // 伪造的断言必须被拒，而不是把服务端带崩
+      const fakeVerify = await api({
+        method: 'POST',
+        url: '/api/auth/passkeys/login/verify',
+        payload: { response: { id: 'not-a-real-credential', response: {} } },
+      });
+      check(
+        '伪造的通行密钥断言被拒绝',
+        fakeVerify.statusCode >= 400 && fakeVerify.json().ok === false,
+        { status: fakeVerify.statusCode },
+      );
     }
 
     /* ---------------------------- 11. 错误信封 ---------------------------- */

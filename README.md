@@ -4,7 +4,7 @@
 
 墨水屏风格界面 · 阅读数据可视化 · 多端进度同步 · 完整的 CLI 与插件体系
 
-[![Version](https://img.shields.io/badge/version-0.3.0-1a1a1a)](#版本管理)
+[![Version](https://img.shields.io/badge/version-0.4.0-1a1a1a)](#版本管理)
 [![License](https://img.shields.io/badge/license-MIT-1a1a1a)](#许可证)
 
 ---
@@ -637,6 +637,10 @@ npm run test:plugin
 READSYNC_DATA_DIR=./data-reeden REEDEN_SAMPLE=/path/to/Reeden \
   npx tsx src/scripts/reeden-import-check.ts
 
+# 安读（Anx Reader）导入的端到端验证（35 项：SQLite 只读 / 日粒度时长 / 指纹跳过 / 幂等）
+# 不需要样本：脚本自己造一份结构一致的 database7.db
+READSYNC_DATA_DIR=./data-anx npx tsx src/scripts/anx-import-check.ts
+
 # 真实 socket 的大文件整体上传（冒烟测试走进程内 inject，照不出传输层问题）
 READSYNC_DATA_DIR=./data-repro npx tsx src/scripts/repro-upload.ts 64
 
@@ -683,6 +687,8 @@ READSYNC_DATA_DIR=./data-repro PROXY_STATUS=524 npx tsx src/scripts/repro-proxy-
 | [docs/storage-cors.md](docs/storage-cors.md) | 对象存储 CORS 配置（预签名直传必读） |
 | [docs/api-reference.md](docs/api-reference.md) | 完整 API 参考，含统一同步接口、分片上传与 KOSync 协议细节 |
 | [docs/plugin-development.md](docs/plugin-development.md) | 插件清单、上下文 API、钩子、存储驱动与同步协议扩展 |
+| [docs/reeden-sync.md](docs/reeden-sync.md) | Reeden 同步插件：WebDAV/S3 数据源、导入口径、故障排查 |
+| [docs/anx-reader-sync.md](docs/anx-reader-sync.md) | 安读（Anx Reader）同步插件：SQLite 数据源、日粒度时长怎么处理 |
 | [koreader-plugin/README.md](koreader-plugin/README.md) | KOReader 同步插件：安装、配置、故障排查 |
 | [docs/https-setup.md](docs/https-setup.md) | 自有域名配置 HTTPS：备案判断、Caddy / Nginx / acme.sh 三种方案 |
 | [docs/security.md](docs/security.md) | 安全设计与权衡、部署检查清单 |

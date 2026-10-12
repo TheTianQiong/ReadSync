@@ -63,6 +63,16 @@ export interface ReadingHeatmap {
   /** 7 行（周日→周六）× 24 列 */
   cells: Array<{ weekday: number; hour: number; seconds: number }>;
   maxSeconds: number;
+  /** 当前范围内的总时长（等于各格子之和，前端直接显示，不必自己加） */
+  totalSeconds: number;
+  /**
+   * 有阅读记录的那些年份，由近及远。
+   *
+   * 热力图是唯一一个「看习惯」的图表，只看最近一年没有意义（作息是长期形成的），
+   * 所以它默认统计全部历史、再让用户按年份回看。**这个列表不受 from/to 影响** ——
+   * 否则选了 2024 年之后就只剩 2024，回不到「全部」。
+   */
+  availableYears: number[];
 }
 
 /** 书库概览 */
@@ -114,7 +124,14 @@ export interface ReadingSessionDetail {
   platform: string;
   device: string;
   seconds: number;
-  /** 会话开始时间 */
+  /**
+   * 是否知道这条读于哪个小时。
+   *
+   * false 表示这个数据源只给了「当天合计」（Anx Reader 就是这样），
+   * 界面应当显示「时间未知」而不是 `startedAt` 那个占位的 00:00。
+   */
+  hourKnown: boolean;
+  /** 会话开始时间；`hourKnown` 为 false 时是当天 0 点的占位值 */
   startedAt: string;
   endedAt: string | null;
   /** 会话结束时的进度百分比 */

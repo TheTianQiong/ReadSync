@@ -17,6 +17,7 @@ import {
   setUploadBaseUrl,
 } from '../lib/api';
 import { buildPasswordPayload, setPlaintextFallbackAllowed } from '../lib/crypto';
+import { loginWithPasskey as loginWithPasskeyRequest } from '../lib/webauthn';
 
 /**
  * 全局登录态。
@@ -53,6 +54,18 @@ interface AuthContextValue {
   loading: boolean;
   isAdmin: boolean;
   login: (credentials: LoginCredentials) => Promise<AuthResult>;
+  /**
+   * 用通行密钥登录。
+   *
+   * 不传 `username` 就是「可发现凭据」：系统列出这台设备上该站点的通行密钥让用户挑，
+   * 于是新设备上第一次登录也不必先输账号。返回 null 表示用户取消或走了别的路
+   * （例如条件式 UI 被中止），不是错误。
+   */
+  loginWithPasskey: (options?: {
+    username?: string;
+    conditional?: boolean;
+    signal?: AbortSignal;
+  }) => Promise<AuthResult | null>;
   register: (payload: RegisterPayload) => Promise<SessionUser>;
   logout: () => Promise<void>;
   logoutAll: () => Promise<void>;
@@ -152,6 +165,22 @@ export function AuthProvider({ children }: { children: ReactNode }): ReactNode {
     return result;
   }, []);
 
+  const loginWithPasskey = useCallback(
+    async (options: { username?: string; conditional?: boolean; signal?: AbortSignal } = {}) => {
+      const result = await loginWithPasskeyRequest(options);
+      if (!result) return null;
+
+      // 与密码登录同样的收尾：令牌落盘 + 更新当前用户
+      const auth = result as unknown as AuthResult;
+      if (auth.accessToken) {
+        setTokens(auth.accessToken, auth.refreshToken);
+        setUser(auth.user);
+      }
+      return auth;
+    },
+    [],
+  );
+
   const register = useCallback(async (payload: RegisterPayload): Promise<SessionUser> => {
     const password = await buildPasswordPayload(payload.password);
 
@@ -230,6 +259,7 @@ export function AuthProvider({ children }: { children: ReactNode }): ReactNode {
       loading,
       isAdmin: user?.role === 'admin',
       login,
+      loginWithPasskey,
       register,
       logout,
       logoutAll,
@@ -237,7 +267,20 @@ export function AuthProvider({ children }: { children: ReactNode }): ReactNode {
       refreshSite,
       patchUser,
     }),
-    [user, settings, initialized, loading, login, register, logout, logoutAll, refreshUser, refreshSite, patchUser],
+    [
+      user,
+      settings,
+      initialized,
+      loading,
+      login,
+      loginWithPasskey,
+      register,
+      logout,
+      logoutAll,
+      refreshUser,
+      refreshSite,
+      patchUser,
+    ],
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

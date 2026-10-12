@@ -64,7 +64,8 @@ interface PlatformRow {
 
 interface HeatmapRow {
   weekday: number;
-  hour: number;
+  /** 可空：有些数据源只有日粒度（见 schema 里 hour 的说明） */
+  hour: number | null;
   seconds: number | null;
 }
 
@@ -110,6 +111,8 @@ interface SessionRow {
   platform: string;
   device: string;
   seconds: number | null;
+  /** 可空：null 表示这条只记到「哪一天」，不知道小时 */
+  hour: number | null;
   startedAt: number;
   endedAt: number | null;
   progressPercent: number | null;
@@ -503,7 +506,16 @@ export function getPlatformDistribution(
 
 function buildHeatmapCells(rows: HeatmapRow[]): Array<{ weekday: number; hour: number; seconds: number }> {
   const byKey = new Map<string, number>();
-  for (const row of rows) byKey.set(`${row.weekday}-${row.hour}`, num(row.seconds));
+  for (const row of rows) {
+    /*
+     * hour 为 null 的行（只有当天合计、不知道几点读的）**不能**落进 hour 0：
+     * `${weekday}-null` 与 `${weekday}-0` 不是一回事，但一旦按数字算就会
+     * 悄悄合并到凌晨那一格，热力图上凭空多出一座「凌晨高峰」。
+     * 这类时长照样计入日/周/月统计，只是不进热力图。
+     */
+    if (row.hour === null) continue;
+    byKey.set(`${row.weekday}-${row.hour}`, num(row.seconds));
+  }
 
   // 无数据的格子也必须返回 seconds: 0，前端才能画出完整的 7×24 网格
   const cells: Array<{ weekday: number; hour: number; seconds: number }> = [];
@@ -542,8 +554,39 @@ export function getReadingHeatmap(
 
   const cells = buildHeatmapCells(rows);
   const maxSeconds = cells.reduce((max, cell) => (cell.seconds > max ? cell.seconds : max), 0);
+  const totalSeconds = cells.reduce((sum, cell) => sum + cell.seconds, 0);
 
-  return { cells, maxSeconds };
+  /*
+   * 可选年份**不带 from/to**单独查一次。
+   *
+   * 它是「切换器本身的选项」：若跟着当前范围走，选了 2024 年之后列表就只剩
+   * 2024，用户再也点不回「全部」。平台/书籍过滤照旧带上 —— 那是用户当下的
+   * 视野，年份列表应当跟着它变。
+   */
+  const yearFilters: SessionFilters = {
+    platform: query.platform,
+    bookId: query.bookId,
+  };
+  const { clause: yearClause, params: yearParams } = buildSessionWhere(userId, yearFilters);
+  const yearRows = getRawDb()
+    .prepare(
+      `SELECT substr(s.day, 1, 4) AS year
+         FROM reading_sessions s
+        WHERE ${yearClause}
+        GROUP BY year
+        ORDER BY year DESC
+        LIMIT 30`,
+    )
+    .all(...yearParams) as unknown as Array<{ year: string | null }>;
+
+  const availableYears: number[] = [];
+  for (const row of yearRows) {
+    const year = Number(row.year);
+    // day 一定是 YYYY-MM-DD，理论上不会解析失败；真失败了也不该让整张图挂掉
+    if (Number.isInteger(year) && year > 1900 && year < 3000) availableYears.push(year);
+  }
+
+  return { cells, maxSeconds, totalSeconds, availableYears };
 }
 
 /* ---------------------------- 4. 书库概览 ---------------------------- */
@@ -756,6 +799,7 @@ export function listReadingSessions(
               s.platform AS platform,
               s.device AS device,
               s.seconds AS seconds,
+              s.hour AS hour,
               s.started_at AS startedAt,
               s.ended_at AS endedAt,
               s.progress_percent AS progressPercent
@@ -774,6 +818,8 @@ export function listReadingSessions(
     platform: row.platform,
     device: row.device,
     seconds: num(row.seconds),
+    // 前端据此把「时间未知」的日子如实标出来，而不是显示一个假的 00:00
+    hourKnown: row.hour !== null,
     startedAt: new Date(row.startedAt).toISOString(),
     endedAt: row.endedAt !== null ? new Date(row.endedAt).toISOString() : null,
     progressPercent: row.progressPercent,
@@ -825,7 +871,8 @@ function isWidgetEnabled(layout: DashboardLayout, widget: DashboardWidget): bool
 }
 
 function emptyHeatmap(): ReadingHeatmap {
-  return { cells: buildHeatmapCells([]), maxSeconds: 0 };
+  // 组件没启用时不必去查年份列表：前端拿到空数组就不会渲染切换器
+  return { cells: buildHeatmapCells([]), maxSeconds: 0, totalSeconds: 0, availableYears: [] };
 }
 
 /* --------------------------- 8. 首页聚合 --------------------------- */

@@ -1,7 +1,6 @@
 import {
   type LibraryOverview,
   type ReadingHeatmap as ReadingHeatmapData,
-  type ReadingSessionDetail,
   type ReadingStatusSummary,
   type ReadingTimeTrend,
   type PlatformDistribution,
@@ -11,7 +10,13 @@ import { BookOpen, Clock, Flame, Library, TrendingUp } from 'lucide-react';
 import { useState, type ReactNode } from 'react';
 import { Link } from 'react-router-dom';
 import { PlatformPie } from '../components/charts/PlatformPie';
-import { ReadingHeatmap } from '../components/charts/ReadingHeatmap';
+import {
+  ReadingHeatmap,
+  heatmapCellLabel,
+  heatmapYearOptions as heatmapYearOptionsOf,
+  heatmapYearRange,
+  type HeatmapYear,
+} from '../components/charts/ReadingHeatmap';
 import { TrendChart, type TrendMetric, type TrendVariant } from '../components/charts/TrendChart';
 import { SessionsModal } from '../components/SessionsModal';
 import { Alert } from '../components/ui/Alert';
@@ -22,7 +27,7 @@ import { Segmented } from '../components/ui/Segmented';
 import { PageSpinner } from '../components/ui/Spinner';
 import { api } from '../lib/api';
 import { useAsync } from '../lib/hooks';
-import { formatBytes, formatDateTime, formatDuration, formatPercent, formatRelative, toDate } from '../lib/utils';
+import { formatBytes, formatDateTime, formatDuration, formatPercent, formatRelative } from '../lib/utils';
 
 const GRANULARITY_OPTIONS: ReadonlyArray<{ value: StatGranularity; label: string }> = [
   { value: 'day', label: '日' },
@@ -47,7 +52,6 @@ interface DrilldownState {
   title: string;
   description?: ReactNode;
   filters: Record<string, string | number>;
-  clientFilter?: (session: ReadingSessionDetail) => boolean;
 }
 
 const CLOSED: DrilldownState = { open: false, title: '', filters: {} };
@@ -71,7 +75,13 @@ export function ReadingStatus(): ReactNode {
     [granularity],
   );
   const platforms = useAsync(() => api.get<PlatformDistribution>('/stats/platforms'), []);
-  const heatmap = useAsync(() => api.get<ReadingHeatmapData>('/stats/heatmap'), []);
+  // 热力图默认全部历史；选到某一年时按年再查一次（与首页同一套做法）
+  const [heatmapYear, setHeatmapYear] = useState<HeatmapYear>('all');
+  const heatmap = useAsync(
+    () => api.get<ReadingHeatmapData>('/stats/heatmap', heatmapYearRange(heatmapYear)),
+    [heatmapYear],
+  );
+  const heatmapYearOptions = heatmapYearOptionsOf(heatmap.data?.availableYears ?? []);
   const library = useAsync(() => api.get<LibraryOverview>('/stats/library'), []);
 
   const status = summary.data;
@@ -328,7 +338,20 @@ export function ReadingStatus(): ReactNode {
       </div>
 
       <Card>
-        <CardHeader title="阅读热力图" description="星期 × 时段，点击格子查看该时段的阅读明细" />
+        <CardHeader
+          title="阅读热力图"
+          description="星期 × 时段，点击格子查看该时段的阅读明细"
+          actions={
+            heatmapYearOptions.length > 1 ? (
+              <Segmented
+                size="sm"
+                value={heatmapYear}
+                onChange={setHeatmapYear}
+                options={heatmapYearOptions}
+              />
+            ) : null
+          }
+        />
         <CardBody>
           {heatmap.loading ? (
             <PageSpinner label="载入热力图…" />
@@ -337,14 +360,15 @@ export function ReadingStatus(): ReactNode {
               data={heatmap.data}
               onSelect={(cell) =>
                 openDrilldown({
-                  title: `${['周日', '周一', '周二', '周三', '周四', '周五', '周六'][cell.weekday] ?? ''} ${
-                    cell.hour
-                  }:00 的阅读明细`,
+                  title: `${heatmapCellLabel(cell.weekday, cell.hour, cell.seconds).split(' · ')[0]}${
+                    heatmapYear === 'all' ? '' : `（${heatmapYear} 年）`
+                  }的阅读明细`,
                   description: `该时段累计阅读 ${formatDuration(cell.seconds)}`,
-                  filters: {},
-                  clientFilter: (session) => {
-                    const date = toDate(session.startedAt);
-                    return !!date && date.getDay() === cell.weekday && date.getHours() === cell.hour;
+                  // 星期与小时交给后端过滤：前端只筛「当前这一页」会几乎总是空
+                  filters: {
+                    weekday: cell.weekday,
+                    hour: cell.hour,
+                    ...heatmapYearRange(heatmapYear),
                   },
                 })
               }
@@ -359,7 +383,6 @@ export function ReadingStatus(): ReactNode {
         title={drilldown.title}
         description={drilldown.description}
         filters={drilldown.filters}
-        clientFilter={drilldown.clientFilter}
       />
     </div>
   );

@@ -2,7 +2,7 @@ import type { Paginated, ReadingSessionDetail } from '@readsync/shared';
 import { useMemo, useState, type ReactNode } from 'react';
 import { useAsync } from '../lib/hooks';
 import { api, type QueryValue } from '../lib/api';
-import { formatDateTime, formatDuration, formatPercent } from '../lib/utils';
+import { formatDate, formatDateTime, formatDuration, formatPercent } from '../lib/utils';
 import { EmptyState, ErrorNote } from './ui/EmptyState';
 import { Modal } from './ui/Modal';
 import { Pagination } from './ui/Pagination';
@@ -14,10 +14,15 @@ const PAGE_SIZE = 20;
 /**
  * 图表下钻明细（README 要求 5：「点击任意图表可以显示详细信息」）。
  *
- * 统一走 GET /api/stats/sessions，由调用方传入过滤条件：
+ * 统一走 GET /api/stats/sessions，过滤条件**全部交给后端**：
  *  - 点趋势图的柱子 → { from: 该日, to: 该日 }
  *  - 点平台扇区     → { platform }
- *  - 点热力图格子   → 后端不一定支持星期/小时维度，因此额外用 clientFilter 在前端筛
+ *  - 点热力图格子   → { weekday, hour }（可能再带某个年份的 from/to）
+ *
+ * 这里曾经收一个 `clientFilter` 回调在前端筛，热力图用它按星期/小时过滤 ——
+ * 那是个坑：**筛的只是当前这一页**（20 条，按时间倒序），而「周三 15 点」的
+ * 会话几乎永远落不进最新 20 条里，于是点开永远是空列表。要筛就筛全部，
+ * 那就只能交给后端；所以这个回调已删除，别再加回来。
  *
  * 端点尚未实现时（404）展示空状态，不让整页崩掉。
  */
@@ -27,14 +32,12 @@ export function SessionsModal({
   title,
   description,
   filters,
-  clientFilter,
 }: {
   open: boolean;
   onClose: () => void;
   title: string;
   description?: ReactNode;
   filters?: Record<string, QueryValue>;
-  clientFilter?: (session: ReadingSessionDetail) => boolean;
 }): ReactNode {
   const [page, setPage] = useState(1);
   const filterKey = JSON.stringify(filters ?? {});
@@ -51,11 +54,7 @@ export function SessionsModal({
   );
 
   const normalized = useMemo(() => normalizeSessions(data), [data]);
-
-  const items = useMemo(
-    () => (clientFilter ? normalized.items.filter(clientFilter) : normalized.items),
-    [normalized.items, clientFilter],
-  );
+  const items = normalized.items;
 
   const totalSeconds = items.reduce((sum, item) => sum + item.seconds, 0);
 
@@ -94,7 +93,20 @@ export function SessionsModal({
             <TBody>
               {items.map((session) => (
                 <TR key={session.id}>
-                  <TD className="whitespace-nowrap">{formatDateTime(session.startedAt)}</TD>
+                  <TD className="whitespace-nowrap">
+                    {/*
+                      只有日粒度的数据源（Anx Reader 只记到「哪天」）不知道具体时刻，
+                      这时如实说「时间未知」—— 显示 00:00 会被当成真的半夜读过书。
+                    */}
+                    {session.hourKnown ? (
+                      formatDateTime(session.startedAt)
+                    ) : (
+                      <span className="text-muted">
+                        {formatDate(session.startedAt)}
+                        <span className="ml-1 text-faint">时间未知</span>
+                      </span>
+                    )}
+                  </TD>
                   <TD className="max-w-56 truncate">{session.bookTitle ?? '未关联书籍'}</TD>
                   <TD className="whitespace-nowrap">{session.platform}</TD>
                   <TD className="max-w-40 truncate">{session.device || '—'}</TD>

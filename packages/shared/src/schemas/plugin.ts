@@ -102,6 +102,7 @@ export const pluginManifestSchema = z.object({
         'fs:storage', // 读写服务器存储目录
         'log', // 输出日志
         'db:plugin', // 使用插件专属数据表
+        'sqlite:read', // 以只读方式打开外部 SQLite 数据库（读别的阅读器的数据文件）
         'sync:write', // 代某个账号写入阅读进度与阅读会话（外部数据导入用）
         'books:write', // 代某个账号登记书目、写封面（外部数据导入用）
       ]),
@@ -309,12 +310,50 @@ export interface PluginContext {
   };
 
   /**
+   * 只读地打开一个外部 SQLite 数据库。需要 sqlite:read 权限。
+   *
+   * 为什么内核要提供这个，而不是让插件自己装驱动：插件是无依赖的纯 JS（解压出来
+   * 只有几个文件，没有 node_modules），而读 SQLite 二进制格式不是能顺手实现的东西。
+   * 宿主本来就有 better-sqlite3，把它包一层给插件用，比让每个插件各写一份解析器靠谱。
+   *
+   * 用法（Anx Reader 的 database7.db 就是这么读的）：
+   *
+   * ```js
+   * const db = await ctx.sqlite.open({ data: await source.get('database7.db') });
+   * try {
+   *   const rows = await db.all('SELECT id, title FROM tb_books WHERE is_deleted = 0');
+   * } finally {
+   *   db.close();   // 不关会在临时目录里留下文件
+   * }
+   * ```
+   *
+   * 三条限制：**只读**（写语句会被 SQLite 拒绝）、**只认单条 SELECT**（不是沙箱，
+   * 是防手滑）、**数据是字节**（调用方自己从存储里取，插件拿不到文件路径）。
+   */
+  sqlite: {
+    open(input: { data: Uint8Array }): Promise<PluginSqliteDatabase>;
+  };
+
+  /**
    * 注册一个周期任务。
    *
    * 内核负责在插件停用 / 卸载 / 服务退出时停掉它 —— 插件自己 setInterval
-   * 会在停用后继续跑，等于关不掉的定时器。需要声明 schedule 能力。
+   * 会在停用后继续跑，等于关不掉的定时器。
+   *
+   * **触发时刻按整点对齐**：`everyMinutes = 60` 的任务落在每小时的 HH:00 前后，
+   * 而不是「注册时刻 + 60 分钟」。多一个插件就多一份导入，若它们都在服务启动
+   * 那一刻注册、又都在同一瞬间触发，就会一起挤去连网盘、写库。
+   *
+   * 内核会给每个插件的每个任务派一个**固定的**小偏移（±3 分钟内，由插件 id
+   * 与任务名算出），所以：不同插件错开，同一个插件重启后仍落在同一时刻。
+   * 想自己指定就用 `options.offsetMinutes`（负数表示整点前）。
    */
-  schedule(name: string, everyMinutes: number, fn: () => void | Promise<void>): void;
+  schedule(
+    name: string,
+    everyMinutes: number,
+    fn: () => void | Promise<void>,
+    options?: { offsetMinutes?: number },
+  ): void;
 }
 
 /**
@@ -376,7 +415,14 @@ export interface PluginSessionImport {
     /** YYYY-MM-DD（用户时区下的日期） */
     day: string;
     hours: Array<{
-      hour: number;
+      /**
+       * 0-23；**null 表示只知道这一天的合计，不知道是几点读的**。
+       *
+       * 有些阅读器的数据源天生是日粒度（Anx Reader 的 tb_reading_time 就是
+       * 每本书每天的合计）。这种时长会如实记成「小时未知」：日/周/月统计照常
+       * 包含它，热力图与按小时下钻跳过它 —— 硬塞进某个小时等于编数据。
+       */
+      hour: number | null;
       seconds: number;
       /** 关联到的书目 id（由 ensureBook 返回）；不填则不关联 */
       bookId?: number | null;
@@ -434,6 +480,27 @@ export interface PluginUserScope {
   readonly userId: number;
   readonly sync: PluginUserSyncApi;
   readonly storage: PluginUserStorageApi;
+}
+
+/** 只读打开的 SQLite 数据库（见 `ctx.sqlite.open`） */
+export interface PluginSqliteDatabase {
+  /**
+   * 执行一条查询并取回全部行。
+   *
+   * 参数一律用 `?` 占位（内部是预编译语句），别把值拼进 SQL —— 表名、书名里
+   * 带引号是常事，拼出来的语句轻则报错重则读错数据。
+   */
+  all<T = Record<string, unknown>>(
+    sql: string,
+    params?: Array<string | number | null>,
+  ): Promise<T[]>;
+  /** 取第一行；没有则返回 undefined */
+  get<T = Record<string, unknown>>(
+    sql: string,
+    params?: Array<string | number | null>,
+  ): Promise<T | undefined>;
+  /** 关闭并删掉临时文件。插件要自己负责调用（宿主的卸载流程也会兜底） */
+  close(): void;
 }
 
 /** 插件入口模块的约定导出 */
