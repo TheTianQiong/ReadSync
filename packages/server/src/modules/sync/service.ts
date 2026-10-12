@@ -219,7 +219,7 @@ function findByDocument(userId: number, document: string): SyncEntryRow | undefi
  *
  * 匹配不上就不关联，不影响进度本身写入 sync_entries。
  */
-function resolveBookId(userId: number, document: string, title: string | undefined): number | null {
+export function resolveBookId(userId: number, document: string, title: string | undefined): number | null {
   const db = getDb();
   const needle = document.toLowerCase();
 

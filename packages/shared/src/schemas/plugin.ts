@@ -431,7 +431,10 @@ export interface PluginSessionImport {
        */
       hour: number | null;
       seconds: number;
-      /** 关联到的书目 id（由 ensureBook 返回）；不填则不关联 */
+      /**
+       * 关联到的书目 id（由 ensureBook 返回）。**不填也能关联** —— 内核会按
+       * 文档标识 → md5 → 书名自己去找（与进度同一套逻辑），传了就优先用它。
+       */
       bookId?: number | null;
       document?: string | null;
     }>;

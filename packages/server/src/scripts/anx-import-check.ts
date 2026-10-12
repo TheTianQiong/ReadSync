@@ -32,6 +32,7 @@ import { installPlugin, updatePluginConfig } from '../modules/plugins/service.js
 import { listUsersWithConfig, saveUserConfig } from '../modules/plugins/user-config.js';
 import { safeParseManifest } from '../modules/plugins/internal.js';
 import { getReadingHeatmap, listReadingSessions } from '../modules/stats/service.js';
+import { createBook } from '../modules/library/service.js';
 import { createUser } from '../lib/users.js';
 import { setLogLevel } from '../logger.js';
 
@@ -114,11 +115,11 @@ function buildAnxDatabase(file: string): void {
       null,
       MD5_A,
     );
-    // B：没有 file_md5（用派生键兜底），读到 12.5%
+    // B：没有 file_md5（用派生键兜底），读到 12.5%，有封面
     insertBook.run(
       2,
       '测试书 B',
-      null,
+      'cover/b.png',
       'file/b.txt',
       'epubcfi(/6/10!/4,/2/1:0)',
       0.125,
@@ -176,6 +177,7 @@ async function main(): Promise<void> {
   const sampleDb = path.join(sampleDir, 'database7.db');
   buildAnxDatabase(sampleDb);
   writeFileSync(path.join(sampleDir, 'data', 'cover', 'a.png'), PNG_1X1);
+  writeFileSync(path.join(sampleDir, 'data', 'cover', 'b.png'), PNG_1X1);
   const dbFingerprint = createHash('md5').update(readFileSync(sampleDb)).digest('hex');
   check('造出 Anx 数据库（tb_books 3 行 / tb_reading_time 4 行，含 1 本已删除）', true);
 
@@ -191,6 +193,25 @@ async function main(): Promise<void> {
     plainPassword: 'AnxPass12345',
   });
   check('准备两个账号（第二个用来验证配置不外溢）', user.id > 0 && other.id > 0);
+
+  /*
+   * 先按 **Reeden 的方式**把「测试书 A」建进书库：同样的 md5，但文档标识是
+   * Reeden 自己的 bookId（不是 md5）。
+   *
+   * 这正是用户报的那个场景 —— 同一本书先由 Reeden 录入，随后 Anx 导入时长，
+   * 两边只有 md5 相同。若关联只认「插件传来的 bookId」或只认文档标识，这些
+   * 时长就会挂在「未关联书籍」上。
+   */
+  const reedenDocumentId = md5Of('reeden-book-a');
+  const reedenBook = await createBook(user.id, {
+    title: '测试书 A',
+    author: '作者甲',
+    format: 'epub',
+    size: 1024,
+    md5: MD5_A,
+    documentId: reedenDocumentId,
+  } as never);
+  check('先按 Reeden 的方式登记同一本书（md5 相同、文档标识不同）', reedenBook.id > 0, reedenBook.id);
 
   const zip = new AdmZip();
   zip.addLocalFolder(path.join(repoRoot, 'packages', 'server', 'plugins-samples', 'anx-reader-sync'));
@@ -264,8 +285,18 @@ async function main(): Promise<void> {
     .where(sql`${books.ownerId} = ${user.id} and ${books.md5} = ${MD5_A}`)
     .get();
   check('有 file_md5 的书按原 md5 登记（能与网页端上传的同一本对上）', bookA !== undefined, bookA?.title);
-  check('书名取自 tb_books.title', bookA?.title === '测试书 A', bookA?.title);
-  check('作者取自 tb_books.author', bookA?.author === '作者甲', bookA?.author);
+  check('Reeden 先建的同一本书被复用，没有重复建一本', bookA?.id === reedenBook.id, {
+    bookA: bookA?.id,
+    reedenBook: reedenBook.id,
+  });
+  check('已有的文档标识没被覆盖（Reeden 的 bookId 仍是它的主标识）', bookA?.documentId === reedenDocumentId, {
+    got: bookA?.documentId,
+    expected: reedenDocumentId,
+  });
+  check('已有的书目信息也没被覆盖', bookA?.title === '测试书 A' && bookA?.author === '作者甲', {
+    title: bookA?.title,
+    author: bookA?.author,
+  });
   check('格式从 file_path 的扩展名推出', bookA?.format === 'epub', bookA?.format);
 
   const bookB = db
@@ -290,8 +321,12 @@ async function main(): Promise<void> {
   check('进度串原样保留 EPUB CFI', entryA?.progress === CFI_A, entryA?.progress);
   check('百分比按 0-10000 落库（86% → 8600）', entryA?.percentage === 8600, entryA?.percentage);
   check('同步来的进度把状态推进到「在读」', bookA?.readingStatus === 'reading', bookA?.readingStatus);
-  check('封面从 data/cover 里取到', bookA?.coverUpdatedAt !== null, bookA?.coverUpdatedAt);
-  check('没有封面的书不会因此失败', bookB?.coverUpdatedAt === null, bookB?.coverUpdatedAt);
+  check('封面从 data/cover 里取到（Anx 新建的那本）', bookB?.coverUpdatedAt !== null, bookB?.coverUpdatedAt);
+  /*
+   * 已有的书不会被塞封面：它可能是用户自己传过封面的，导入不该覆盖。
+   * （代价是「书已存在但没有封面」时也不会补 —— 宁可不动用户的封面。）
+   */
+  check('已有的书不会被导入的封面覆盖', bookA?.coverUpdatedAt === null, bookA?.coverUpdatedAt);
 
   /* -------------------- 4. 时长：小时未知 -------------------- */
   const sessions = db
@@ -311,6 +346,30 @@ async function main(): Promise<void> {
     sessions.map((s) => s.hour),
   );
   check('平台标识为 anx', sessions.every((s) => s.platform === PLATFORM), sessions[0]?.platform);
+
+  /*
+   * 关联书目 —— 这两条是用户报的那个 bug 的哨兵。
+   *
+   * 时长原本只认「插件传进来的 bookId」，而 Anx 插件只给了文档标识（= file_md5）。
+   * 于是时长导进来了、进度也关联好了，明细里那几行却写着「未关联书籍」，
+   * 统计里那本书一条时长都没有。
+   */
+  check(
+    '所有时长都关联到了书籍（没有「未关联书籍」）',
+    sessions.every((s) => s.bookId !== null),
+    sessions.map((s) => ({ day: s.day, bookId: s.bookId, document: s.document })),
+  );
+  check(
+    'Reeden 先建的同一本书，Anx 的时长也挂在它名下',
+    sessions.filter((s) => s.document === MD5_A).length > 0 &&
+      sessions.filter((s) => s.document === MD5_A).every((s) => s.bookId === reedenBook.id),
+    sessions.filter((s) => s.document === MD5_A).map((s) => ({ day: s.day, bookId: s.bookId })),
+  );
+  check(
+    'Anx 自己新建的那本，时长同样关联',
+    sessions.filter((s) => s.document === md5Of('anx:2')).every((s) => s.bookId === bookB?.id),
+    sessions.filter((s) => s.document === md5Of('anx:2')).map((s) => s.bookId),
+  );
 
   // 明细接口要如实告诉前端「时间未知」
   const detail = listReadingSessions(user.id, { granularity: 'day' }, {}, 1, 20, 'Asia/Shanghai');
@@ -350,7 +409,8 @@ async function main(): Promise<void> {
   const storedFingerprint = db
     .select()
     .from(pluginData)
-    .where(sql`${pluginData.pluginId} = ${PLUGIN_ID} and ${pluginData.key} = ${`dbMd5:${user.id}`}`)
+    // 键名带「导入逻辑版本」：改了导入逻辑就 +1，让所有人重跑一次刷新历史数据
+    .where(sql`${pluginData.pluginId} = ${PLUGIN_ID} and ${pluginData.key} = ${`dbMd5:v2:${user.id}`}`)
     .get()?.value;
 
   check('记录了数据库指纹', storedFingerprint === dbFingerprint, { storedFingerprint, dbFingerprint });

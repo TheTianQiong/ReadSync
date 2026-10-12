@@ -19,7 +19,7 @@ import { saveBookCover } from '../library/cover.js';
 import { BROWSE_SCAN_LIMIT, browseStorage, getAdapterForStorage } from '../storage/service.js';
 import { createAdapter } from '../storage/adapters/registry.js';
 import type { StorageAdapter } from '../storage/types.js';
-import { upsertProgress } from '../sync/service.js';
+import { resolveBookId, upsertProgress } from '../sync/service.js';
 import { getModuleLogger } from '../../logger.js';
 
 /**
@@ -403,6 +403,26 @@ export function buildSyncApi(
       let inserted = 0;
       let days = 0;
 
+      /*
+       * 关联书目：插件可以不传 bookId，只给文档标识，由内核按
+       * 「文档标识 → md5 → 书名」找（与进度走的是同一个 resolveBookId）。
+       *
+       * 这一档不能省。Anx Reader 的文档标识是**整文件 MD5**，而同一本书若先是
+       * 由 Reeden 导入的，它的文档标识是 Reeden 自己的 bookId —— 两者只有 md5
+       * 相同。少了这层回退，时长导进来了却挂在「未关联书籍」上，统计里那本书
+       * 一条时长都没有，而进度却是关联好的，看起来像数据坏了。
+       *
+       * 一次导入动辄几百天 × 几本书，同一个文档会反复出现，所以结果记在本地。
+       */
+      const resolvedBooks = new Map<string, number | null>();
+      const bookIdFor = (document: string | null | undefined, explicit?: number | null): number | null => {
+        if (explicit !== undefined && explicit !== null) return explicit;
+        if (!document) return null;
+        const key = document.toLowerCase();
+        if (!resolvedBooks.has(key)) resolvedBooks.set(key, resolveBookId(userId, key, undefined));
+        return resolvedBooks.get(key) ?? null;
+      };
+
       for (const day of input.days) {
         const weekday = weekdayOf(day.day);
         /*
@@ -429,7 +449,8 @@ export function buildSyncApi(
           db.insert(readingSessions)
             .values({
               userId,
-              bookId: entry.bookId ?? null,
+              // 插件给了就用它；没给就按文档标识/md5 找（见上面 bookIdFor 的说明）
+              bookId: bookIdFor(entry.document, entry.bookId),
               document: entry.document ?? null,
               platform: input.platform,
               device,

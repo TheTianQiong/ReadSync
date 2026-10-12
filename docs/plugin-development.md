@@ -261,6 +261,12 @@ await ctx.sync.setCover({ book: 12, mime: 'image/jpeg', dataBase64: '…' });
 `importSessions` 是**按天替换**（先删该账号 + 该 platform + 该天的旧行再写），
 这是刻意的：导入类插件会被反复重跑，累加会把时长越滚越大。
 
+**每条时长只需要给 `document`（文档标识），书目关联由内核自己做** —— 按
+「文档标识 → md5 → 书名」找（与进度走的是同一套）。这一层不能省：同一本书先由
+别的来源登记、两边只有 md5 相同时（Anx 的 `file_md5` vs Reeden 的 bookId 就是
+这种），只给文档标识才找得到。`bookId` 仍然可以传（`ensureBook` 的返回值），
+传了就优先用它。
+
 `user` 可以是用户名、邮箱或用户 id。
 
 **`hour` 可以传 `null`** —— 表示「只知道这一天的合计，不知道是几点读的」。

@@ -44,6 +44,15 @@ import { createHash } from 'node:crypto';
 const PLATFORM = 'anx';
 const DEVICE = 'Anx Reader';
 
+/**
+ * 导入逻辑版本（见下面 fingerprintKey 处的说明）。**改了导入逻辑就 +1**：
+ * 这会让所有人在下次同步时完整重跑一遍，把历史数据按新逻辑刷新。
+ *
+ * v2：时长改为自行关联书目（此前只有 Anx 新建的书能关联上，
+ *     Reeden 先建的那本会显示「未关联书籍」）。
+ */
+const LOGIC_VERSION = 2;
+
 /** 服务端的书籍格式枚举（见 shared 的 BOOK_FORMATS）；认不出的扩展名一律按 other */
 const KNOWN_FORMATS = new Set([
   'epub', 'pdf', 'mobi', 'azw3', 'azw', 'fb2', 'txt', 'cbz', 'cbr', 'djvu', 'zip', 'json', 'other',
@@ -283,7 +292,16 @@ export async function register(ctx) {
 
     const bytes = Buffer.from(await source.get(dbKey));
     const fingerprint = createHash('md5').update(bytes).digest('hex');
-    const fingerprintKey = `dbMd5:${userId}`;
+
+    /*
+     * 指纹键里带一个「导入逻辑版本」。
+     *
+     * 改了导入逻辑（比如这次修好了时长与书目的关联）就把它 +1：键一变，所有
+     * 用户下次同步都会**完整重跑一遍**，历史数据随之被刷新（时长是按天替换的）。
+     * 不带版本号的话，「数据库没变就跳过」会让旧数据一直躺着 —— 用户看到的是
+     * 「升级了但什么都没变」，而原因藏在插件数据表的一个键里，谁也想不到。
+     */
+    const fingerprintKey = `dbMd5:v${LOGIC_VERSION}:${userId}`;
 
     if (cfg.skipUnchanged !== false && (await ctx.pluginData.get(fingerprintKey)) === fingerprint) {
       ctx.log.info(`数据库未变化（${fingerprint.slice(0, 8)}…），跳过`, { userId });
