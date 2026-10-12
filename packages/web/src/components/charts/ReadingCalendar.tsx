@@ -84,10 +84,22 @@ export function ReadingCalendar({
   // 说清覆盖了哪一段：用户看「读过几天」时必须知道这是哪一年的几天
   const summary = `${label}（${from} ~ ${to}）· 读过 ${activeDays} 天 · 合计 ${formatDuration(totalSeconds)}`;
 
+  /*
+   * 列宽用 `1fr` 平分容器宽度，格子用 `aspect-square` 跟着方形化 ——
+   * 于是宽屏上整张图铺满这一块（而不是一堆小方块缩在左边），窄屏靠外层的
+   * `min-w` + `overflow-x-auto` 滚动。月份标签用**同一套网格**、指定落在
+   * 起始列上，所以永远与它那一列对齐（不靠百分比去猜）。
+   */
+  const columnCount = Math.max(1, weeks.length);
+  const gridColumns = {
+    gridTemplateColumns: `repeat(${columnCount}, minmax(0, 1fr))`,
+    gap: '2px',
+  } as const;
+
   return (
     <div className="w-full overflow-x-auto">
-      <div className="min-w-[720px]">
-        {/* 说明行：悬停时显示那一天，否则显示全年小结（与热力图同一套做法） */}
+      <div className="min-w-[680px] max-w-[1200px]">
+        {/* 说明行：悬停时显示那一天，否则显示区间小结（与热力图同一套做法） */}
         <div className="mb-1 flex h-4 items-center gap-1.5 font-sans text-[11px]">
           {focused ? (
             <>
@@ -109,15 +121,15 @@ export function ReadingCalendar({
           )}
         </div>
 
-        {/* 月份标签：按列位置百分比摆，不依赖具体像素宽度 */}
+        {/* 月份标签：与下面的格子网格同列，标签摆在自己那一列的开头 */}
         <div className="flex">
           <div className="w-5 shrink-0" />
-          <div className="relative h-4 flex-1">
+          <div className="grid flex-1" style={gridColumns}>
             {monthStarts(weeks).map((month) => (
               <span
                 key={month.key}
-                className="absolute font-sans text-[10px] text-muted"
-                style={{ left: `${(month.weekIndex / Math.max(1, weeks.length)) * 100}%` }}
+                className="overflow-visible font-sans text-[10px] whitespace-nowrap text-muted"
+                style={{ gridColumnStart: month.weekIndex + 1 }}
               >
                 {month.label}
               </span>
@@ -126,22 +138,32 @@ export function ReadingCalendar({
         </div>
 
         <div className="flex">
-          {/* 星期标签：只标一/三/五，且与格子行高对齐 */}
-          <div className="flex w-5 shrink-0 flex-col gap-px pt-px">
+          {/* 星期标签：行高交给网格（7 等分），只标一/三/五 */}
+          <div
+            className="grid w-5 shrink-0"
+            style={{ gridTemplateRows: 'repeat(7, minmax(0, 1fr))', gap: '2px' }}
+          >
             {WEEKDAY_ROWS.map((label, index) => (
-              <span key={label} className="h-2.5 font-sans text-[9px] leading-none text-faint">
+              <span
+                key={label}
+                className="flex items-center font-sans text-[9px] leading-none text-faint"
+              >
                 {LABELED_ROWS.has(index) ? label : ''}
               </span>
             ))}
           </div>
 
-          <div className="flex gap-px">
+          <div className="grid flex-1" style={gridColumns}>
             {weeks.map((week, weekIndex) => (
-              <div key={weekIndex} className="flex flex-col gap-px">
+              <div
+                key={weekIndex}
+                className="flex flex-col"
+                style={{ gap: '2px' }}
+              >
                 {week.map((day, rowIndex) => {
                   if (!day) {
                     // 日历边界外的占位：透明，什么都不画
-                    return <span key={rowIndex} className="size-2.5" />;
+                    return <span key={rowIndex} className="aspect-square w-full" />;
                   }
 
                   const level = intensity(day.seconds);
@@ -163,7 +185,7 @@ export function ReadingCalendar({
                       onClick={() => clickable && onSelect?.(day)}
                       disabled={!clickable}
                       className={cn(
-                        'size-2.5 rounded-[1px] border transition-colors',
+                        'aspect-square w-full rounded-[2px] border transition-colors',
                         day.future ? 'border-transparent bg-transparent' : 'border-line',
                         clickable ? 'cursor-pointer' : 'cursor-default',
                       )}
