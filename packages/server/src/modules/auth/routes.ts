@@ -33,7 +33,8 @@ import {
 import { decryptString, encryptString } from '../../crypto/secret-box.js';
 import { getDb } from '../../db/index.js';
 import { passkeys, users, type PasskeyRow } from '../../db/schema.js';
-import { badRequest, conflict, forbidden, internal, notFound, rateLimited, unauthorized } from '../../errors.js';
+import { badRequest, conflict, forbidden, internal, notFound, unauthorized } from '../../errors.js';
+import { scaledLimit } from '../../lib/rate-limit.js';
 import { auditContextFrom, recordAudit } from '../../lib/audit.js';
 import {
   assertMailConfigured,
@@ -101,33 +102,19 @@ export async function registerAuthRoutes(app: FastifyInstance): Promise<void> {
   const log = getModuleLogger('auth');
 
   /**
-   * 路由级限流配置。
+   * 路由级限流配置（实现在 lib/rate-limit.ts，与插件路由共用同一套逻辑）。
    *
-   * 必须显式提供 errorResponseBuilder：@fastify/rate-limit 默认抛的是普通 Error，
+   * 那里必须显式提供 errorResponseBuilder：@fastify/rate-limit 默认抛的是普通 Error，
    * 而 app.ts 的错误处理器只对 AppError 保留 statusCode，普通 Error 会被当成
    * 未处理异常返回 500 —— 前端既拿不到 429 也拿不到 RATE_LIMITED 语义。
-   */
-  /**
-   * 全局限流倍数（`READSYNC_RATE_LIMIT_FACTOR`）。
    *
-   * 默认 1。自托管场景里常见「一家人/一个小团队共用一个公网 IP」，
-   * 按 IP 计的登录限流会把正常使用误伤成「操作过于频繁」；调大这个倍数
-   * 就能放宽全部接口的配额，而不必逐条改代码。
+   * 配额倍数 `READSYNC_RATE_LIMIT_FACTOR` 的语义也在那个文件里：自托管场景常见
+   * 「一家人/一个小团队共用一个公网 IP」，按 IP 计的登录限流会误伤正常使用，
+   * 调大倍数即可放宽全部接口；调小（如 0.5）更严格，但 0 会被当作 1。
    *
-   * 调小（如 0.5）则更严格，但注意 0 会被当作 1，别用它来「关闭」限流。
+   * `limited` 保留为本地别名：历史调用点较多，全量改名收益不大。
    */
-  const factor = ((): number => {
-    const raw = Number(process.env.READSYNC_RATE_LIMIT_FACTOR ?? '');
-    return Number.isFinite(raw) && raw > 0 ? raw : 1;
-  })();
-
-  const scaledLimit = (max: number): number => Math.max(1, Math.round(max * factor));
-
-  const limited = (max: number, timeWindow: string) => ({
-    max: scaledLimit(max),
-    timeWindow,
-    errorResponseBuilder: () => rateLimited('操作过于频繁，请稍后再试'),
-  });
+  const limited = scaledLimit;
 
   /* ------------------------------- 注册 ------------------------------- */
 

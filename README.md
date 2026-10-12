@@ -4,7 +4,7 @@
 
 墨水屏风格界面 · 阅读数据可视化 · 多端进度同步 · 完整的 CLI 与插件体系
 
-[![Version](https://img.shields.io/badge/version-0.4.0-1a1a1a)](#版本管理)
+[![Version](https://img.shields.io/badge/version-0.4.1-1a1a1a)](#版本管理)
 [![License](https://img.shields.io/badge/license-MIT-1a1a1a)](#许可证)
 
 ---
@@ -626,7 +626,7 @@ READSYNC_DATA_DIR=./data-smoke npx tsx src/scripts/smoke-db.ts
 # 数据库迁移校验（含数据保留与外键完整性），会自建旧版库再升级
 READSYNC_DATA_DIR=./data-mig npx tsx src/scripts/check-migration.ts
 
-# 端到端集成测试（282 项断言：认证 / 2FA / 恢复码 / 上传 / 分片 / 预签名直传 / 只登记书目 / 进度关联 / 多标识 / 跨域 / 同步 / 统计 / KOSync / 权限隔离 / 插件自助配置）
+# 端到端集成测试（322 项断言：认证 / 2FA / 通行密钥 / 恢复码 / 上传 / 分片 / 预签名直传 / 只登记书目 / 进度关联 / 多标识 / 跨域 / 同步 / 统计 / 热力图下钻 / KOSync / 权限隔离 / 插件自助配置 / 周期任务 / 手动触发）
 READSYNC_DATA_DIR=./data-e2e npx tsx src/scripts/smoke-e2e.ts
 
 # KOReader 插件的逻辑测试（25 项：每 N 页 / 每隔 N 分钟 / 仅 Wi-Fi / 菜单文案）

@@ -2259,8 +2259,20 @@ async function main(): Promise<void> {
     check('关闭注册后新用户注册被拒', regBlocked.statusCode === 403, regBlocked.body);
 
     /* ------------------- 10b. 插件：用户自助配置 ------------------- */
-    /** 本段装的测试插件；10c 的周期任务测试也用同一个 */
+    /** 本段装的测试插件；10c 的周期任务与 10e 的手动触发都用同一个 */
     const PLUGIN_ID = 'com.readsync.test-userconfig';
+    const normalUserId = getDb()
+      .select({ id: users.id })
+      .from(users)
+      .where(eq(users.username, 'normaluser'))
+      .get()!.id;
+    /** 读测试插件写在 plugin_data 里的探针值（10c 用它数触发次数，10e 用它看运行上下文） */
+    const probe = async (key: string): Promise<any> => {
+      const res = await api({ method: 'GET', url: `/api/plugins/${PLUGIN_ID}/data`, headers: auth });
+      const item = (res.json().data?.items ?? []).find((row: { key: string }) => row.key === key);
+      return item?.value ?? null;
+    };
+
     section('10b. 插件：用户自助配置与越权防线');
     {
       /*
@@ -2268,11 +2280,6 @@ async function main(): Promise<void> {
        * 真插件（Reeden 同步）另有一份端到端验证；这里要验的是**接口层**：
        * 谁配得了、配的东西谁看得见、以及写不进别人的账号。
        */
-      const normalUserId = getDb()
-        .select({ id: users.id })
-        .from(users)
-        .where(eq(users.username, 'normaluser'))
-        .get()!.id;
       const testManifest = {
         id: PLUGIN_ID,
         name: '自助配置测试插件',
@@ -2313,6 +2320,24 @@ export function register(ctx) {
     await sleep(4000);
     const done = ((await ctx.pluginData.get('slowDone')) ?? 0) + 1;
     await ctx.pluginData.set('slowDone', done);
+  });
+
+  /*
+   * 手动触发专用（0 分钟 = 不排定时器），并把它拿到的运行上下文记下来 ——
+   * 测试据此断言「用户点的那次只跑他自己」「管理员点的那次不带 user」。
+   */
+  ctx.schedule('sync', 0, async (run) => {
+    await ctx.pluginData.set('lastManualRun', {
+      user: run?.user ?? null,
+      trigger: run?.trigger ?? null,
+    });
+    return { message: '手动跑完了', user: run?.user ?? null };
+  });
+
+  /** 手动触发专用的慢任务：用来验「同一任务同时只跑一个」 */
+  ctx.schedule('slow-manual', 0, async () => {
+    await sleep(3000);
+    return { message: '慢任务跑完了' };
   });
 }
 `;
@@ -2568,15 +2593,9 @@ export function register(ctx) {
        * 这一段刻意等真实时间：定时器的失败模式（压根没排上、跑完不续排、
        * 或者停用后还在续排）都不是纯函数断言能覆盖的。
        */
-      const probe = async (key: string): Promise<number> => {
-        const res = await api({ method: 'GET', url: `/api/plugins/${PLUGIN_ID}/data`, headers: auth });
-        const item = (res.json().data?.items ?? []).find((row: { key: string }) => row.key === key);
-        return Number(item?.value ?? 0);
-      };
-
       console.log('  … 等待 7 秒，观察快任务是否按 3 秒触发');
       await new Promise((resolve) => setTimeout(resolve, 7_000));
-      const ticks = await probe('tick');
+      const ticks = Number((await probe('tick')) ?? 0);
       check('周期任务确实按间隔触发了（≥2 次）', ticks >= 2, ticks);
 
       /*
@@ -2610,9 +2629,7 @@ export function register(ctx) {
         { startedAtStop, doneAfterStop },
       );
 
-      // 卸载，别把测试插件留给后面的段落
-      const removed = await api({ method: 'DELETE', url: `/api/plugins/${PLUGIN_ID}`, headers: auth });
-      check('测试插件可以卸载', removed.statusCode === 200, removed.body);
+      // 插件先留着（10e 还要用它验手动触发），最后统一卸载
     }
 
     /* ---------------- 10d. 通行密钥：免账号登录的入口 ---------------- */
@@ -2676,6 +2693,132 @@ export function register(ctx) {
         fakeVerify.statusCode >= 400 && fakeVerify.json().ok === false,
         { status: fakeVerify.statusCode },
       );
+    }
+
+    /* ---------------- 10e. 手动触发插件任务 ---------------- */
+    section('10e. 手动触发：管理员跑全部 / 用户只跑自己');
+    {
+      /*
+       * 定时任务一小时才跑一回，刚配好或刚改完路径时没人愿意干等，所以两条路
+       * 都得有按钮。区别只在「为谁跑」：
+       *  - 管理员 → 不带 user，插件按自己的逻辑跑（导入类插件跑所有配置过的人）；
+       *  - 用户   → 内核把他自己的 id 放进任务上下文，插件只处理那一个账号。
+       *    这条要是漏了，某个人点一下「立即同步」就会去连所有人的网盘。
+       */
+      const SITE_ONLY_ID = 'com.readsync.test-siteonly';
+
+      // 10c 把那插件停用了，这里先启用回来
+      const enabled = await api({ method: 'POST', url: `/api/plugins/${PLUGIN_ID}/enable`, headers: auth });
+      check('重新启用测试插件', enabled.statusCode === 200 && enabled.json().data?.status === 'enabled', enabled.body);
+
+      // 一个只有站点级字段的插件：不该出现在用户自助页，也不该由用户触发
+      const siteManifest = {
+        id: SITE_ONLY_ID,
+        name: '仅站点配置测试插件',
+        version: '1.0.0',
+        apiVersion: '>=0.3.0 <0.5.0',
+        capabilities: ['metadata'],
+        permissions: [],
+        config: [{ key: 'siteOnlyField', label: '站点字段', type: 'string' }],
+      };
+      const siteZip = new AdmZip();
+      siteZip.addFile('plugin.json', Buffer.from(JSON.stringify(siteManifest), 'utf8'));
+      siteZip.addFile('index.js', Buffer.from('export function register() {}\n', 'utf8'));
+      const sitePart = buildMultipart(
+        {},
+        {
+          field: 'file',
+          filename: 'siteonly.zip',
+          content: siteZip.toBuffer(),
+          contentType: 'application/zip',
+        },
+      );
+      const installedSiteOnly = await api({
+        method: 'POST',
+        url: '/api/plugins/install',
+        headers: { ...auth, 'content-type': sitePart.contentType },
+        payload: sitePart.body,
+      });
+      check('安装「只有站点配置」的测试插件', installedSiteOnly.statusCode === 200, installedSiteOnly.body);
+
+      const mineList = await api({ method: 'GET', url: '/api/plugins/mine', headers: userAuth });
+      check(
+        '只有站点级字段的插件不出现在用户自助页',
+        !(mineList.json().data ?? []).some((item: { id: string }) => item.id === SITE_ONLY_ID),
+        mineList.json().data,
+      );
+
+      const userRunSiteOnly = await api({
+        method: 'POST',
+        url: `/api/plugins/mine/${SITE_ONLY_ID}/run`,
+        headers: userAuth,
+      });
+      check('用户不能触发「只有站点配置」的插件', userRunSiteOnly.statusCode === 400, userRunSiteOnly.body);
+
+      // ---- 管理员触发：不带 user，跑全部 ----
+      const adminRun = await api({
+        method: 'POST',
+        url: `/api/plugins/${PLUGIN_ID}/run`,
+        headers: auth,
+      });
+      check('管理员可以立即运行插件', adminRun.statusCode === 200, adminRun.body);
+      check('运行结果回传任务的返回值', adminRun.json().data?.result?.message === '手动跑完了', adminRun.json().data);
+
+      const afterAdmin = await probe('lastManualRun');
+      check(
+        '管理员触发时任务上下文里没有 user（跑全部）',
+        afterAdmin?.user === null && afterAdmin?.trigger === 'manual',
+        afterAdmin,
+      );
+
+      // ---- 用户触发：只跑自己 ----
+      const userRun = await api({
+        method: 'POST',
+        url: `/api/plugins/mine/${PLUGIN_ID}/run`,
+        headers: userAuth,
+      });
+      check('用户可以立即同步自己的那份', userRun.statusCode === 200, userRun.body);
+      check('用户触发的范围标记为 user', userRun.json().data?.scope === 'user', userRun.json().data);
+
+      const afterUser = await probe('lastManualRun');
+      check(
+        '用户触发时任务上下文里带的是他自己（插件只看得到自己的账号）',
+        afterUser?.user === normalUserId && afterUser?.trigger === 'manual',
+        { afterUser, normalUserId },
+      );
+
+      // ---- 同任务同时只跑一个 ----
+      const first = api({
+        method: 'POST',
+        url: `/api/plugins/${PLUGIN_ID}/run?task=slow-manual`,
+        headers: auth,
+      });
+      // 等第一次真的进来了，再发第二次
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      const second = await api({
+        method: 'POST',
+        url: `/api/plugins/${PLUGIN_ID}/run?task=slow-manual`,
+        headers: auth,
+      });
+      check('同一任务正在运行时再次触发被拒（409）', second.statusCode === 409, second.body);
+      const firstDone = await first;
+      check('先发起的那次照常跑完', firstDone.statusCode === 200, firstDone.body);
+
+      const missing = await api({
+        method: 'POST',
+        url: '/api/plugins/com.example.nope/run',
+        headers: auth,
+      });
+      check('运行不存在的插件返回 404', missing.statusCode === 404, missing.statusCode);
+
+      const anonRun = await api({ method: 'POST', url: `/api/plugins/${PLUGIN_ID}/run` });
+      check('未登录不能触发运行', anonRun.statusCode === 401, anonRun.statusCode);
+
+      // 收尾：两个测试插件都卸掉
+      for (const id of [PLUGIN_ID, SITE_ONLY_ID]) {
+        const removed = await api({ method: 'DELETE', url: `/api/plugins/${id}`, headers: auth });
+        check(`卸载测试插件 ${id}`, removed.statusCode === 200, removed.body);
+      }
     }
 
     /* ---------------------------- 11. 错误信封 ---------------------------- */

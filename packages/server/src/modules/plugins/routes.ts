@@ -10,8 +10,11 @@ import {
 } from '@readsync/shared';
 import { badRequest, unsupportedMediaType } from '../../errors.js';
 import { auditContextFrom, recordAudit } from '../../lib/audit.js';
+import { scaledLimit } from '../../lib/rate-limit.js';
 import { currentUser, requireAdmin, requireAuth } from '../../middleware/auth.js';
-import { mountPluginRoutes } from './loader.js';
+import { mountPluginRoutes, runPluginTask } from './loader.js';
+import { safeParseManifest } from './internal.js';
+import { hasUserScopedFields, requireEnabledPlugin } from './user-config.js';
 import {
   disablePlugin,
   enablePlugin,
@@ -75,6 +78,41 @@ export async function registerPluginRoutes(app: FastifyInstance): Promise<void> 
 
       return { ok: true, data: { config } } satisfies ApiSuccess<{
         config: Record<string, unknown>;
+      }>;
+    },
+  );
+
+  /**
+   * 立刻同步我自己的那一份（「设置 → 插件」上的「立即同步」）。
+   *
+   * 关键在于 `user: 我自己`：内核把这个 id 放进任务上下文，插件只处理这一个
+   * 账号。若走管理员那条路（不带 user），某个人点一下按钮就会去连所有人的网盘。
+   */
+  app.post<{ Params: { id: string } }>(
+    '/api/plugins/mine/:id/run',
+    { preHandler: requireAuth, config: { rateLimit: scaledLimit(6, '5 minutes') } },
+    async (req) => {
+      const pluginId = req.params.id;
+      const row = requireEnabledPlugin(pluginId);
+      const manifest = safeParseManifest(row.manifest);
+      if (!manifest) throw badRequest(`插件 ${pluginId} 的清单数据已损坏，请重新安装`);
+      if (!hasUserScopedFields(manifest)) {
+        throw badRequest('这个插件没有需要你自己配置的部分，由管理员在后台运行');
+      }
+
+      const user = currentUser(req);
+      const data = await runPluginTask(pluginId, 'sync', { trigger: 'manual', user: user.id });
+
+      recordAudit('plugin.run', auditContextFrom(req), {
+        target: pluginId,
+        meta: { scope: 'user', task: 'sync' },
+      });
+
+      return { ok: true, data: { pluginId, task: 'sync', scope: 'user', result: data ?? null } } satisfies ApiSuccess<{
+        pluginId: string;
+        task: string;
+        scope: 'user';
+        result: unknown;
       }>;
     },
   );
@@ -189,6 +227,36 @@ export async function registerPluginRoutes(app: FastifyInstance): Promise<void> 
         ok: true,
         data: { config },
       } satisfies ApiSuccess<{ config: Record<string, unknown> }>;
+    },
+  );
+
+  /**
+   * 立刻运行某个插件的任务（管理后台的「立即运行」）。
+   *
+   * 不带 `user`：插件按自己的逻辑跑，导入类插件会把**所有配置过的账号**跑一遍。
+   * 只看个别账号的那种「立即同步」在 `/api/plugins/mine/:id/run`。
+   */
+  app.post<{ Params: { id: string }; Querystring: { task?: string } }>(
+    '/api/plugins/:id/run',
+    { preHandler: requireAdmin, config: { rateLimit: scaledLimit(6, '5 minutes') } },
+    async (req) => {
+      const pluginId = req.params.id;
+      requireEnabledPlugin(pluginId);
+
+      const taskName = (req.query.task ?? '').trim() || 'sync';
+      const data = await runPluginTask(pluginId, taskName, { trigger: 'manual' });
+
+      recordAudit('plugin.run', auditContextFrom(req), {
+        target: pluginId,
+        meta: { scope: 'all', task: taskName },
+      });
+
+      return { ok: true, data: { pluginId, task: taskName, scope: 'all', result: data ?? null } } satisfies ApiSuccess<{
+        pluginId: string;
+        task: string;
+        scope: 'all';
+        result: unknown;
+      }>;
     },
   );
 

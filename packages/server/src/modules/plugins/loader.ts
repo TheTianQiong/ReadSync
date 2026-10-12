@@ -11,11 +11,13 @@ import {
   type PluginHook,
   type PluginManifest,
   type PluginModule,
+  type PluginTaskHandler,
+  type PluginTaskRun,
 } from '@readsync/shared';
 import { loadConfig } from '../../config.js';
 import { getDb } from '../../db/index.js';
 import { plugins } from '../../db/schema.js';
-import { notFound, pluginError } from '../../errors.js';
+import { conflict, notFound, pluginError } from '../../errors.js';
 import { http } from '../../lib/http.js';
 import { getModuleLogger } from '../../logger.js';
 import { assertApiVersionCompatible, isPathInside, safeParseManifest } from './internal.js';
@@ -58,7 +60,15 @@ interface LoadedPlugin {
   /** 插件注册的周期任务（name → 计时器）。停用/卸载时由宿主统一清掉 */
   timers: Map<string, NodeJS.Timeout>;
   /** 任务处理器（含只手动触发、没有定时器的那些） */
-  tasks: Map<string, () => void | Promise<void>>;
+  tasks: Map<string, PluginTaskHandler>;
+  /**
+   * 正在运行的任务（`${name}:${user ?? '*'}`）。
+   *
+   * 定时与手动可能撞在一起：定时那趟跑到一半，管理员又点了一下「立即运行」。
+   * 两个导入同时写同一批数据没有好处（一个按天替换另一个正在写），所以同一
+   * 任务同一目标同时只允许跑一个 —— 后来的那个直接拒绝，让用户等一下。
+   */
+  running: Set<string>;
   /**
    * 计时器已被停掉。
    *
@@ -225,9 +235,20 @@ export async function unloadPlugin(pluginId: string): Promise<void> {
 /**
  * 立刻执行某个插件注册过的任务（含「仅手动」的任务）。
  *
- * 给 CLI 用：配好插件后总得能马上跑一次看看，而不是干等下一个整点。
+ * 三处入口共用：CLI（`readsync plugin:run`）、管理后台的「立即运行」、
+ * 用户自助页面的「立即同步」。区别只在 `run`：
+ *
+ *  - CLI / 管理员：不带 `user`，插件按自己的逻辑跑（通常是所有配置过的人）；
+ *  - 用户自助：内核把**他自己**的 id 放进去，插件只处理那一个账号。
+ *
+ * 返回值是任务处理器的返回值（导入类任务会返回各类计数），界面可以据此告诉
+ * 用户「这次导入了什么」。任务自己抛错时原样上抛 —— 手动触发的人需要看到原因。
  */
-export async function runPluginTask(pluginId: string, name: string): Promise<void> {
+export async function runPluginTask(
+  pluginId: string,
+  name: string,
+  run?: Partial<PluginTaskRun>,
+): Promise<unknown> {
   const loaded = loadedPlugins.get(pluginId);
   if (!loaded) throw pluginError(`插件 ${pluginId} 未加载（未启用或加载失败）`);
 
@@ -241,7 +262,39 @@ export async function runPluginTask(pluginId: string, name: string): Promise<voi
     );
   }
 
-  await task();
+  return invokeTask(loaded, name, task, {
+    trigger: run?.trigger ?? 'cli',
+    ...(run?.user !== undefined ? { user: run.user } : {}),
+  });
+}
+
+/**
+ * 跑一个任务，并保证同一任务 + 同一目标同时只跑一次。
+ *
+ * 定时与手动撞车时后来的那个直接拒绝：两个导入同时写同一批数据没有好处，
+ * 而且「点了没反应」比「点了报错」更难排查。
+ */
+async function invokeTask(
+  plugin: LoadedPlugin,
+  name: string,
+  task: PluginTaskHandler,
+  run: PluginTaskRun,
+): Promise<unknown> {
+  const key = `${name}:${run.user ?? '*'}`;
+  if (plugin.running.has(key)) {
+    throw conflict(
+      run.user === undefined
+        ? `任务「${name}」正在运行中，请等它跑完`
+        : `该同步正在运行中，请等它跑完`,
+    );
+  }
+
+  plugin.running.add(key);
+  try {
+    return await task(run);
+  } finally {
+    plugin.running.delete(key);
+  }
 }
 
 /** 列出插件注册过的任务名，供 CLI / 管理页展示 */
@@ -342,6 +395,7 @@ function createLoadedPlugin(
     protocols: new Map(),
     timers: new Map(),
     tasks: new Map(),
+    running: new Set<string>(),
     schedulesStopped: false,
     context: null as unknown as PluginContext,
   };
@@ -512,7 +566,7 @@ function registerSchedule(
     const timer = setTimeout(() => {
       plugin.timers.delete(name);
       Promise.resolve()
-        .then(fn)
+        .then(() => invokeTask(plugin, name, fn, { trigger: 'schedule' }))
         .catch((err: unknown) => {
           // runHook 那套错误隔离在这里同样适用：任务失败不能把进程带下去
           log.error({ err, pluginId: plugin.id, name }, '插件周期任务执行失败');

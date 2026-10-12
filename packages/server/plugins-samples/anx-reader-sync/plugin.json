@@ -1,7 +1,7 @@
 {
   "id": "com.readsync.anx-reader-sync",
   "name": "安读（Anx Reader）同步",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "author": "ReadSync",
   "description": "定时读取 WebDAV / S3 上 Anx Reader 的 database7.db，把书架、阅读进度与每日阅读时长导入本服务器。连接信息由每个用户自己填写，数据只会导入填写者自己的账号。",
   "license": "MIT",

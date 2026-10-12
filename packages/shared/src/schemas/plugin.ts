@@ -347,11 +347,18 @@ export interface PluginContext {
    * 内核会给每个插件的每个任务派一个**固定的**小偏移（±3 分钟内，由插件 id
    * 与任务名算出），所以：不同插件错开，同一个插件重启后仍落在同一时刻。
    * 想自己指定就用 `options.offsetMinutes`（负数表示整点前）。
+   *
+   * 处理器会收到一个 `PluginTaskRun`（`{ user?, trigger }`）。**手动触发**（管理后台
+   * 的「立即运行」、用户页的「立即同步」、CLI）走的是同一个处理器，所以：
+   *
+   *  - 想支持「只同步我自己」，就看 `run.user`（内核从登录态给出，插件改不了）；
+   *  - 定时触发时错误只记日志（不能让定时器炸掉），手动触发时应当**抛出去**，
+   *    让点按钮的人看到失败原因。`run.trigger === 'schedule'` 是判断依据。
    */
   schedule(
     name: string,
     everyMinutes: number,
-    fn: () => void | Promise<void>,
+    fn: PluginTaskHandler,
     options?: { offsetMinutes?: number },
   ): void;
 }
@@ -502,6 +509,27 @@ export interface PluginSqliteDatabase {
   /** 关闭并删掉临时文件。插件要自己负责调用（宿主的卸载流程也会兜底） */
   close(): void;
 }
+
+/**
+ * 插件任务被触发时的上下文。
+ *
+ * 任务是「谁触发、为谁跑」都要说清楚的一件事：定时跑全体用户、管理员点一下跑全体、
+ * 用户在「设置 → 插件」里点「立即同步」则**只跑他自己** —— 后者要是跑成了全体，
+ * 某个人按一下按钮就会去连所有人的网盘。
+ */
+export interface PluginTaskRun {
+  /**
+   * 只处理这个用户；不传表示「按插件自己的逻辑跑」（通常是所有配置过的人）。
+   *
+   * 只有用户自助那条路径会带上它，由内核从登录态取，插件无法自己指定 ——
+   * 与写入入口同一个道理（见 `forUser`）。
+   */
+  user?: number;
+  trigger: 'schedule' | 'manual' | 'cli';
+}
+
+/** 任务处理器。可以忽略参数（多数插件不需要区分是谁触发的） */
+export type PluginTaskHandler = (run: PluginTaskRun) => void | Promise<unknown>;
 
 /** 插件入口模块的约定导出 */
 export interface PluginModule {

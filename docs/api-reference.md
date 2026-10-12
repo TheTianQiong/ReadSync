@@ -282,6 +282,13 @@ KOReader 算的是**采样 MD5**（12 个固定偏移各读 1KB，见 `KOREADER_
 | GET | `/api/plugins/:id/data` | 管理员 | 插件键值数据 |
 | GET | `/api/plugins/mine` | 登录 | 需要**我自己**配置的插件列表 |
 | PUT / DELETE | `/api/plugins/:id/my-config` | 登录 | 保存 / 清空我自己那份配置 |
+| POST | `/api/plugins/:id/run?task=` | 管理员 | 立刻运行某个任务（默认 `sync`），跑**全部**已配置的账号 |
+| POST | `/api/plugins/mine/:id/run` | 登录 | 立刻同步**我自己**那一份（只处理当前账号） |
+
+两个 `run` 的响应都带 `result`：插件任务处理器的返回值原样回传（导入类插件会返回
+`{ books, progress, sessionRows, message }` 这类计数），界面直接拿 `message` 显示即可。
+同一个任务 + 同一个目标正在跑时，后来的请求得到 **409**（两个导入同时写同一批数据
+没有好处）。用户端那个接口只对**声明了用户级配置项**的插件开放，站点级插件回 400。
 
 插件若声明了同步协议，其路由挂载在 `/api/plugins/{pluginId}{mountPath}`。
 

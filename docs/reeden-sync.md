@@ -111,13 +111,26 @@ readsync plugin:enable com.readsync.reeden-sync
 
 ## 四、跑一次
 
+三种触发方式，都不必等定时：
+
+| 在哪 | 跑谁 |
+|---|---|
+| **设置 → 插件 → 立即同步** | **只有你自己** —— 配置里写着你的网盘地址，就只同步你的账号 |
+| **管理后台 → 插件 → 立即运行** | 所有配置过的账号 |
+| `readsync plugin:run com.readsync.reeden-sync` | 同上（命令行） |
+
 ```bash
-# 立刻导入一次（名字就叫 sync）
+# 命令行：任务名可省略，默认取 sync
 readsync plugin:run com.readsync.reeden-sync
 
 # 看插件任务有哪些
 readsync plugin:list
 ```
+
+「设置 → 插件」页面上会显示上次运行的结果（导入了多少本书、多少条进度、多少段时长），
+点完「立即同步」也会直接把这次的结果弹出来。
+
+> 同一个人连着点两次不会重复跑：第一次还在跑的时候，第二次会收到「正在运行中」。
 
 ## 五、导入之后
 

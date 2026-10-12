@@ -203,9 +203,20 @@ async function openSource(storage, cfg) {
  * ========================================================================== */
 
 export async function register(ctx) {
-  /** 所有配置过的用户各跑一遍；某个人失败只跳过他自己 */
-  async function runImport() {
-    const userIds = await ctx.usersWithConfig();
+  /**
+   * 跑一遍导入。
+   *
+   * `run.user` 有值时**只跑那一个账号** —— 那是用户在「设置 → 插件」里点
+   * 「立即同步」的情形，由内核从登录态给出，插件指定不了。没给就遍历所有
+   * 配置过的人（定时任务与管理员手动触发走这条）。
+   *
+   * 单账号那趟**不吞异常**：点按钮的人需要看到失败原因。批量那趟相反 ——
+   * 某个人网盘连不上只该跳过他自己。
+   */
+  async function runImport(run = {}) {
+    const only = run.user;
+    const userIds = only === undefined ? await ctx.usersWithConfig() : [only];
+
     if (userIds.length === 0) {
       ctx.log.info('还没有用户配置过自己的 Anx 备份位置，跳过（请在「设置 → 插件」里配置）');
       return { users: 0, skippedUsers: 0 };
@@ -227,6 +238,8 @@ export async function register(ctx) {
         totals.sessionRows += report.sessionRows ?? 0;
       } catch (err) {
         totals.skippedUsers += 1;
+        // 只跑一个人时把错误抛出去（谁点的按钮谁该知道为什么没成）
+        if (only !== undefined) throw err;
         ctx.log.error(`用户 #${userId} 的导入失败，已跳过该用户`, {
           userId,
           error: String(err?.message ?? err),
@@ -234,12 +247,16 @@ export async function register(ctx) {
       }
     }
 
+    const message =
+      totals.users === 0 && totals.skippedUnchanged > 0
+        ? '数据库没有变化，无需导入'
+        : `书 ${totals.books} 本（新登记 ${totals.created}），进度 ${totals.progress} 条，时长 ${totals.sessionRows} 段`;
+
     ctx.log.info(
       `本轮导入完成：成功 ${totals.users} 个账号（${totals.skippedUnchanged} 个数据库未变化已跳过），` +
-        `失败 ${totals.skippedUsers} 个；书 ${totals.books}（新登记 ${totals.created}），` +
-        `进度 ${totals.progress}，时长 ${totals.sessionRows} 段`,
+        `失败 ${totals.skippedUsers} 个；${message}`,
     );
-    return totals;
+    return { ...totals, message };
   }
 
   /**
@@ -444,12 +461,13 @@ export async function register(ctx) {
     return report;
   }
 
-  /** 手动/定时都走这里：错误只记日志，不让定时器炸掉 */
-  async function safeRun(reason) {
+  /** 定时触发走这里：错误只记日志，不让定时器炸掉 */
+  async function safeRun(reason, run) {
     try {
-      await runImport();
+      return await runImport(run);
     } catch (err) {
       ctx.log.error(`导入失败（${reason}）`, { error: String(err?.message ?? err) });
+      return null;
     }
   }
 
@@ -457,8 +475,17 @@ export async function register(ctx) {
   // 触发时刻由内核按「整点对齐 + 本插件的固定偏移」排（见 plugin-development.md 4.4）
   const initialCfg = ctx.getConfig();
   const intervalMinutes = Number(initialCfg.intervalMinutes);
-  ctx.schedule('sync', Number.isFinite(intervalMinutes) && intervalMinutes > 0 ? intervalMinutes : 0, () =>
-    safeRun('定时'),
+  ctx.schedule(
+    'sync',
+    Number.isFinite(intervalMinutes) && intervalMinutes > 0 ? intervalMinutes : 0,
+    (run) => {
+      /*
+       * 手动触发的错误要抛出去（点按钮的人得看到原因），定时触发的只记日志。
+       * 两种触发共用同一个处理器，`run.trigger` 就是干这个用的。
+       */
+      if (run?.trigger === 'schedule') return safeRun('定时', run);
+      return runImport(run);
+    },
   );
 
   /*
@@ -486,7 +513,7 @@ export async function register(ctx) {
       if (state.lastDate === today) return;
       await ctx.pluginData.set('dailyState', { lastDate: today, at: now.toISOString() });
 
-      await safeRun('每日补同步');
+      await safeRun('每日补同步', { trigger: 'schedule' });
     });
   }
 

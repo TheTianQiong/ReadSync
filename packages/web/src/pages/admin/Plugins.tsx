@@ -1,5 +1,5 @@
 import type { PluginSummary } from '@readsync/shared';
-import { Plug, RefreshCw, Settings2, Trash2, Upload } from 'lucide-react';
+import { Play, Plug, RefreshCw, Settings2, Trash2, Upload } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import {
   ConfigFieldControl,
@@ -48,6 +48,8 @@ export function Plugins(): ReactNode {
   const [configPlugin, setConfigPlugin] = useState<PluginSummary | null>(null);
   const [pendingDelete, setPendingDelete] = useState<PluginSummary | null>(null);
   const [busy, setBusy] = useState(false);
+  /** 正在手动运行的插件 id（同一个按钮显示 loading） */
+  const [runningId, setRunningId] = useState<string | null>(null);
 
   const plugins = data ?? [];
 
@@ -76,6 +78,23 @@ export function Plugins(): ReactNode {
       reload();
     } catch (err) {
       toast.error(err instanceof Error ? err.message : '操作失败');
+    }
+  };
+
+  /** 手动跑一次插件的任务（导入类插件会把所有已配置的账号跑一遍） */
+  const handleRun = async (plugin: PluginSummary): Promise<void> => {
+    setRunningId(plugin.id);
+    try {
+      const result = await api.post<{ result?: { message?: string } | null }>(
+        `/plugins/${plugin.id}/run`,
+      );
+      const detail = result?.result?.message;
+      toast.success(detail ? `${plugin.name} 运行完成：${detail}` : `${plugin.name} 运行完成`);
+      reload();
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : '运行失败');
+    } finally {
+      setRunningId(null);
     }
   };
 
@@ -188,6 +207,22 @@ export function Plugins(): ReactNode {
                     checked={plugin.status === 'enabled'}
                     aria-label={`${plugin.status === 'enabled' ? '停用' : '启用'} ${plugin.name}`}
                     onChange={() => void handleToggle(plugin)}
+                  />
+
+                  {/*
+                    立刻跑一次（导全部已配置的账号）。定时任务可能一小时才跑一回，
+                    刚配好或刚改完路径时没人愿意干等 —— 用户自己那份在
+                    「设置 → 插件」里也有一个「立即同步」，只跑他自己。
+                  */}
+                  <Button
+                    size="sm"
+                    variant="quiet"
+                    aria-label={`立即运行 ${plugin.name}`}
+                    title={plugin.status === 'enabled' ? '立即运行（所有已配置的账号）' : '插件未启用'}
+                    disabled={plugin.status !== 'enabled' || runningId === plugin.id}
+                    loading={runningId === plugin.id}
+                    icon={<Play size={13} />}
+                    onClick={() => void handleRun(plugin)}
                   />
 
                   <Button

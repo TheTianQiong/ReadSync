@@ -296,7 +296,33 @@ ctx.schedule('nightly', 24 * 60, fn, { offsetMinutes: -10 }); // 每天整点前
 
 任务跑完才排下一次，于是任务跑超时或系统休眠之后能自己校正回来，不会「补跑」一串。
 
-手动触发（任何注册过的任务，包括 `everyMinutes` 为 0 的）：
+#### 手动触发
+
+三种入口、同一个处理器（`everyMinutes` 为 0 的任务只能这样跑）：
+
+| 入口 | 谁 | 跑谁 |
+|---|---|---|
+| `readsync plugin:run <插件ID> [任务名]` | 命令行 | 按插件自己的逻辑（通常全部用户） |
+| 管理后台 → 插件 → 「立即运行」 | 管理员 | 同上 |
+| 设置 → 插件 → 「立即同步」 | 每个用户 | **只有他自己**（`run.user`） |
+
+处理器会收到 `PluginTaskRun`：
+
+```js
+ctx.schedule('sync', 60, async (run) => {
+  if (run.trigger === 'schedule') return safeRun();   // 定时：错误只记日志
+  return runImport(run.user);                        // 手动：错误抛出去给点按钮的人看
+});
+```
+
+- `run.user`：**只有用户自助那条路会有**，值由内核从登录态取，插件指定不了 ——
+  跟 `ctx.forUser()` 是同一个道理（见 §4.5）。不看它，用户点一下「立即同步」就会
+  去跑所有人的账号。
+- `run.trigger`：`'schedule' | 'manual' | 'cli'`。定时触发时**必须**把错误吞掉
+  （不能让定时器炸掉），手动触发时应当抛出去。
+- 返回值会原样回到接口响应里（`data.result`），可以带一句 `{ message: '导入了 3 本' }`
+  让界面直接显示；`readsync plugin:run` 只打印成功/失败。
+- 同一个任务 + 同一个目标同时只跑一次：撞车时后来的那个收到 409。
 
 ```bash
 readsync plugin:run <插件ID> [任务名]
