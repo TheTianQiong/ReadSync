@@ -246,6 +246,36 @@ const existing = await ctx.storage.forStorage(12);
 
 连接的凭据要写在插件清单的 `config` 里并声明为 `password` 类型，这样才会加密落库。
 
+`list()` 的前缀带不带结尾斜杠都行（内核会归一化），返回的是**一层**条目：
+文件带 `size` 与 `lastModified`，目录的 `isDir` 为 true 且名字以 `/` 结尾。
+
+```js
+const entries = await src.list('book_progress');
+const files = entries.filter((e) => !e.isDir && e.name.endsWith('.json'));
+// { name: 'b1.json', path: 'book_progress/b1.json', isDir: false,
+//   size: 1234, lastModified: '2026-03-01T09:30:00.000Z' }
+```
+
+#### 上游没变就跳过（省的是自己和网盘的开销）
+
+定时同步的插件**务必**先比一次「上游变没变」，没变就整轮返回。判断依据用元信息，
+不要下载内容：`stat()` 给的 `size` / `lastModified` / `etag`（对象存储上通常就是
+内容的 MD5），目录则用 `list()` 里每个条目的 `size` 与 `lastModified`。
+
+```js
+const stat = await src.stat('database7.db');
+const token = `${stat.size}:${stat.lastModified ?? ''}:${stat.etag ?? ''}`;
+if ((await ctx.pluginData.get('sig')) === token) return { skipped: true };
+// …导入…（结束时写回 token）
+```
+
+两个坑：
+
+- **别只比大小。** `"readProgress":8618` → `8619` 长度一模一样，只有修改时间会变。
+  驱动给不出修改时间与 ETag 时（很少见）才退回「下载内容算 MD5」。
+- **指纹里带上「导入逻辑版本」。** 改了导入逻辑就把它 +1，让所有用户下次完整重跑
+  一遍。否则「上游没变」会让修好的逻辑对老数据不生效，用户只会看到「升级了但没变化」。
+
 ### 4.3 写入阅读数据
 
 ```js

@@ -26,6 +26,11 @@
  * create_at 是 **UTC**。所以读 create_at 时要按 utcOffsetHours 换算，否则整天的
  * 时长会跑到错误的小时上（实测这个偏移是 +8）。
  *
+ * 上游没变就整轮跳过（与安读插件同一套做法）：先只读**元信息**（大小 + 修改时间 +
+ * ETag），把 metadata 与进度目录的状态拼成一个指纹，和上次一样就直接返回 ——
+ * 一个字节都不下载、一条记录都不写。定时每小时的同步绝大部分时候都会走这条路：
+ * 数据没变，没必要把整库拉下来重算一遍（详见 runImportFor 里的说明）。
+ *
  * 数据放在哪：**由本插件自己的配置决定**。Reeden 的同步目录一般和书籍文件存储
  * 不是同一个地方（不同网盘、不同桶，或者干脆是本地目录），所以这里支持直接填
  * WebDAV / S3 / 本地路径，不必为了它在「存储管理」里多建一条存储条目；想复用
@@ -55,7 +60,17 @@
  * `intervalMinutes` / `dailyAt` 是站点级的（管理员定全站的节奏）；其余都在用户手上。
  */
 
+import { createHash } from 'node:crypto';
 import { inflateRawSync } from 'node:zlib';
+
+/**
+ * 导入逻辑版本。
+ *
+ * **改了导入逻辑就 +1**：指纹键里带着它，键一变所有用户下次同步都会重新完整
+ * 导入一遍（进度是 upsert、时长按天替换，重跑不会翻倍）。不这么做的话，
+ * 「上游没变就跳过」会让升级后的旧数据一直躺着，用户只看到「升级了但什么都没变」。
+ */
+const LOGIC_VERSION = 1;
 
 /* ========================================================================== *
  * 极简 zip 读取
@@ -133,6 +148,28 @@ function readZipJson(buf, dir, name) {
 /* ========================================================================== *
  * 小工具
  * ========================================================================== */
+
+/** 32 位十六进制（服务端只认这种形态的 md5） */
+function isHex32(value) {
+  return typeof value === 'string' && /^[0-9a-fA-F]{32}$/.test(value.trim());
+}
+
+function md5Hex(text) {
+  return createHash('md5').update(text, 'utf8').digest('hex');
+}
+
+/**
+ * 一本书的去重键（md5 字段）与文档标识。
+ *
+ * Reeden 的 bookId 通常就是 32 位十六进制（能用就直接用，网页端上传的同一本书
+ * 才认得出是同一本）；**但别假定它一定长这样** —— 遇到不是十六进制的库
+ * （UUID、自增数字…），直接把它当 md5 传给内核会被拒，整轮导入一本都进不来。
+ * 这时候派生一个稳定的 32 位 md5 兜底，同一本书每次算出来都一样。
+ */
+function bookKey(bookId) {
+  const id = String(bookId).trim();
+  return isHex32(id) ? id.toLowerCase() : md5Hex(`reeden:${id}`);
+}
 
 /** 把图片字节的魔数认成 MIME —— 服务端的封面接口只接受四种位图 */
 function detectImageMime(buf) {
@@ -371,11 +408,24 @@ export async function register(ctx) {
       return { users: 0, skippedUsers: 0 };
     }
 
-    const totals = { users: 0, skippedUsers: 0, books: 0, created: 0, progress: 0, sessionRows: 0 };
+    const totals = {
+      users: 0,
+      skippedUsers: 0,
+      skippedUnchanged: 0,
+      books: 0,
+      created: 0,
+      progress: 0,
+      sessionRows: 0,
+    };
     for (const userId of userIds) {
       try {
         const cfg = await ctx.getUserConfig(userId);
         const report = await runImportFor(userId, cfg);
+        // 上游没变的账号单独计数：整轮都跳过时，那句「无需导入」比一串 0 更说明问题
+        if (report.unchanged) {
+          totals.skippedUnchanged += 1;
+          continue;
+        }
         totals.users += 1;
         totals.books += report.books;
         totals.created += report.created;
@@ -391,11 +441,66 @@ export async function register(ctx) {
       }
     }
 
-    const message = `书 ${totals.books} 本（新登记 ${totals.created}），进度 ${totals.progress} 条，时长 ${totals.sessionRows} 段`;
+    const message =
+      totals.users === 0 && totals.skippedUnchanged > 0
+        ? '上游没有变化，无需导入'
+        : `书 ${totals.books} 本（新登记 ${totals.created}），进度 ${totals.progress} 条，时长 ${totals.sessionRows} 段`;
     ctx.log.info(
-      `本轮导入完成：成功 ${totals.users} 个账号，跳过 ${totals.skippedUsers} 个；${message}`,
+      `本轮导入完成：成功 ${totals.users} 个账号，未变化跳过 ${totals.skippedUnchanged} 个，` +
+        `失败 ${totals.skippedUsers} 个；${message}`,
     );
     return { ...totals, message };
+  }
+
+  /**
+   * 进度目录里的 json 文件清单（只列，不读内容）。
+   *
+   * 读不到目录不该让整次导入失败：有的 Reeden 版本可能把这层目录换成别的名字，
+   * 那时至少书目与时长还能同步。
+   */
+  async function listProgressEntries(source, root, progressDir, userId) {
+    try {
+      const entries = await source.list(joinKey(root, progressDir));
+      return entries.filter((entry) => !entry.isDir && entry.name.endsWith('.json'));
+    } catch (err) {
+      ctx.log.warn(`目录 ${progressDir} 读不到（可能这一版 Reeden 用的是别的名字）`, {
+        userId,
+        error: String(err),
+      });
+      return [];
+    }
+  }
+
+  /** 按清单把进度文件读出来；单个坏文件跳过，不该拖累别人 */
+  async function readProgressFiles(source, entries, userId) {
+    const files = new Map();
+    for (const entry of entries) {
+      const bookId = entry.name.slice(0, -'.json'.length).toLowerCase();
+      try {
+        const raw = Buffer.from(await source.get(entry.path));
+        files.set(bookId, JSON.parse(raw.toString('utf8')));
+      } catch (err) {
+        ctx.log.warn(`读取进度文件 ${entry.path} 失败，已跳过`, { userId, error: String(err) });
+      }
+    }
+    return files;
+  }
+
+  /**
+   * 上游状态指纹的原文（外层还会再取一次 MD5 存起来）。
+   *
+   * 顺序必须稳定：清单顺序一变指纹就变，「没变就跳过」立刻失效，
+   * 所以这里按文件名排一次序。
+   */
+  function sourceSignature(metaToken, progressEntries) {
+    const parts = [`metadata|${metaToken}`];
+    const sorted = [...progressEntries].sort((a, b) =>
+      a.name < b.name ? -1 : a.name > b.name ? 1 : 0,
+    );
+    for (const entry of sorted) {
+      parts.push(`progress|${entry.name}|${entry.size ?? ''}|${entry.lastModified ?? ''}`);
+    }
+    return parts.join('\n');
   }
 
   /**
@@ -417,40 +522,61 @@ export async function register(ctx) {
     const offsetHours = Number.isFinite(Number(cfg.utcOffsetHours)) ? Number(cfg.utcOffsetHours) : 8;
     const platform = 'reeden';
 
-    // ---- 1) metadata ----
+    /*
+     * ---- 1) 上游有没有变（一个字节都不下载） ----
+     *
+     * 只读元信息：metadata 的大小 / 修改时间 / ETag，加上进度目录的文件清单。
+     * 为什么不能只盯 metadata：Reeden 在「书没动、今天只读了几页」时可能只更新
+     * book_progress/<id>.json，只比 metadata 会把这类变化整轮漏掉。
+     */
     const metadataKey = joinKey(root, 'metadata');
     const metadataStat = await source.stat(metadataKey);
     if (!metadataStat) {
       throw new Error(`找不到 ${metadataKey} —— 请确认「Reeden 根目录」填对了`);
     }
-    const metadataBuf = Buffer.from(await source.get(metadataKey));
+
+    const progressEntries = await listProgressEntries(source, root, progressDir, userId);
+
+    let metaToken = `stat:${metadataStat.size}:${metadataStat.lastModified ?? ''}:${metadataStat.etag ?? ''}`;
+    let prefetchedMetadata = null;
+    if (!metadataStat.lastModified && !metadataStat.etag) {
+      /*
+       * 驱动既没给修改时间也没给 ETag（本地 / WebDAV / S3 都会给，这里是兜底）：
+       * 退回按内容算 MD5 —— 宁可多下一次，也不要因为「大小没变」漏掉变化。
+       */
+      prefetchedMetadata = Buffer.from(await source.get(metadataKey));
+      metaToken = `md5:${createHash('md5').update(prefetchedMetadata).digest('hex')}`;
+    }
+
+    const fingerprint = createHash('md5')
+      .update(sourceSignature(metaToken, progressEntries))
+      .digest('hex');
+    const fingerprintKey = `sourceSig:v${LOGIC_VERSION}:${userId}`;
+
+    if (cfg.skipUnchanged !== false && (await ctx.pluginData.get(fingerprintKey)) === fingerprint) {
+      ctx.log.info(`上游未变化（${fingerprint.slice(0, 8)}…），跳过本轮导入`, { userId });
+      return {
+        books: 0,
+        created: 0,
+        progress: 0,
+        sessions: 0,
+        sessionRows: 0,
+        covers: 0,
+        skipped: 0,
+        unchanged: true,
+      };
+    }
+
+    // ---- 2) metadata ----
+    const metadataBuf = prefetchedMetadata ?? Buffer.from(await source.get(metadataKey));
     const metadataDir = readZipDirectory(metadataBuf);
 
     const bookList = readZipJson(metadataBuf, metadataDir, 'book.json') ?? [];
     const hourly = readZipJson(metadataBuf, metadataDir, 'read_record_hourly.json') ?? [];
     const records = readZipJson(metadataBuf, metadataDir, 'read_record.json') ?? [];
 
-    // ---- 2) 每本书的进度文件 ----
-    const progressFiles = new Map();
-    try {
-      const entries = await source.list(joinKey(root, progressDir));
-      for (const entry of entries) {
-        if (entry.isDir || !entry.name.endsWith('.json')) continue;
-        const bookId = entry.name.slice(0, -'.json'.length).toLowerCase();
-        try {
-          const raw = Buffer.from(await source.get(entry.path));
-          progressFiles.set(bookId, JSON.parse(raw.toString('utf8')));
-        } catch (err) {
-          // 单个坏文件不该让整次导入失败
-          ctx.log.warn(`读取进度文件 ${entry.path} 失败，已跳过`, { userId, error: String(err) });
-        }
-      }
-    } catch (err) {
-      ctx.log.warn(`目录 ${progressDir} 读不到（可能这一版 Reeden 用的是别的名字）`, {
-        userId,
-        error: String(err),
-      });
-    }
+    // ---- 3) 每本书的进度文件（清单一分钟前刚列过，直接用） ----
+    const progressFiles = await readProgressFiles(source, progressEntries, userId);
 
     const sessionsByBook = collectSessions(hourly, records, offsetHours);
     const metaById = new Map();
@@ -473,13 +599,20 @@ export async function register(ctx) {
     for (const bookId of allIds) {
       const meta = metaById.get(bookId);
       const title = meta?.title || `Reeden 书籍 ${bookId.slice(0, 8)}`;
+      /*
+       * 文档标识与 md5 都用 bookKey(bookId)：服务端只认 32 位十六进制，
+       * 而 Reeden 的 bookId 不保证是这个形态。两者取同一个值，
+       * 「按文档标识找书」与「按 md5 认同一本」才会指向同一本。
+       * bookId 本来就是十六进制时（常见情况）原样返回，已导入的数据不受影响。
+       */
+      const documentId = bookKey(bookId);
 
       let book = null;
       if (cfg.autoRegisterBooks !== false) {
         book = await api.sync.ensureBook({
           title,
-          md5: bookId,
-          documentId: bookId,
+          md5: documentId,
+          documentId,
           ...(meta?.author ? { author: meta.author } : {}),
           format: typeof meta?.type === 'string' ? meta.type.toLowerCase() : 'epub',
           size: Number(meta?.size) || 0,
@@ -497,7 +630,7 @@ export async function register(ctx) {
           }
         }
       } else {
-        book = await api.sync.findBook({ documentId: bookId });
+        book = await api.sync.findBook({ documentId });
         if (!book) {
           report.skipped += 1;
           continue;
@@ -510,7 +643,7 @@ export async function register(ctx) {
       const picked = pickProgress(progressFiles.get(bookId), meta);
       if (picked) {
         const result = await api.sync.pushProgress({
-          document: bookId,
+          document: documentId,
           title,
           progress: positionString(picked.position),
           percentage: picked.percentage,
@@ -529,7 +662,7 @@ export async function register(ctx) {
         for (const [day, hours] of bookSessions) {
           if (!days.has(day)) days.set(day, []);
           for (const [hour, seconds] of hours) {
-            days.get(day).push({ hour, seconds, bookId: book.id, document: bookId });
+            days.get(day).push({ hour, seconds, bookId: book.id, document: documentId });
             report.sessions += 1;
           }
         }
@@ -584,6 +717,12 @@ export async function register(ctx) {
         ctx.log.warn('读取封面失败（不影响进度与时长）', { userId, error: String(err) });
       }
     }
+
+    /*
+     * 记下这一轮的上游状态：下次同步先比它，一样就整轮跳过。
+     * 放在最后 —— 中途抛错就不写，下一轮会老老实实重跑一遍。
+     */
+    await ctx.pluginData.set(fingerprintKey, fingerprint);
 
     /*
      * `lastRun:<用户id>` 是内核与插件之间的约定：用户自助页面上那句

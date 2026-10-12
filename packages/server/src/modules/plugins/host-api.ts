@@ -8,6 +8,7 @@ import {
   type PluginSessionImport,
   type PluginStorageConnection,
   type PluginStorageEntry,
+  type PluginStorageStat,
   type PluginUserScope,
 } from '@readsync/shared';
 import { getDb } from '../../db/index.js';
@@ -169,21 +170,43 @@ function bindReader(adapter: StorageAdapter, browse?: () => Promise<PluginStorag
       if (browse) return browse();
 
       /*
+       * 前缀统一成「以 / 结尾」（空串保持空串）再切 key。
+       *
+       * 不归一化会静默吞掉整层文件：适配器返回的 key 是 `book_progress/b1.json`，
+       * 拿 length 直接切会得到 `/b1.json` —— 开头那个斜杠让每个文件都被当成
+       * 「名字是 / 的目录」，插件一条文件都拿不到，而目录本身看起来又是存在的。
+       * 插件里写 `list('book_progress')` 是最自然的写法，不能要求它记得加斜杠。
+       */
+      const baseDir = prefix === '' || prefix.endsWith('/') ? prefix : `${prefix}/`;
+
+      /*
        * 适配器的 list 是扁平的（S3 风格，没有目录概念），这里收敛成一层：
        * 只保留 prefix 之下、再往下一级为止的条目，目录以 / 结尾 ——
        * 与「存储管理」里看到的样子保持一致。
        */
-      const listed = await adapter.list({ prefix, limit: BROWSE_SCAN_LIMIT });
+      const listed = await adapter.list({ prefix: baseDir, limit: BROWSE_SCAN_LIMIT });
       const byName = new Map<string, PluginStorageEntry>();
       for (const object of listed.objects) {
-        const rest = object.key.slice(prefix.length);
+        const rest = object.key.slice(baseDir.length);
         if (!rest) continue;
         const slash = rest.indexOf('/');
         if (slash === -1) {
-          byName.set(rest, { name: rest, path: object.key, isDir: false, size: object.size ?? null });
+          byName.set(rest, {
+            name: rest,
+            path: object.key,
+            isDir: false,
+            size: object.size ?? null,
+            // 插件靠它判断「上游这份文件有没有被改过」
+            lastModified: object.lastModified ?? null,
+          });
         } else {
-          const dir = rest.slice(0, slash + 1);
-          byName.set(dir, { name: dir, path: `${prefix}${dir}`, isDir: true, size: null });
+          const childDir = rest.slice(0, slash + 1);
+          byName.set(childDir, {
+            name: childDir,
+            path: `${baseDir}${childDir}`,
+            isDir: true,
+            size: null,
+          });
         }
       }
       return [...byName.values()];
@@ -200,9 +223,14 @@ function bindReader(adapter: StorageAdapter, browse?: () => Promise<PluginStorag
       return Buffer.concat(chunks);
     },
 
-    async stat(key: string): Promise<{ size: number } | null> {
+    async stat(key: string): Promise<PluginStorageStat | null> {
       const object = await adapter.stat(key);
-      return object ? { size: object.size } : null;
+      if (!object) return null;
+      return {
+        size: object.size,
+        lastModified: object.lastModified ?? null,
+        etag: object.etag ?? null,
+      };
     },
 
     async getRange(key: string, offset: number, length: number): Promise<Uint8Array | null> {
@@ -312,6 +340,7 @@ export function buildStorageApi(pluginId: string, allowed: boolean, boundUserId?
           path: entry.path,
           isDir: entry.isDir,
           size: entry.size ?? null,
+          lastModified: entry.lastModified ?? null,
         }));
       });
     },

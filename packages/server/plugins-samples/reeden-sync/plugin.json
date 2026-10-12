@@ -1,11 +1,11 @@
 {
   "id": "com.readsync.reeden-sync",
   "name": "Reeden 同步",
-  "version": "1.2.2",
+  "version": "1.3.0",
   "author": "ReadSync",
   "description": "定时读取 WebDAV / S3 上 Reeden 的阅读数据（进度、时长、书目、封面）并导入本服务器。连接信息由每个用户自己填写，数据只会导入填写者自己的账号。",
   "license": "MIT",
-  "apiVersion": ">=0.3.0 <0.5.0",
+  "apiVersion": ">=0.4.6 <0.5.0",
   "capabilities": ["metadata"],
   "permissions": ["log", "db:plugin", "fs:storage", "sync:write", "books:write"],
   "config": [
@@ -217,6 +217,13 @@
       "default": "23:55",
       "placeholder": "23:55",
       "description": "当天数据在次日可能被轮转掉，所以每天这个点再补一次；留空关闭"
+    },
+    {
+      "key": "skipUnchanged",
+      "label": "上游没有变化时跳过",
+      "type": "boolean",
+      "default": true,
+      "description": "先只读文件大小与修改时间（不下载内容），与上次一致就整轮跳过；定时跑得勤时能省下大部分开销"
     }
   ]
 }

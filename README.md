@@ -4,7 +4,7 @@
 
 墨水屏风格界面 · 阅读数据可视化 · 多端进度同步 · 完整的 CLI 与插件体系
 
-[![Version](https://img.shields.io/badge/version-0.4.5-1a1a1a)](#版本管理)
+[![Version](https://img.shields.io/badge/version-0.4.7-1a1a1a)](#版本管理)
 [![License](https://img.shields.io/badge/license-MIT-1a1a1a)](#许可证)
 
 ---
@@ -636,6 +636,10 @@ npm run test:plugin
 # 需要一份 Reeden 导出：REEDEN_SAMPLE 指向它的根目录（仓库里不附带样本）
 READSYNC_DATA_DIR=./data-reeden REEDEN_SAMPLE=/path/to/Reeden \
   npx tsx src/scripts/reeden-import-check.ts
+
+# Reeden「上游没变就整轮跳过」的验证（32 项：自造数据源，不需要样本）
+# 含两条反向断言：全量重跑必须写库（证明探针灵敏）、同长度改写必须被发现（否掉只比大小）
+READSYNC_DATA_DIR=./data-reeden-skip npx tsx src/scripts/reeden-skip-check.ts
 
 # 安读（Anx Reader）导入的端到端验证（35 项：SQLite 只读 / 日粒度时长 / 指纹跳过 / 幂等）
 # 不需要样本：脚本自己造一份结构一致的 database7.db

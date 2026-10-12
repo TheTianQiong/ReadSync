@@ -392,10 +392,22 @@ export interface PluginStorageEntry {
   path: string;
   isDir: boolean;
   size: number | null;
+  /**
+   * 最后修改时间（RFC3339）；驱动拿不到时为 null。
+   *
+   * 给「上游没变就整轮跳过」用的：同步插件每跑一次都要判断网盘上那份数据
+   * 有没有变，只比大小是不够的（同长度的改写看不出来），而时间和 ETag 是
+   * 各家驱动都会给的标准信号。
+   */
+  lastModified?: string | null;
 }
 
 export interface PluginStorageStat {
   size: number;
+  /** 最后修改时间（RFC3339）；驱动拿不到时为 null */
+  lastModified: string | null;
+  /** 内容 ETag；驱动拿不到时为 null。对象存储上通常就是内容的 MD5 */
+  etag: string | null;
 }
 
 /** 插件推送进度时的入参；user 可以是用户名或用户 id */
