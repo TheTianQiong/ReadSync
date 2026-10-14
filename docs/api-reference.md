@@ -268,7 +268,17 @@ KOReader 算的是**采样 MD5**（12 个固定偏移各读 1KB，见 `KOREADER_
 | GET | `/api/stats/status` | 阅读状态卡片（含连续阅读天数） |
 | GET | `/api/stats/dashboard` | 首页聚合数据 |
 | GET | `/api/stats/sessions` | **图表下钻**：阅读会话明细 |
+| POST | `/api/stats/sessions/delete` | 删除阅读记录（单条或多条，只能删自己的） |
 | GET / PUT | `/api/stats/preferences` | 首页组件布局 |
+
+删除阅读记录：`POST /api/stats/sessions/delete`，请求体 `{"ids":[1,2,3]}`，返回
+`{"deleted":2,"books":1}`（`books` 是因此被扣减了「总阅读时长」的书目数）。
+
+- 别人的 id 混进来会被**静默忽略**，不算进 `deleted`、也不报错 ——
+  报错等于告诉对方「这个 id 存在，只是不属于你」。
+- 一次最多 500 条；`ids` 里的元素必须是正整数。
+- 删掉的时长会从相关书目的 `totalReadingSeconds` 里扣掉（夹到 0），
+  否则书库列表上还挂着一份已经不存在的时长。
 
 ### 3.6 插件 `/api/plugins`
 

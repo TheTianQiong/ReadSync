@@ -446,6 +446,15 @@ export function ReadingStatus(): ReactNode {
         title={drilldown.title}
         description={drilldown.description}
         filters={drilldown.filters}
+        // 统计是读时聚合的：删了记录，整页图表都得重取，否则屏幕上还留着刚删掉的时长
+        onChanged={() => {
+          summary.reload();
+          trend.reload();
+          platforms.reload();
+          heatmap.reload();
+          calendarTrend.reload();
+          library.reload();
+        }}
       />
     </div>
   );

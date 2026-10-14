@@ -340,21 +340,48 @@ function ReadSync:getPercentFinished()
     return percent
 end
 
---- 本次会话已读秒数（仅在开启上报时返回）
+--- 单次上报的时长上限（86400 秒 = 一天）。
+--
+-- 它只是「设备时钟被改过 / 跨了夏令时」这类意外的兜底 ——
+-- 真正「别把休眠算进来」的保证是停表/起表（见 settleReadingSegment）。
+local MAX_SEGMENT_SECONDS = 86400
+
+--- 结算当前「活跃片段」：把已经过去的时间记进 pending_seconds，然后停表。
+--
+-- 为什么必须停表：设备休眠（熄屏）期间 os.time() 照样在走，而整夜没人翻一页。
+-- 不停表的话，醒来后第一次推送会把那一整夜当成阅读时长报上去 —— 服务器上
+-- 就会冒出「一口气读了 8 小时」这种明显异常的记录。
+--
+-- KOReader 官方统计插件（statistics.koplugin）用的正是这套：收到 Suspend 事件
+-- 就停表、Resume 再重新起表。事件名与派发机制见 frontend/ui/event.lua
+-- （handler = "on"..事件名）与 frontend/device/generic/device.lua
+-- （_beforeSuspend / _afterResume 里 broadcastEvent）。注意**没有**
+-- ScreenSaverOn/ScreenSaverOff 这类事件：息屏走的就是 Suspend 那条路。
+function ReadSync:settleReadingSegment()
+    local started = self.session_started_at
+    self.session_started_at = nil
+    if not started then return end
+
+    local elapsed = os.time() - started
+    if elapsed <= 0 or elapsed > MAX_SEGMENT_SECONDS then return end
+    self.pending_seconds = (self.pending_seconds or 0) + elapsed
+end
+
+--- 本次会话已读秒数（仅在开启上报时返回），取走即清零。
 function ReadSync:consumeReadingSeconds()
     if not self.settings.send_reading_time then
+        -- 关闭上报时也要按节奏起表：否则打开开关后，会把「没统计的那段时间」
+        -- 一次性算成一段超长阅读
+        self.pending_seconds = 0
         self.session_started_at = os.time()
         return 0
     end
-    local started = self.session_started_at
-    self.session_started_at = os.time()
-    if not started then return 0 end
 
-    local elapsed = os.time() - started
-    -- 单次上限与接口约定一致（86400 秒）。设备休眠时 os.time() 仍会走，
-    -- 因此这里也用它兜底，避免把休眠时间当成阅读时间上报。
-    if elapsed <= 0 or elapsed > 86400 then return 0 end
-    return elapsed
+    self:settleReadingSegment()
+    local total = self.pending_seconds or 0
+    self.pending_seconds = 0
+    self.session_started_at = os.time()
+    return total
 end
 
 function ReadSync:getDeviceName()
@@ -596,6 +623,7 @@ end
 
 function ReadSync:onReaderReady()
     self.session_started_at = os.time()
+    self.pending_seconds = 0
     self.pages_since_push = 0
     self.last_auto_push_at = os.time()
     self:startMinuteTimer()
@@ -622,14 +650,28 @@ function ReadSync:onCloseDocument()
         self:pushProgress(true)
     end
     self:stopMinuteTimer()
+    -- 这本书读完了：留下的时长不能算到下一本书头上
     self.session_started_at = nil
+    self.pending_seconds = 0
     self.pages_since_push = 0
 end
 
+--- 休眠 / 熄屏（KOReader 在息屏前广播 Suspend）。
 function ReadSync:onSuspend()
     if self.settings.push_on_suspend and self:isConfigured() then
         self:pushProgress(true)
     end
+    -- 推完就停表。无论推送有没有真的发出去（没配置 / 关了「休眠时推送」），
+    -- 都要把「到此刻为止」的活跃时长留下并停表，休眠期间一秒都不算。
+    self:settleReadingSegment()
+end
+
+--- 唤醒（Resume）：重新起表。
+--
+-- 必须与 onSuspend 成对：少了这一半等于白停 —— session_started_at 还停在
+-- 休眠前的时刻，下一次推送照样会把整段休眠算成阅读。
+function ReadSync:onResume()
+    self.session_started_at = os.time()
 end
 
 return ReadSync

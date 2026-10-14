@@ -297,6 +297,146 @@ do
     check("页数档为 0 时也显示关闭", t3:find("关闭", 1, true) ~= nil and t3:find("（0", 1, true) == nil, t3)
 end
 
+print("休眠/熄屏期间不计入阅读时长")
+do
+    -- 真机上的场景：息屏 → 睡一夜 → 唤醒。os.time() 睡眠期间照样在走，
+    -- 所以「把两次时间戳一减」必然把整夜算成阅读 —— 用户看到的就是同步后
+    -- 出现「一口气读了 8 小时」这种异常记录。
+    --
+    -- 修法是照 KOReader 官方统计插件：Suspend 停表、Resume 重新起表。
+    -- 下面这两个用例就是它的哨兵：去掉 onResume / settleReadingSegment，
+    -- 断言立刻变红。
+    reset_world()
+    local reported = {}
+    local p = new_plugin{}
+    p.pushProgress = function()
+        -- 与真实 payload 一致：推送时读一次 consumeReadingSeconds
+        table.insert(reported, p:consumeReadingSeconds())
+    end
+
+    p:onReaderReady()            -- 起表
+    clock = clock + 600          -- 读了 10 分钟
+    p:onSuspend()                -- 息屏：推送一次并停表
+    check("息屏时推送了一次", #reported == 1, #reported)
+    check("息屏结算的是这 10 分钟", reported[1] == 600, reported[1])
+
+    clock = clock + 8 * 3600     -- 睡了 8 小时
+    p:onResume()                 -- 唤醒：重新起表
+    clock = clock + 300          -- 又读了 5 分钟
+    p:pushProgress(true)
+    check("唤醒后只报醒来读的 5 分钟，不含整夜", reported[2] == 300, reported[2])
+end
+
+do
+    -- 关了「休眠时推送」也一样要停表：这是最容易漏的一半 ——
+    -- 不推送的话没人调用 consumeReadingSeconds，session_started_at 就一直停在
+    -- 息屏那一刻，醒来第一次推送照样把整夜算进去。
+    reset_world()
+    local reported = {}
+    local p = new_plugin{ push_on_suspend = false }
+    p.pushProgress = function()
+        table.insert(reported, p:consumeReadingSeconds())
+    end
+
+    p:onReaderReady()
+    clock = clock + 420
+    p:onSuspend()
+    check("关了「休眠时推送」就不推", #reported == 0, #reported)
+
+    clock = clock + 6 * 3600
+    p:onResume()
+    p:pushProgress(true)
+    check("息屏前读的 7 分钟没丢，休眠的 6 小时不算", reported[1] == 420, reported[1])
+end
+
+do
+    -- 一夜里多次息屏/唤醒（中途醒来又睡）也要累加正确
+    reset_world()
+    local reported = {}
+    local p = new_plugin{ push_on_suspend = false }
+    p.pushProgress = function()
+        table.insert(reported, p:consumeReadingSeconds())
+    end
+
+    p:onReaderReady()
+    clock = clock + 100
+    p:onSuspend()
+    clock = clock + 3600          -- 睡 1 小时
+    p:onResume()
+    clock = clock + 50
+    p:onSuspend()
+    clock = clock + 3600          -- 又睡 1 小时
+    p:onResume()
+    clock = clock + 30
+    p:pushProgress(true)
+    check("两次休眠之间的活跃片段照常累加（100+50+30）", reported[1] == 180, reported[1])
+end
+
+do
+    -- 没休眠时不能受影响：修复前是「两次时间戳相减」，修复后也必须一样
+    reset_world()
+    local reported = {}
+    local p = new_plugin{}
+    p.pushProgress = function()
+        table.insert(reported, p:consumeReadingSeconds())
+    end
+
+    p:onReaderReady()
+    clock = clock + 900
+    p:pushProgress(true)
+    check("全程没息屏时照常算 15 分钟", reported[1] == 900, reported[1])
+end
+
+do
+    -- 时钟被改过（或跨了夏令时）的兜底：超过一天的部分一律不认
+    reset_world()
+    local reported = {}
+    local p = new_plugin{}
+    p.pushProgress = function()
+        table.insert(reported, p:consumeReadingSeconds())
+    end
+
+    p:onReaderReady()
+    clock = clock + 90000
+    p:pushProgress(true)
+    check("超过一天的间隔不认（时钟跳变兜底）", reported[1] == 0, reported[1])
+end
+
+do
+    -- 关掉「上报阅读时长」后必须始终是 0，别攒着
+    reset_world()
+    local reported = {}
+    local p = new_plugin{ send_reading_time = false }
+    p.pushProgress = function()
+        table.insert(reported, p:consumeReadingSeconds())
+    end
+
+    p:onReaderReady()
+    clock = clock + 600
+    p:pushProgress(true)
+    check("关闭上报时不报时长", reported[1] == 0, reported[1])
+end
+
+do
+    -- 关书时已读时间不能带到下一本书头上
+    reset_world()
+    local reported = {}
+    local p = new_plugin{}
+    p.pushProgress = function()
+        table.insert(reported, p:consumeReadingSeconds())
+    end
+
+    p:onReaderReady()
+    clock = clock + 200
+    p:onCloseDocument()           -- 关书：推送一次并清零
+    check("关书时把这本书的时长推走", reported[1] == 200, reported[1])
+
+    p:onReaderReady()             -- 打开另一本书
+    clock = clock + 60
+    p:pushProgress(true)
+    check("新书只算自己的 1 分钟", reported[2] == 60, reported[2])
+end
+
 print("")
 print(string.format("通过 %d 项，失败 %d 项", passed, failed))
 if failed > 0 then os.exit(1) end

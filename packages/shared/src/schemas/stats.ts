@@ -138,6 +138,27 @@ export interface ReadingSessionDetail {
   progressPercent: number | null;
 }
 
+/**
+ * 删除阅读记录（单条或多条共用一个入口）。
+ *
+ * 只能删自己的：服务端的 WHERE 里带 user_id，别人的 id 混进来会被忽略而不是报错 ——
+ * 报错等于告诉对方「这个 id 存在但不属于你」。
+ */
+export const deleteReadingSessionsSchema = z.object({
+  ids: z
+    .array(z.number().int().positive())
+    .min(1, '至少要选一条记录')
+    .max(500, '一次最多删除 500 条记录'),
+});
+export type DeleteReadingSessionsInput = z.infer<typeof deleteReadingSessionsSchema>;
+
+export interface DeleteReadingSessionsResult {
+  /** 实际删掉的行数（不属于自己的 id 不算在里面） */
+  deleted: number;
+  /** 因为时长被删而同步扣减了「总阅读时长」的书目数 */
+  books: number;
+}
+
 /** 首页可配置的组件布局 */
 export const dashboardLayoutSchema = z.object({
   widgets: z

@@ -4,7 +4,7 @@
 
 墨水屏风格界面 · 阅读数据可视化 · 多端进度同步 · 完整的 CLI 与插件体系
 
-[![Version](https://img.shields.io/badge/version-0.4.7-1a1a1a)](#版本管理)
+[![Version](https://img.shields.io/badge/version-0.4.8-1a1a1a)](#版本管理)
 [![License](https://img.shields.io/badge/license-MIT-1a1a1a)](#许可证)
 
 ---
@@ -41,6 +41,8 @@
 - 平台分布；热力图两种看法：**作息**（星期 × 小时，看习惯）与**全年**（一天一格，看坚持），默认近一年、可回看具体年份
 - 阅读状态总览：当前在读、今日 / 本周 / 本月 / 累计时长、连续阅读天数
 - 首页组件可自由开关排序，**点击任意图表下钻到会话明细**
+- 明细里的阅读记录**可以删**（单条或多条），删完图表与书目时长同步更新 ——
+  误报的、导入错的那几条不用一直躺在统计里
 
 ### 账号与安全
 
@@ -450,7 +452,7 @@ readsync secret    # 检查主密钥来源（确认备份完整性）
 
 #### 可选：用专用插件（推荐）
 
-内置同步在出错时提示很含糊（例如「未知服务器错误」）。仓库提供了 [KOReader 插件](koreader-plugin/README.md)：用访问令牌认证、上报阅读时长、给出具体的中文错误原因。
+内置同步在出错时提示很含糊（例如「未知服务器错误」）。仓库提供了 [KOReader 插件](koreader-plugin/README.md)：用访问令牌认证、上报阅读时长（**熄屏 / 休眠期间不计入**）、给出具体的中文错误原因。
 
 ```bash
 readsync sync-token create -u 你的用户名 -n "KOReader"   # 创建访问令牌
@@ -626,10 +628,10 @@ READSYNC_DATA_DIR=./data-smoke npx tsx src/scripts/smoke-db.ts
 # 数据库迁移校验（含数据保留与外键完整性），会自建旧版库再升级
 READSYNC_DATA_DIR=./data-mig npx tsx src/scripts/check-migration.ts
 
-# 端到端集成测试（340 项断言：认证 / 2FA / 通行密钥 / 恢复码 / 上传 / 分片 / 预签名直传 / 只登记书目 / 进度关联 / 多标识 / 跨域 / 同步 / 统计 / 热力图下钻 / 日历热力图 / KOSync / 权限隔离 / 插件自助配置 / 周期任务 / 手动触发）
+# 端到端集成测试（365 项断言：认证 / 2FA / 通行密钥 / 恢复码 / 上传 / 分片 / 预签名直传 / 只登记书目 / 进度关联 / 多标识 / 跨域 / 同步 / 统计 / 热力图下钻 / 日历热力图 / KOSync / 权限隔离 / 插件自助配置 / 周期任务 / 手动触发）
 READSYNC_DATA_DIR=./data-e2e npx tsx src/scripts/smoke-e2e.ts
 
-# KOReader 插件的逻辑测试（25 项：每 N 页 / 每隔 N 分钟 / 仅 Wi-Fi / 菜单文案）
+# KOReader 插件的逻辑测试（36 项：每 N 页 / 每隔 N 分钟 / 仅 Wi-Fi / 休眠停表 / 菜单文案）
 npm run test:plugin
 
 # Reeden 导入的端到端验证（45 项：三种数据源 / 书目 / 进度 / 时长 / 封面 / 幂等 / 按用户配置互不串台）
@@ -637,11 +639,11 @@ npm run test:plugin
 READSYNC_DATA_DIR=./data-reeden REEDEN_SAMPLE=/path/to/Reeden \
   npx tsx src/scripts/reeden-import-check.ts
 
-# Reeden「上游没变就整轮跳过」的验证（32 项：自造数据源，不需要样本）
+# Reeden「只同步变化的那部分」的验证（42 项：整轮跳过 / 只推变化的书 / 只重写变化的天，不需要样本）
 # 含两条反向断言：全量重跑必须写库（证明探针灵敏）、同长度改写必须被发现（否掉只比大小）
 READSYNC_DATA_DIR=./data-reeden-skip npx tsx src/scripts/reeden-skip-check.ts
 
-# 安读（Anx Reader）导入的端到端验证（35 项：SQLite 只读 / 日粒度时长 / 指纹跳过 / 幂等）
+# 安读（Anx Reader）导入的端到端验证（42 项：SQLite 只读 / 日粒度时长 / 指纹跳过 / 幂等 / 只重写变化的天）
 # 不需要样本：脚本自己造一份结构一致的 database7.db
 READSYNC_DATA_DIR=./data-anx npx tsx src/scripts/anx-import-check.ts
 

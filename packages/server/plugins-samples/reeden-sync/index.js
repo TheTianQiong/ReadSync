@@ -70,7 +70,7 @@ import { inflateRawSync } from 'node:zlib';
  * 导入一遍（进度是 upsert、时长按天替换，重跑不会翻倍）。不这么做的话，
  * 「上游没变就跳过」会让升级后的旧数据一直躺着，用户只看到「升级了但什么都没变」。
  */
-const LOGIC_VERSION = 1;
+const LOGIC_VERSION = 2;
 
 /* ========================================================================== *
  * 极简 zip 读取
@@ -309,6 +309,41 @@ function positionString(position) {
   return `section=${position.section ?? 0},paragraph=${position.paragraph ?? 0},element=${position.element ?? 0}`;
 }
 
+/** 百分比按服务端自己的分辨率（万分之一）取整 —— 直接比浮点会因二进制误差误判成「变了」 */
+function scalePercent(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return -1;
+  return Math.min(10000, Math.max(0, Math.round(n * 10000)));
+}
+
+/**
+ * 服务器上那份进度与上游这份是不是同一份。
+ *
+ * 位置串与百分比任一不同就算变了。**不看时间**：上游同步常会把
+ * last_read_time 往后挪一点（哪怕这一页没读完），照推的话服务端会接受并重写
+ * 这本书的最近阅读/更新时间 —— 于是「只有一本书在读，整库的书都显示成刚更新过」。
+ */
+function sameProgress(current, percentage, position) {
+  if (!current) return false;
+  return (
+    scalePercent(current.percentage) === scalePercent(percentage) &&
+    (current.progress ?? '') === position
+  );
+}
+
+/**
+ * 某一天的小时表指纹（顺序无关）。
+ *
+ * bookId 也要算进去：时长与书目的关联是导入时解析出来的（文档标识 → md5 → 书名），
+ * 关联结果变了就得重导一次，否则那天会一直挂着旧的归属。
+ */
+function dayDigest(hours) {
+  return hours
+    .map((entry) => `${entry.hour}|${entry.document ?? ''}|${entry.bookId ?? ''}|${entry.seconds}`)
+    .sort()
+    .join(';');
+}
+
 /* ========================================================================== *
  * 插件入口
  * ========================================================================== */
@@ -415,6 +450,7 @@ export async function register(ctx) {
       books: 0,
       created: 0,
       progress: 0,
+      progressUnchanged: 0,
       sessionRows: 0,
     };
     for (const userId of userIds) {
@@ -430,6 +466,7 @@ export async function register(ctx) {
         totals.books += report.books;
         totals.created += report.created;
         totals.progress += report.progress;
+        totals.progressUnchanged += report.progressUnchanged ?? 0;
         totals.sessionRows += report.sessionRows ?? 0;
       } catch (err) {
         totals.skippedUsers += 1;
@@ -444,7 +481,9 @@ export async function register(ctx) {
     const message =
       totals.users === 0 && totals.skippedUnchanged > 0
         ? '上游没有变化，无需导入'
-        : `书 ${totals.books} 本（新登记 ${totals.created}），进度 ${totals.progress} 条，时长 ${totals.sessionRows} 段`;
+        : `书 ${totals.books} 本（新登记 ${totals.created}），进度 ${totals.progress} 条` +
+          `${totals.progressUnchanged > 0 ? `（${totals.progressUnchanged} 本没变，未重写）` : ''}，` +
+          `时长 ${totals.sessionRows} 段`;
     ctx.log.info(
       `本轮导入完成：成功 ${totals.users} 个账号，未变化跳过 ${totals.skippedUnchanged} 个，` +
         `失败 ${totals.skippedUsers} 个；${message}`,
@@ -559,6 +598,7 @@ export async function register(ctx) {
         books: 0,
         created: 0,
         progress: 0,
+        progressUnchanged: 0,
         sessions: 0,
         sessionRows: 0,
         covers: 0,
@@ -592,7 +632,16 @@ export async function register(ctx) {
     const allIds = new Set([...metaById.keys(), ...progressFiles.keys(), ...sessionsByBook.keys()]);
 
     // ---- 3) 逐本导入 ----
-    const report = { books: 0, created: 0, progress: 0, sessions: 0, covers: 0, skipped: 0 };
+    const report = {
+      books: 0,
+      created: 0,
+      progress: 0,
+      progressUnchanged: 0,
+      sessions: 0,
+      sessionRows: 0,
+      covers: 0,
+      skipped: 0,
+    };
     const days = new Map(); // day → [{hour, seconds, bookId, document}]
     const coverJobs = [];
 
@@ -639,20 +688,26 @@ export async function register(ctx) {
 
       report.books += 1;
 
-      // 进度
+      // 进度：位置与百分比都跟服务器上一样就不推（见 shouldPushProgress 的说明）
       const picked = pickProgress(progressFiles.get(bookId), meta);
       if (picked) {
-        const result = await api.sync.pushProgress({
-          document: documentId,
-          title,
-          progress: positionString(picked.position),
-          percentage: picked.percentage,
-          platform,
-          device: 'Reeden',
-          deviceId: picked.deviceId || 'reeden',
-          ...(picked.at ? { clientTime: picked.at.toISOString() } : {}),
-        });
-        if (result.accepted) report.progress += 1;
+        const position = positionString(picked.position);
+        const current = await api.sync.getProgress({ document: documentId });
+        if (sameProgress(current, picked.percentage, position)) {
+          report.progressUnchanged += 1;
+        } else {
+          const result = await api.sync.pushProgress({
+            document: documentId,
+            title,
+            progress: position,
+            percentage: picked.percentage,
+            platform,
+            device: 'Reeden',
+            deviceId: picked.deviceId || 'reeden',
+            ...(picked.at ? { clientTime: picked.at.toISOString() } : {}),
+          });
+          if (result.accepted) report.progress += 1;
+        }
       }
 
       // 时长（先攒起来，最后按天一次性替换 —— 服务端是按「账号 + 平台 + 天」替换的，
@@ -669,27 +724,47 @@ export async function register(ctx) {
       }
     }
 
-    // ---- 4) 时长：按天替换 ----
-    if (days.size > 0) {
+    // ---- 4) 时长：只发变了的天 ----
+    {
       /*
-       * 上游删掉的天要一起清掉，否则本地会留着已经不存在的数据。
-       * 记着上次导入过哪些天，这次没出现的天用「空小时表」送过去即被清空。
+       * 按天算指纹，只把「和上次不一样」的天、以及「上游已经没有」的天发过去。
+       *
+       * 为什么必须按天筛：服务端的 importSessions 是**先删后写**。如果每轮都把
+       * 全部天数发过去，那么只要有一本书读了，整批天数都会被重写一遍 ——
+       * 用户看到的就是「只读了一本书，书库里所有书的历史记录都动了一遍」。
+       *
+       * 状态存在插件数据里（键名带导入逻辑版本），顺带承担了原先
+       * importedDays 的职责：上游删掉的那天在这里表现为「以前有、现在没有」，
+       * 送一个空小时表过去即被清空。
        */
-      const importedKey = `importedDays:${userId}`;
-      const imported = (await ctx.pluginData.get(importedKey)) ?? [];
-      for (const day of Array.isArray(imported) ? imported : []) {
-        if (!days.has(day)) days.set(day, []);
+      const digestKey = `sessionDays:v${LOGIC_VERSION}:${userId}`;
+      const previous = (await ctx.pluginData.get(digestKey)) ?? {};
+      const next = {};
+      const changed = [];
+
+      for (const [day, hours] of days) {
+        const digest = dayDigest(hours);
+        next[day] = digest;
+        if (previous[day] !== digest) changed.push({ day, hours });
+      }
+      for (const day of Object.keys(previous)) {
+        if (!days.has(day)) changed.push({ day, hours: [] });
       }
 
-      const payload = [...days.entries()].map(([day, hours]) => ({ day, hours }));
-      const result = await api.sync.importSessions({ platform, device: 'Reeden', days: payload });
-      report.sessionRows = result.inserted;
+      if (changed.length > 0) {
+        const result = await api.sync.importSessions({ platform, device: 'Reeden', days: changed });
+        report.sessionRows = result.inserted;
+        ctx.log.info(`时长：${changed.length}/${next ? Object.keys(next).length : 0} 天有变化，已按天替换`, {
+          userId,
+        });
+      } else {
+        ctx.log.info(`时长：${Object.keys(next).length} 天全部与上次一致，一条都没重写`, { userId });
+      }
 
-      await ctx.pluginData.set(
-        importedKey,
-        // 只留最近的若干天：这个列表只用来发现「上游删了哪一天」，不必永久保存
-        [...days.keys()].sort().slice(-500),
-      );
+      // 只留最近若干天：更早的日期上游不会再变天，留着只是白白占地方
+      const kept = {};
+      for (const day of Object.keys(next).sort().slice(-500)) kept[day] = next[day];
+      await ctx.pluginData.set(digestKey, kept);
     }
 
     // ---- 5) 封面 ----
@@ -730,13 +805,17 @@ export async function register(ctx) {
      */
     await ctx.pluginData.set(`lastRun:${userId}`, {
       at: new Date().toISOString(),
-      message: `书 ${report.books} 本（新登记 ${report.created}），进度 ${report.progress} 条，时长 ${report.sessionRows ?? 0} 段`,
+      message:
+        `书 ${report.books} 本（新登记 ${report.created}），进度 ${report.progress} 条` +
+        `${report.progressUnchanged > 0 ? `（${report.progressUnchanged} 本没变，未重写）` : ''}，` +
+        `时长 ${report.sessionRows ?? 0} 段`,
       ...report,
     });
 
     ctx.log.info(
       `用户 #${userId} 导入完成：书 ${report.books}（新登记 ${report.created}），` +
-        `进度 ${report.progress}，时长 ${report.sessionRows ?? 0} 段，封面 ${report.covers}，跳过 ${report.skipped}`,
+        `进度 ${report.progress}（${report.progressUnchanged} 本未变化已跳过），` +
+        `时长 ${report.sessionRows ?? 0} 段，封面 ${report.covers}，跳过 ${report.skipped}`,
       { userId },
     );
     return report;

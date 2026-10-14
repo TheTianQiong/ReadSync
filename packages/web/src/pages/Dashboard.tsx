@@ -534,6 +534,16 @@ export function Dashboard(): ReactNode {
         title={drilldown.title}
         description={drilldown.description}
         filters={drilldown.filters}
+        /*
+         * 删掉记录后，本页的每一个数字都可能是旧的（统计是读时聚合的）：
+         * 首页聚合、热力图、日历趋势、最近在读的时长都要重取一遍。
+         */
+        onChanged={() => {
+          reload();
+          heatmapData.reload();
+          calendarTrend.reload();
+          recentBooks.reload();
+        }}
       />
     </div>
   );

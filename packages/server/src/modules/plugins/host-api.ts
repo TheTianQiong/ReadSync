@@ -5,6 +5,7 @@ import {
   webdavConfigSchema,
   type PluginBookInput,
   type PluginProgressPush,
+  type PluginProgressState,
   type PluginSessionImport,
   type PluginStorageConnection,
   type PluginStorageEntry,
@@ -20,7 +21,7 @@ import { saveBookCover } from '../library/cover.js';
 import { BROWSE_SCAN_LIMIT, browseStorage, getAdapterForStorage } from '../storage/service.js';
 import { createAdapter } from '../storage/adapters/registry.js';
 import type { StorageAdapter } from '../storage/types.js';
-import { resolveBookId, upsertProgress } from '../sync/service.js';
+import { getProgress, resolveBookId, upsertProgress } from '../sync/service.js';
 import { getModuleLogger } from '../../logger.js';
 
 /**
@@ -393,6 +394,28 @@ export function buildSyncApi(
   };
 
   return {
+    /**
+     * 读服务器上某本书当前的进度。
+     *
+     * 只读、只限本账号：插件据此判断「上游这份进度和服务器上的一致吗」，
+     * 一致就不推 —— 否则上游只是把最后阅读时间往后挪了一点，也会让服务端
+     * 重写这本书的最近阅读/更新时间（整库的书都跟着显得被更新过）。
+     */
+    async getProgress(
+      input: WithOptionalUser<{ user: string | number; document: string }>,
+    ): Promise<PluginProgressState | null> {
+      guardSync();
+      const userId = targetUser(input.user);
+      const entry = getProgress(userId, normalizeDocumentId(input.document));
+      if (!entry) return null;
+      return {
+        percentage: entry.percentage,
+        progress: entry.progress ?? null,
+        clientTime: entry.clientTime,
+        updatedAt: entry.updatedAt,
+      };
+    },
+
     async pushProgress(input: WithOptionalUser<PluginProgressPush>): Promise<{ accepted: boolean }> {
       guardSync();
       if (!/^[a-fA-F0-9]{32}$/.test(input.document)) {

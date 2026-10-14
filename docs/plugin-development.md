@@ -133,7 +133,7 @@ readsync plugin enable com.example.hello
 | `log` | `ctx.log` 输出日志 |
 | `db:plugin` | 可使用 `plugin_data` 表中的专属键值存储 |
 | `sqlite:read` | `ctx.sqlite.open()` 可**只读**打开外部 SQLite 数据库（读别的阅读器的数据文件） |
-| `sync:write` | `ctx.sync.pushProgress` / `importSessions` 可写阅读进度与时长 |
+| `sync:write` | `ctx.sync` 的读取与写入（`pushProgress` / `getProgress` / `importSessions`）|
 | `books:write` | `ctx.sync.ensureBook` / `setCover` 可登记书目、写封面 |
 
 后两项是给「外部数据导入」类插件准备的：它们会代某个账号写数据，所以清单里
@@ -280,6 +280,7 @@ if ((await ctx.pluginData.get('sig')) === token) return { skipped: true };
 
 ```js
 await ctx.sync.ensureBook({ user: 'alice', title: '书名', md5: '…', documentId: '…' });
+await ctx.sync.getProgress({ user: 'alice', document: '…' }); // → 现有进度或 null
 await ctx.sync.pushProgress({ user: 'alice', document: '…', percentage: 0.42 });
 await ctx.sync.importSessions({ user: 'alice', platform: 'myapp', device: 'X', days: [...] });
 await ctx.sync.setCover({ book: 12, mime: 'image/jpeg', dataBase64: '…' });
@@ -290,6 +291,36 @@ await ctx.sync.setCover({ book: 12, mime: 'image/jpeg', dataBase64: '…' });
 
 `importSessions` 是**按天替换**（先删该账号 + 该 platform + 该天的旧行再写），
 这是刻意的：导入类插件会被反复重跑，累加会把时长越滚越大。
+
+#### 只推真正变了的那部分（重要）
+
+导入插件请**先比再写**，否则用户会看到「只有一本书在读，书库里的书全都显示成
+刚更新过」—— 那正是 `lastReadAt` / `updatedAt` 被无谓刷新造成的。
+
+```js
+const current = await ctx.sync.getProgress({ document });
+if (current && scale(current.percentage) === scale(next.percentage) && current.progress === position) {
+  // 一模一样：连推都不用推
+} else { await ctx.sync.pushProgress({ … }); }
+```
+
+`getProgress` 返回 `{ percentage, progress, clientTime, updatedAt }`。**比对时不要看
+`clientTime`/`updatedAt`**：上游的「最后阅读时间」常常自己往前走（打开书、同步一下
+就变了），而位置压根没动；时间一变就推，等于每轮都把整库的书重写一遍。
+百分比也建议按服务端的分辨率（万分之一）取整后比，浮点直接比会误判。
+
+时长同理：`importSessions` 是**整批替换**的，所以请记住上次每天的指纹，只发
+「变了的天」和「上游已经没有的天」（送空小时表即被清空）：
+
+```js
+const changed = [...days].filter(([day, hours]) => previous[day] !== digest(hours));
+const gone = Object.keys(previous).filter((day) => !days.has(day))
+  .map((day) => ({ day, hours: [] }));
+await ctx.sync.importSessions({ platform, device, days: [...changed.map(…), ...gone] });
+```
+
+指纹里记得带上导入逻辑版本：改了导入逻辑就 +1，让所有用户下次完整重跑一遍
+刷新历史数据，否则「没变就跳过」会让修好的逻辑对老数据不生效。
 
 **每条时长只需要给 `document`（文档标识），书目关联由内核自己做** —— 按
 「文档标识 → md5 → 书名」找（与进度走的是同一套）。这一层不能省：同一本书先由

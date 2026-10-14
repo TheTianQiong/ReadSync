@@ -150,7 +150,8 @@ async function main(): Promise<void> {
    * 被直接拒收 —— 那是另一条正确的规则，不该混进这里要验的东西。
    */
   const progressB1 = writeProgress(sampleDir, 'b1', progressContent(5000, '2030-01-01 00:00:00'));
-  writeProgress(sampleDir, 'b2', progressContent(2500, '2026-03-01 10:15:00'));
+  // b2 的初始时间也用「很晚」的值：见下面进度改写那一段的说明
+  writeProgress(sampleDir, 'b2', progressContent(2500, '2030-01-01 00:00:00'));
 
   const coversZip = new AdmZip();
   coversZip.addFile('cover1.thumb', PNG_1X1);
@@ -285,16 +286,18 @@ async function main(): Promise<void> {
   check('没封面的书保持为空', bookOf('样本二')?.coverUpdatedAt === null, bookOf('样本二')?.coverUpdatedAt);
 
   /* -------------------- 4. 上游没变：整轮跳过 -------------------- */
-  const fingerprintKey = `sourceSig:v1:${user.id}`;
-  const storedFingerprint = db
+  // 键名形如 sourceSig:v<导入逻辑版本>:<用户id>。这里按正则找，不写死版本号 ——
+  // 否则以后每次抬版本都要来改一遍测试（改了就是假红）。
+  const fingerprintRows = db
     .select()
     .from(pluginData)
-    .where(sql`${pluginData.pluginId} = ${PLUGIN_ID} and ${pluginData.key} = ${fingerprintKey}`)
-    .get()?.value as string | undefined;
+    .where(eq(pluginData.pluginId, PLUGIN_ID))
+    .all()
+    .filter((row) => new RegExp(`^sourceSig:v\\d+:${user.id}$`).test(row.key));
   check(
     '指纹键里带着导入逻辑版本（改了逻辑就 +1，让所有人重跑一次）',
-    typeof storedFingerprint === 'string' && /^[0-9a-f]{32}$/.test(storedFingerprint),
-    storedFingerprint,
+    fingerprintRows.length === 1 && /^[0-9a-f]{32}$/.test(String(fingerprintRows[0]?.value ?? '')),
+    fingerprintRows.map((row) => [row.key, row.value]),
   );
 
   /*
@@ -373,7 +376,96 @@ async function main(): Promise<void> {
   const removedRun = (await runPluginTask(PLUGIN_ID, 'sync')) as { skippedUnchanged?: number } | null | undefined;
   check('进度文件被删掉（清单变了）也会重新导入', removedRun?.skippedUnchanged === 0, removedRun);
 
-  /* -------------------- 9. 定时触发那一趟也不写 lastRun（跳过时） -------------------- */
+  /* -------------------- 9. 只有一本书变了：别的书一秒都不许动 -------------------- */
+  {
+    /*
+     * 用户的原话：「只有某一本书或者某几本书的记录有变化，插件依旧会更新书库中
+     * 所有书籍内容」。
+     *
+     * 成因有两处，这里各钉一条：
+     *  - 进度照推：上游的 last_read_time 常常自己往前走，服务端会接受并重写这本书的
+     *    最近阅读/更新时间；
+     *  - 时长整批发：importSessions 是先删后写，整批发等于把所有书所有天重写一遍。
+     */
+    const booksBefore = db.select().from(books).all();
+    const sessionsBefore = db.select().from(readingSessions).all();
+
+    const beforeOf = (title: string) => {
+      const row = booksBefore.find((b) => b.title === title)!;
+      return { updatedAt: row.updatedAt.getTime(), lastReadAt: row.lastReadAt?.getTime() ?? null };
+    };
+    const afterOf = (title: string) =>
+      db.select().from(books).where(sql`${books.ownerId} = ${user.id} and ${books.title} = ${title}`).get()!;
+
+    const b1Before = beforeOf('样本一');
+    const b2Before = beforeOf('样本二');
+
+    // 只动 b2：内容变、长度不变（2500 → 2501），时间往后挪 5 分钟
+    writeProgress(sampleDir, 'b2', progressContent(2501, '2030-01-01 00:05:00'));
+
+    const run = (await runPluginTask(PLUGIN_ID, 'sync')) as
+      | { progress?: number; progressUnchanged?: number; unchanged?: boolean }
+      | null
+      | undefined;
+    check('上游确实变了（这一轮没被整轮跳过）', run?.unchanged !== true, run);
+    check('只推了变化的那一本，没变的那本被跳过', run?.progress === 1 && run?.progressUnchanged === 1, run);
+
+    const b1After = afterOf('样本一');
+    const b2After = afterOf('样本二');
+    check(
+      '没变的书（样本一）的「最近更新 / 最近阅读」一点没动',
+      b1After.updatedAt.getTime() === b1Before.updatedAt &&
+        (b1After.lastReadAt?.getTime() ?? null) === b1Before.lastReadAt,
+      { updatedAt: [b1Before.updatedAt, b1After.updatedAt.getTime()], lastReadAt: [b1Before.lastReadAt, b1After.lastReadAt?.getTime() ?? null] },
+    );
+    check(
+      '变了的书（样本二）确实被更新了',
+      b2After.updatedAt.getTime() !== b2Before.updatedAt,
+      { before: b2Before.updatedAt, after: b2After.updatedAt.getTime() },
+    );
+    check('样本二的进度落库为 2501', entryOf(DOC_B2)?.percentage === 2501, entryOf(DOC_B2)?.percentage);
+    check(
+      '时长一条都没重写（上游的天数没变，按天指纹应当全部命中）',
+      JSON.stringify(db.select().from(readingSessions).all()) === JSON.stringify(sessionsBefore),
+    );
+  }
+
+  /* -------------------- 10. 只有一天变了：只重写那一天 -------------------- */
+  {
+    const rowsOn = (day: string) =>
+      db
+        .select()
+        .from(readingSessions)
+        .where(sql`${readingSessions.userId} = ${user.id} and ${readingSessions.day} = ${day}`)
+        .all();
+    const idsOn = (day: string) => rowsOn(day).map((row) => row.id).sort();
+    const secondsOn = (day: string) => rowsOn(day).reduce((sum, row) => sum + row.seconds, 0);
+
+    const dayOneIds = idsOn('2026-03-01');
+    const dayTwoIds = idsOn('2026-03-02');
+    check('前置：两个日期各有记录', dayOneIds.length > 0 && dayTwoIds.length > 0, {
+      dayOneIds,
+      dayTwoIds,
+    });
+
+    // 只改 3-01 的时长（600 → 700），3-02 原样不动
+    writeMetadata(metadataFile, metadataBooks, [
+      { book_id: 'b1', date: '2026-03-01', hour: 9, read_seconds: 700 },
+      { book_id: 'b2', date: '2026-03-01', hour: 10, read_seconds: 300 },
+      { book_id: 'b1', date: '2026-03-02', hour: 20, read_seconds: 900 },
+    ]);
+
+    const run = (await runPluginTask(PLUGIN_ID, 'sync')) as { sessionRows?: number } | null | undefined;
+    check('只重写了变化的那一天（3-01 两行）', run?.sessionRows === 2, run);
+    check('3-01 的时长被替换成 700 + 300', secondsOn('2026-03-01') === 1000, secondsOn('2026-03-01'));
+    check(
+      '3-02 的行 id 一个都没变（那天没变，没被重写）',
+      JSON.stringify(idsOn('2026-03-02')) === JSON.stringify(dayTwoIds),
+      { before: dayTwoIds, after: idsOn('2026-03-02') },
+    );
+  }
+
+  /* -------------------- 11. 定时触发那一趟也不写 lastRun（跳过时） -------------------- */
   const lastRunAtOf = (): string | undefined => {
     const value = db
       .select()

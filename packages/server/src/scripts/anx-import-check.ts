@@ -406,14 +406,22 @@ async function main(): Promise<void> {
     .from(pluginData)
     .where(sql`${pluginData.pluginId} = ${PLUGIN_ID} and ${pluginData.key} = ${`lastRun:${user.id}`}`)
     .get()?.value ?? {}) as { at?: string };
+  /*
+   * 键名形如 dbMd5:v<导入逻辑版本>:<用户id>。这里按正则找而不是写死版本号 ——
+   * 键里带版本号是为了「改了导入逻辑就 +1，让所有人重跑一次刷新历史数据」，
+   * 写死的话每次抬版本都要来改一遍测试（而且改的是断言，不是被测的东西）。
+   */
   const storedFingerprint = db
     .select()
     .from(pluginData)
-    // 键名带「导入逻辑版本」：改了导入逻辑就 +1，让所有人重跑一次刷新历史数据
-    .where(sql`${pluginData.pluginId} = ${PLUGIN_ID} and ${pluginData.key} = ${`dbMd5:v2:${user.id}`}`)
-    .get()?.value;
+    .where(eq(pluginData.pluginId, PLUGIN_ID))
+    .all()
+    .find((row) => new RegExp(`^dbMd5:v\\d+:${user.id}$`).test(row.key))?.value;
 
-  check('记录了数据库指纹', storedFingerprint === dbFingerprint, { storedFingerprint, dbFingerprint });
+  check('记录了数据库指纹（键名里带导入逻辑版本）', storedFingerprint === dbFingerprint, {
+    storedFingerprint,
+    dbFingerprint,
+  });
 
   await runPluginTask(PLUGIN_ID, 'sync');
   const secondRunAt = (db
@@ -428,8 +436,18 @@ async function main(): Promise<void> {
   );
   check('跳过之后数据没有翻倍', count('sessions', user.id) === 3, count('sessions', user.id));
 
-  /* -------------------- 6. 数据库变了就照常导入 -------------------- */
+  /* -------------------- 6. 数据库变了就照常导入（且只重写变了的天） -------------------- */
   {
+    const idsOn = (day: string): number[] =>
+      db
+        .select({ id: readingSessions.id })
+        .from(readingSessions)
+        .where(sql`${readingSessions.userId} = ${user.id} and ${readingSessions.day} = ${day}`)
+        .all()
+        .map((row) => row.id)
+        .sort();
+    const untouchedBefore = idsOn('2026-03-02');
+
     const busy = new Database(sampleDb);
     try {
       busy.prepare('UPDATE tb_reading_time SET reading_time = ? WHERE book_id = 1 AND date = ?').run(2222, '2026-03-01');
@@ -438,7 +456,7 @@ async function main(): Promise<void> {
       busy.close();
     }
 
-    await runPluginTask(PLUGIN_ID, 'sync');
+    const changedRun = (await runPluginTask(PLUGIN_ID, 'sync')) as { sessionRows?: number } | null | undefined;
 
     const thirdRunAt = (db
       .select()
@@ -454,6 +472,19 @@ async function main(): Promise<void> {
       .get()?.total;
     check('按天替换而不是累加（3-01 现在是 2222 + 300）', dayOne === 2522, dayOne);
     check('新出现的日期也导入了', count('sessions', user.id) === 4, count('sessions', user.id));
+
+    /*
+     * 只重写了「变了的那两天」：改动的 3-01（2 行）+ 新增的 3-03（1 行）= 3 行。
+     * 整批发的话会是 4 行 —— 服务端的 importSessions 是先删后写，整批发等于把
+     * 没动过的 3-02 也重写一遍（用户看到的就是「只读了一本书，所有书的历史记录
+     * 都动了一遍」）。去掉按天指纹，这一条立刻变红。
+     */
+    check('只重写了变化的天（3-01 两行 + 3-03 一行）', changedRun?.sessionRows === 3, changedRun);
+    check(
+      '没变的 3-02 行 id 一个都没动',
+      JSON.stringify(idsOn('2026-03-02')) === JSON.stringify(untouchedBefore),
+      { before: untouchedBefore, after: idsOn('2026-03-02') },
+    );
   }
 
   /* -------------------- 7. 上游删掉的日期会被清掉 -------------------- */

@@ -294,6 +294,10 @@ export interface PluginContext {
   sync: {
     /** 推送一条进度；与 PUT /api/sync/progress 同语义 */
     pushProgress(input: PluginProgressPush): Promise<{ accepted: boolean }>;
+    /** 读服务器上某本书当前的进度；没有记录时返回 null */
+    getProgress(
+      input: { user: string | number; document: string },
+    ): Promise<PluginProgressState | null>;
     /**
      * 按天替换阅读会话。
      *
@@ -410,6 +414,25 @@ export interface PluginStorageStat {
   etag: string | null;
 }
 
+/**
+ * 服务器上某本书当前的进度（只读）。
+ *
+ * 给「只推真正变化的那部分」用：导入插件先拿它与上游的当前值比一比，一样就
+ * 跳过这次推送。为什么不能只靠服务端的冲突判定 —— 上游每次同步常会把
+ * 「最后阅读时间」往后挪一点（哪怕位置没动），照推的话服务端会接受并重写这本书的
+ * 最近阅读/更新时间，于是「只有一本书在读，整库的书都显示成刚更新过」。
+ */
+export interface PluginProgressState {
+  /** 0-1 的小数（服务端精度是万分之一） */
+  percentage: number;
+  /** 位置串（阅读器自己的格式，如 EPUB CFI） */
+  progress: string | null;
+  /** 上次写入时客户端报的时间（RFC3339）；客户端没报过则 null */
+  clientTime: string | null;
+  /** 服务端写入时间（RFC3339） */
+  updatedAt: string;
+}
+
 /** 插件推送进度时的入参；user 可以是用户名或用户 id */
 export interface PluginProgressPush {
   user: string | number;
@@ -481,6 +504,8 @@ export interface PluginBookInput {
 export interface PluginUserSyncApi {
   /** 推送一条进度；与 PUT /api/sync/progress 同语义 */
   pushProgress(input: Omit<PluginProgressPush, 'user'>): Promise<{ accepted: boolean }>;
+  /** 读服务器上某本书当前的进度；没有记录时返回 null */
+  getProgress(input: { document: string }): Promise<PluginProgressState | null>;
   /** 按天替换阅读会话（只动这个账号在 platform 下的这些天） */
   importSessions(input: Omit<PluginSessionImport, 'user'>): Promise<{ days: number; inserted: number }>;
   /** 登记一本没有文件的书 */

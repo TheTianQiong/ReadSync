@@ -834,6 +834,68 @@ export function listReadingSessions(
   };
 }
 
+/* --------------------------- 6.1 删除阅读记录 --------------------------- */
+
+/** 一次最多删多少条；与 shared 的 schema 保持一致 */
+export const MAX_DELETE_SESSIONS = 500;
+
+/**
+ * 删除若干条阅读记录。
+ *
+ * 两道约束：
+ *  - **只能删自己的。** WHERE 里带 user_id，别人的 id 混进来只会被忽略 ——
+ *    报错等于告诉对方「这个 id 存在，只是不属于你」。
+ *  - **书目上的「总阅读时长」要一并扣回去。** 它是同步时累加出来的冗余字段
+ *    （books.total_reading_seconds），光删 reading_sessions 会留下一个对不上的数字。
+ */
+export function deleteReadingSessions(
+  userId: number,
+  ids: number[],
+): { deleted: number; books: number } {
+  const unique = [...new Set(ids.filter((id) => Number.isInteger(id) && id > 0))];
+  if (unique.length === 0) return { deleted: 0, books: 0 };
+  if (unique.length > MAX_DELETE_SESSIONS) {
+    throw badRequest(`一次最多删除 ${MAX_DELETE_SESSIONS} 条记录`);
+  }
+
+  const raw = getRawDb();
+  const placeholders = unique.map(() => '?').join(',');
+
+  // 先按归属把时长汇总起来：删完就查不到 book_id 了
+  const rows = raw
+    .prepare(
+      `SELECT book_id AS bookId, seconds AS seconds
+         FROM reading_sessions
+        WHERE user_id = ? AND id IN (${placeholders})`,
+    )
+    .all(userId, ...unique) as unknown as Array<{ bookId: number | null; seconds: number | null }>;
+
+  const secondsByBook = new Map<number, number>();
+  for (const row of rows) {
+    if (row.bookId === null || row.bookId === undefined) continue;
+    secondsByBook.set(row.bookId, (secondsByBook.get(row.bookId) ?? 0) + num(row.seconds));
+  }
+
+  const result = raw
+    .prepare(`DELETE FROM reading_sessions WHERE user_id = ? AND id IN (${placeholders})`)
+    .run(userId, ...unique);
+
+  // 夹到 0：历史数据里可能出现「记录被删过、冗余字段没跟着扣」的情况，
+  // 负数会让书库列表显示成 -1h 这种明显坏掉的值。
+  const update = raw.prepare(
+    `UPDATE books
+        SET total_reading_seconds = max(0, total_reading_seconds - ?)
+      WHERE id = ? AND owner_id = ?`,
+  );
+  for (const [bookId, seconds] of secondsByBook) {
+    if (seconds > 0) update.run(seconds, bookId, userId);
+  }
+
+  const deleted = num(result.changes);
+  log.info({ userId, deleted, books: secondsByBook.size }, '删除阅读记录');
+  return { deleted, books: secondsByBook.size };
+}
+
 /* --------------------------- 7. 首页布局 --------------------------- */
 
 /** 默认布局：全部组件启用，顺序按 DASHBOARD_WIDGETS 声明顺序 */

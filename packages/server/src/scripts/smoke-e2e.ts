@@ -19,7 +19,8 @@ import { buildApp } from '../app.js';
 import { loadConfig } from '../config.js';
 import { ensureKeyPair } from '../crypto/keys.js';
 import { closeDatabase, getDb, openDatabase } from '../db/index.js';
-import { emailCodes, pluginUserConfig, readingSessions, users } from '../db/schema.js';
+import { books as booksTable, emailCodes, pluginUserConfig, readingSessions, users } from '../db/schema.js';
+import { createUser } from '../lib/users.js';
 import { buildStorageApi, buildSyncApi } from '../modules/plugins/host-api.js';
 import {
   nextAlignedDelayMs,
@@ -2163,6 +2164,225 @@ async function main(): Promise<void> {
           recentWeeks.flat().filter((cell) => cell !== null).every((cell) => cell?.date >= recent.from && cell.date <= recent.to),
         recentWeeks[0]?.map((cell) => cell?.date ?? null),
       );
+    }
+
+    /* -------------- 7c. 删除阅读记录（单条 / 批量 / 越权） -------------- */
+    section('7c. 删除阅读记录（单条 / 批量 / 越权）');
+    {
+      const db = getDb();
+      const me = db.select().from(users).where(eq(users.username, 'admin')).get()!;
+      const target = db.select().from(booksTable).where(eq(booksTable.ownerId, me.id)).get();
+      check('（前置）admin 名下有一本书可用于挂时长', target !== undefined, target?.title);
+
+      if (target) {
+        const PLATFORM = 'delcheck';
+        const DAY = '2026-02-11';
+        const at = new Date(`${DAY}T10:00:00Z`);
+
+        const addSessions = (secondsList: number[]): number[] => {
+          for (const seconds of secondsList) {
+            db.insert(readingSessions)
+              .values({
+                userId: me.id,
+                bookId: target.id,
+                platform: PLATFORM,
+                device: 'TestDevice',
+                seconds,
+                day: DAY,
+                hour: 10,
+                weekday: 3,
+                startedAt: at,
+                endedAt: at,
+                createdAt: at,
+              })
+              .run();
+          }
+          return db
+            .select({ id: readingSessions.id })
+            .from(readingSessions)
+            .where(and(eq(readingSessions.userId, me.id), eq(readingSessions.platform, PLATFORM)))
+            .orderBy(readingSessions.id)
+            .all()
+            .map((row) => row.id);
+        };
+
+        const listOf = () =>
+          api({
+            method: 'GET',
+            url: `/api/stats/sessions?platform=${PLATFORM}&page=1&pageSize=20`,
+            headers: auth,
+          });
+        const totalSecondsOf = async (): Promise<number> => {
+          const res = await api({ method: 'GET', url: '/api/stats/status', headers: auth });
+          return res.json().data?.totalSeconds ?? 0;
+        };
+        const bookSecondsOf = (): number =>
+          db.select({ s: booksTable.totalReadingSeconds }).from(booksTable).where(eq(booksTable.id, target.id)).get()?.s ?? 0;
+        const setBookSeconds = (value: number): void => {
+          db.update(booksTable).set({ totalReadingSeconds: value }).where(eq(booksTable.id, target.id)).run();
+        };
+
+        const ids = addSessions([100, 200]);
+        check('造出 2 条待删记录', ids.length === 2, ids);
+
+        /*
+         * 书上的「总阅读时长」是同步时累加出来的冗余字段。这里把它设成一个
+         * 已知值，再看删记录时它怎么动：应当只掉被删掉的那部分 ——
+         * 多出来的部分一秒都不能被抹掉。
+         */
+        const base = 1000;
+        setBookSeconds(base);
+
+        const listed = await listOf();
+        check('明细接口能列出这两条', listed.json().data?.total === 2, listed.body);
+
+        const totalBefore = await totalSecondsOf();
+        const bookBefore = bookSecondsOf();
+        check('总时长与书目时长都已就位', totalBefore >= 300 && bookBefore === base, {
+          totalBefore,
+          bookBefore,
+        });
+
+        /* ---- 单条删除 ---- */
+        const single = await api({
+          method: 'POST',
+          url: '/api/stats/sessions/delete',
+          headers: auth,
+          payload: { ids: [ids[0]!] },
+        });
+        check('单条删除成功且报出删了几条', single.statusCode === 200 && single.json().data?.deleted === 1, single.body);
+        check('删掉的记录不再出现在明细里', (await listOf()).json().data?.total === 1);
+
+        const totalAfter = await totalSecondsOf();
+        check('统计里的总时长同步少了 100 秒（统计是读时聚合的）', totalBefore - totalAfter === 100, {
+          totalBefore,
+          totalAfter,
+        });
+        check(
+          '书目的总阅读时长同步扣减 100 秒，另补的 300 秒没被动',
+          bookBefore - bookSecondsOf() === 100,
+          { bookBefore, bookAfter: bookSecondsOf() },
+        );
+
+        /* ---- 批量删除 ---- */
+        const moreIds = addSessions([10, 20]);
+        const batch = await api({
+          method: 'POST',
+          url: '/api/stats/sessions/delete',
+          headers: auth,
+          payload: { ids: [ids[1]!, ...moreIds] },
+        });
+        check('一次删掉 3 条', batch.statusCode === 200 && batch.json().data?.deleted === 3, batch.body);
+        check('同一批涉及的书目数如实报出', batch.json().data?.books === 1, batch.body);
+        check('该平台的记录一条不剩', (await listOf()).json().data?.total === 0);
+        check(
+          '书目时长按被删总量（100 + 200 + 10 + 20）扣减',
+          bookBefore - bookSecondsOf() === 330,
+          { bookBefore, bookAfter: bookSecondsOf() },
+        );
+
+        /* ---- 扣减夹到 0：冗余字段对不上时不能出现负数 ---- */
+        const clampIds = addSessions([5000]);
+        setBookSeconds(100);
+        await api({
+          method: 'POST',
+          url: '/api/stats/sessions/delete',
+          headers: auth,
+          payload: { ids: clampIds },
+        });
+        check(
+          '删掉的时长比书目上的冗余值还大时，夹到 0 而不是负数',
+          bookSecondsOf() === 0,
+          bookSecondsOf(),
+        );
+        setBookSeconds(0);
+
+        /* ---- 重复删除 / 不存在的 id ---- */
+        const again = await api({
+          method: 'POST',
+          url: '/api/stats/sessions/delete',
+          headers: auth,
+          payload: { ids: [ids[1]!, 999999] },
+        });
+        check(
+          '重复删同一条、或删不存在的 id：不报错也不虚报条数',
+          again.statusCode === 200 && again.json().data?.deleted === 0,
+          again.body,
+        );
+
+        /* ---- 越权：别人不能删我的记录 ---- */
+        await createUser({
+          username: 'deloutsider',
+          email: 'del-outsider@example.com',
+          plainPassword: 'OutsiderPass123',
+        });
+        const outsiderLogin = await api({
+          method: 'POST',
+          url: '/api/auth/login',
+          payload: {
+            username: 'deloutsider',
+            password: { ciphertext: encryptPassword('OutsiderPass123', publicKey), encrypted: true },
+          },
+        });
+        const outsiderAuth = { authorization: `Bearer ${outsiderLogin.json().data?.accessToken}` };
+        const outsiderIds = addSessions([50]);
+        const outsider = await api({
+          method: 'POST',
+          url: '/api/stats/sessions/delete',
+          headers: outsiderAuth,
+          payload: { ids: outsiderIds },
+        });
+        check(
+          '别人删我的记录：静默忽略（报错等于告诉他这个 id 存在）',
+          outsider.statusCode === 200 && outsider.json().data?.deleted === 0,
+          outsider.body,
+        );
+        check(
+          '那条记录确实还在',
+          db
+            .select({ id: readingSessions.id })
+            .from(readingSessions)
+            .where(eq(readingSessions.id, outsiderIds[0]!))
+            .get() !== undefined,
+        );
+
+        /* ---- 参数与鉴权 ---- */
+        const noAuth = await api({
+          method: 'POST',
+          url: '/api/stats/sessions/delete',
+          payload: { ids: [1] },
+        });
+        check('未登录被拒（401）', noAuth.statusCode === 401, noAuth.statusCode);
+
+        const empty = await api({
+          method: 'POST',
+          url: '/api/stats/sessions/delete',
+          headers: auth,
+          payload: { ids: [] },
+        });
+        check('空数组被拒（400）', empty.statusCode === 400, empty.body);
+
+        const notPositive = await api({
+          method: 'POST',
+          url: '/api/stats/sessions/delete',
+          headers: auth,
+          payload: { ids: [0, -3] },
+        });
+        check('非正整数 id 被拒（400）', notPositive.statusCode === 400, notPositive.body);
+
+        const tooMany = await api({
+          method: 'POST',
+          url: '/api/stats/sessions/delete',
+          headers: auth,
+          payload: { ids: Array.from({ length: 501 }, (_, index) => index + 1) },
+        });
+        check('一次超过 500 条被拒（400）', tooMany.statusCode === 400, tooMany.body);
+
+        // 收尾：把这一节造的数据清掉，别影响后面章节的统计断言
+        db.delete(readingSessions)
+          .where(and(eq(readingSessions.userId, me.id), eq(readingSessions.platform, PLATFORM)))
+          .run();
+      }
     }
 
     /* ---------------------------- 8. KOSync 协议 ---------------------------- */

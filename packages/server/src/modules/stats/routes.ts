@@ -1,11 +1,14 @@
 import type { FastifyInstance } from 'fastify';
 import {
   dashboardLayoutSchema,
+  deleteReadingSessionsSchema,
   paginationQuerySchema,
   statsQuerySchema,
   type ApiSuccess,
   type DashboardData,
   type DashboardLayout,
+  type DeleteReadingSessionsInput,
+  type DeleteReadingSessionsResult,
   type LibraryOverview,
   type Paginated,
   type PaginationQuery,
@@ -19,6 +22,7 @@ import {
 import { badRequest, validationFailed } from '../../errors.js';
 import { currentUser, requireAuth } from '../../middleware/auth.js';
 import {
+  deleteReadingSessions,
   getDashboardData,
   getDashboardLayout,
   getLibraryOverview,
@@ -144,6 +148,27 @@ export async function registerStatsRoutes(app: FastifyInstance): Promise<void> {
 
     const data = listReadingSessions(user.id, query, { weekday, hour }, page, pageSize, timezone);
     return { ok: true, data } satisfies ApiSuccess<Paginated<ReadingSessionDetail>>;
+  });
+
+  /* ------------------------- 删除阅读记录 ------------------------- */
+
+  /**
+   * 删除阅读记录（单条与多条同一个入口 —— 单条就是只有一个元素的数组）。
+   *
+   * 用 POST 而不是 DELETE：要删的 id 在请求体里，而带 body 的 DELETE
+   * 在部分代理/客户端上会被丢掉。语义上它也不是「删除某个资源」，
+   * 而是「按一批 id 批量清理我的记录」。
+   */
+  app.post('/api/stats/sessions/delete', { preHandler: requireAuth }, async (req) => {
+    const user = currentUser(req);
+    const input = parseOrThrow<DeleteReadingSessionsInput>(
+      deleteReadingSessionsSchema,
+      req.body,
+      '要删除的记录 id 不正确',
+    );
+
+    const data = deleteReadingSessions(user.id, input.ids);
+    return { ok: true, data } satisfies ApiSuccess<DeleteReadingSessionsResult>;
   });
 
   /* ------------------------- 首页布局偏好 ------------------------- */
